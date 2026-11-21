@@ -21,7 +21,7 @@
           <span is-="badge">general</span>
         </div>
         <p class="tagline">
-          do you like hurting other people? · nah · just posting · leave a message
+          do you like hurting other people? · nah · just threading · leave a message
         </p>
         <form id="rename-form" class="rename" autocomplete="off">
           <label>
@@ -39,32 +39,60 @@
         </form>
       </header>
 
-      <section class="compose" box-="square">
-        <h2>new transmission</h2>
-        <form id="post-form" autocomplete="off">
-          <label>
-            subject
-            <input id="post-title" type="text" maxlength="120" required />
-          </label>
-          <label>
-            message
-            <textarea id="post-body" rows="5" maxlength="5000" required></textarea>
-          </label>
-          <div class="row">
-            <button type="submit" variant-="foreground0">send to general</button>
-            <span id="post-status" class="status" aria-live="polite"></span>
+      <section id="board-view">
+        <section class="compose" box-="square">
+          <h2>new thread</h2>
+          <form id="thread-form" autocomplete="off">
+            <label>
+              subject
+              <input id="thread-title" type="text" maxlength="120" required />
+            </label>
+            <label>
+              opening message
+              <textarea id="thread-body" rows="5" maxlength="5000" required></textarea>
+            </label>
+            <div class="row">
+              <button type="submit" variant-="foreground0">start thread</button>
+              <span id="thread-status" class="status" aria-live="polite"></span>
+            </div>
+          </form>
+        </section>
+
+        <section class="feed" box-="square">
+          <div class="feed-head">
+            <h2>threads</h2>
+            <button id="refresh" type="button" variant-="foreground2">refresh</button>
           </div>
-        </form>
+          <div id="thread-list" class="posts">
+            <p class="muted">waiting for the call…</p>
+          </div>
+        </section>
       </section>
 
-      <section class="feed" box-="square">
-        <div class="feed-head">
-          <h2>tape log</h2>
-          <button id="refresh" type="button" variant-="foreground2">refresh</button>
-        </div>
-        <div id="posts" class="posts">
-          <p class="muted">waiting for the call…</p>
-        </div>
+      <section id="thread-view" class="hidden">
+        <section class="feed" box-="square">
+          <div class="feed-head">
+            <button id="back-board" type="button" variant-="foreground2">← general</button>
+            <button id="refresh-thread" type="button" variant-="foreground2">refresh</button>
+          </div>
+          <div id="thread-detail">
+            <p class="muted">loading thread…</p>
+          </div>
+        </section>
+
+        <section class="compose" box-="square">
+          <h2>reply</h2>
+          <form id="reply-form" autocomplete="off">
+            <label>
+              message
+              <textarea id="reply-body" rows="4" maxlength="5000" required></textarea>
+            </label>
+            <div class="row">
+              <button type="submit" variant-="foreground0">send reply</button>
+              <span id="reply-status" class="status" aria-live="polite"></span>
+            </div>
+          </form>
+        </section>
       </section>
     </main>
     <script type="module" src="/app.js"></script>

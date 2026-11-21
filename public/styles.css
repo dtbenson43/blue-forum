@@ -317,3 +317,47 @@ article.post h3 {
   text-transform: uppercase;
   font-size: 0.55rem;
 }
+
+.hidden {
+  display: none !important;
+}
+
+#board-view,
+#thread-view {
+  display: grid;
+  gap: 1rem;
+}
+
+.thread-item h3 a {
+  color: var(--hm-cream);
+  text-decoration: none;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--hm-pink) 40%, transparent);
+}
+
+.thread-item h3 a:hover {
+  color: var(--hm-pink);
+  text-decoration: underline;
+}
+
+.thread-title {
+  margin: 0 0 0.45rem;
+  font-size: 0.85rem;
+  color: var(--hm-pink);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--hm-magenta) 70%, transparent);
+}
+
+.thread-meta {
+  margin-bottom: 0.85rem;
+}
+
+article.post.op {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--hm-magenta) 14%, transparent),
+    transparent 40%
+  );
+}
+
+article.post.reply {
+  border-top-color: color-mix(in srgb, var(--hm-cyan) 40%, transparent);
+}

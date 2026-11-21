@@ -30,10 +30,25 @@ function formatTime(iso) {
   }
 }
 
+function parseRoute() {
+  const hash = location.hash.replace(/^#/, "") || "/";
+  const threadMatch = hash.match(/^\/thread\/(\d+)$/);
+  if (threadMatch) {
+    return { view: "thread", threadId: Number(threadMatch[1]) };
+  }
+  return { view: "board" };
+}
+
 const nameInput = document.getElementById("display-name");
 const renameStatus = document.getElementById("rename-status");
-const postStatus = document.getElementById("post-status");
-const postsEl = document.getElementById("posts");
+const threadStatus = document.getElementById("thread-status");
+const replyStatus = document.getElementById("reply-status");
+const threadListEl = document.getElementById("thread-list");
+const threadDetailEl = document.getElementById("thread-detail");
+const boardView = document.getElementById("board-view");
+const threadView = document.getElementById("thread-view");
+
+let activeThreadId = null;
 
 async function loadMe() {
   const { user } = await api("/me");
@@ -41,27 +56,88 @@ async function loadMe() {
   nameInput.placeholder = "your display name";
 }
 
-function renderPosts(posts) {
-  if (!posts.length) {
-    postsEl.innerHTML = `<p class="muted">no messages on the tape — leave the first.</p>`;
+function renderThreadList(threads) {
+  if (!threads.length) {
+    threadListEl.innerHTML = `<p class="muted">no threads yet — start the first.</p>`;
     return;
   }
 
-  postsEl.innerHTML = posts
+  threadListEl.innerHTML = threads
+    .map((thread) => {
+      const replies =
+        thread.replyCount === 1
+          ? "1 reply"
+          : `${thread.replyCount} replies`;
+      return `
+      <article class="post thread-item">
+        <h3>
+          <a href="#/thread/${thread.id}">${escapeHtml(thread.title)}</a>
+        </h3>
+        <p class="meta">
+          ${escapeHtml(thread.authorName)} · ${escapeHtml(formatTime(thread.createdAt))}
+          · ${replies} · bumped ${escapeHtml(formatTime(thread.bumpedAt))}
+        </p>
+      </article>`;
+    })
+    .join("");
+}
+
+function renderThreadDetail(thread) {
+  const posts = thread.posts
     .map(
-      (post) => `
-      <article class="post">
-        <h3>${escapeHtml(post.title)}</h3>
-        <p class="meta">${escapeHtml(post.authorName)} · ${escapeHtml(formatTime(post.createdAt))}</p>
+      (post, index) => `
+      <article class="post ${index === 0 ? "op" : "reply"}">
+        <p class="meta">
+          ${index === 0 ? "OP · " : `#${index} · "}
+          ${escapeHtml(post.authorName)} · ${escapeHtml(formatTime(post.createdAt))}
+        </p>
         <p class="body">${escapeHtml(post.body)}</p>
       </article>`,
     )
     .join("");
+
+  threadDetailEl.innerHTML = `
+    <h2 class="thread-title">${escapeHtml(thread.title)}</h2>
+    <p class="meta thread-meta">
+      started by ${escapeHtml(thread.authorName)} · ${escapeHtml(formatTime(thread.createdAt))}
+    </p>
+    <div class="posts">${posts}</div>
+  `;
 }
 
-async function loadPosts() {
-  const { posts } = await api("/posts");
-  renderPosts(posts);
+async function loadThreads() {
+  const { threads } = await api("/threads");
+  renderThreadList(threads);
+}
+
+async function loadThread(threadId) {
+  const { thread } = await api(`/threads/${threadId}`);
+  activeThreadId = thread.id;
+  renderThreadDetail(thread);
+  document.title = `${thread.title.toUpperCase()} — BLUE FORUM`;
+}
+
+function showBoard() {
+  activeThreadId = null;
+  boardView.classList.remove("hidden");
+  threadView.classList.add("hidden");
+  document.title = "BLUE FORUM — GENERAL";
+}
+
+function showThread() {
+  boardView.classList.add("hidden");
+  threadView.classList.remove("hidden");
+}
+
+async function route() {
+  const current = parseRoute();
+  if (current.view === "thread") {
+    showThread();
+    await loadThread(current.threadId);
+  } else {
+    showBoard();
+    await loadThreads();
+  }
 }
 
 document.getElementById("rename-form").addEventListener("submit", async (e) => {
@@ -75,40 +151,78 @@ document.getElementById("rename-form").addEventListener("submit", async (e) => {
     });
     nameInput.value = user.name;
     renameStatus.textContent = "saved";
-    await loadPosts();
+    await route();
   } catch (err) {
     renameStatus.textContent = err.message;
     renameStatus.classList.add("error");
   }
 });
 
-document.getElementById("post-form").addEventListener("submit", async (e) => {
+document.getElementById("thread-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const title = document.getElementById("post-title");
-  const body = document.getElementById("post-body");
-  postStatus.textContent = "posting…";
-  postStatus.classList.remove("error");
+  const title = document.getElementById("thread-title");
+  const body = document.getElementById("thread-body");
+  threadStatus.textContent = "starting…";
+  threadStatus.classList.remove("error");
   try {
-    await api("/posts", {
+    const { thread } = await api("/threads", {
       method: "POST",
       body: JSON.stringify({ title: title.value, body: body.value }),
     });
     title.value = "";
     body.value = "";
-    postStatus.textContent = "posted";
-    await loadPosts();
+    threadStatus.textContent = "started";
+    location.hash = `#/thread/${thread.id}`;
   } catch (err) {
-    postStatus.textContent = err.message;
-    postStatus.classList.add("error");
+    threadStatus.textContent = err.message;
+    threadStatus.classList.add("error");
+  }
+});
+
+document.getElementById("reply-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!activeThreadId) return;
+  const body = document.getElementById("reply-body");
+  replyStatus.textContent = "sending…";
+  replyStatus.classList.remove("error");
+  try {
+    await api(`/threads/${activeThreadId}/posts`, {
+      method: "POST",
+      body: JSON.stringify({ body: body.value }),
+    });
+    body.value = "";
+    replyStatus.textContent = "sent";
+    await loadThread(activeThreadId);
+  } catch (err) {
+    replyStatus.textContent = err.message;
+    replyStatus.classList.add("error");
   }
 });
 
 document.getElementById("refresh").addEventListener("click", () => {
-  loadPosts().catch((err) => {
-    postsEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+  loadThreads().catch((err) => {
+    threadListEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
   });
 });
 
-Promise.all([loadMe(), loadPosts()]).catch((err) => {
-  postsEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+document.getElementById("refresh-thread").addEventListener("click", () => {
+  if (!activeThreadId) return;
+  loadThread(activeThreadId).catch((err) => {
+    threadDetailEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+  });
+});
+
+document.getElementById("back-board").addEventListener("click", () => {
+  location.hash = "#/";
+});
+
+window.addEventListener("hashchange", () => {
+  route().catch((err) => {
+    const target = parseRoute().view === "thread" ? threadDetailEl : threadListEl;
+    target.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
+  });
+});
+
+Promise.all([loadMe(), route()]).catch((err) => {
+  threadListEl.innerHTML = `<p class="error">${escapeHtml(err.message)}</p>`;
 });

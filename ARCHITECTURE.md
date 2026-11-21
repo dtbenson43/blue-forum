@@ -28,5 +28,12 @@ Browser (WebTUI)
 ## Data
 
 - `users(id, name, created_at)`
-- `posts(id, user_id, title, body, created_at)`
-- Category is implicit: one DO named `general`.
+- `threads(id, user_id, title, created_at, bumped_at)`
+- `posts(id, thread_id, user_id, body, created_at)` — OP is the first post
+- Category is implicit: one DO named `general`
+- Schema version tracked in `schema_meta` (v2 = threads)
+
+## Routes
+
+- Board: `#/` — list threads, start a thread
+- Thread: `#/thread/:id` — read posts, reply
