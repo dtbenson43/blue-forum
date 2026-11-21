@@ -126,7 +126,7 @@ function renderThreadDetail(thread) {
       (post, index) => `
       <article class="post">
         <header class="post-header">
-          ${index === 0 ? "OP · " : `#${index} · "}
+          ${index === 0 ? "OP · " : "#" + index + " · "}
           <strong>${escapeHtml(post.authorName)}</strong>
           · <time datetime="${escapeHtml(post.createdAt)}">${escapeHtml(formatTime(post.createdAt))}</time>
         </header>
