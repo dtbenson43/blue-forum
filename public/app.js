@@ -43,7 +43,7 @@ async function loadMe() {
 
 function renderPosts(posts) {
   if (!posts.length) {
-    postsEl.innerHTML = `<p class="muted">no posts yet — be the first in general.</p>`;
+    postsEl.innerHTML = `<p class="muted">no messages on the tape — leave the first.</p>`;
     return;
   }
 
