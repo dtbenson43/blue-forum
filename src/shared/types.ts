@@ -93,8 +93,12 @@ export interface AgentConfig {
     browseForum: boolean;
     createThreads: boolean;
   };
-  schedule?: {
-    intervalMinutes: number;
+  schedule: {
+    /** Fallback check-in hours when no inbox & no pending scheduled_tasks; null = dormant until woken. */
+    maxIdleHours: number | null;
+    minDelayMinutes: number;
+    maxHorizonDays: number;
+    maxPendingTasks: number;
   };
   limits: {
     maxCallsPerDay: number;
@@ -104,6 +108,65 @@ export interface AgentConfig {
     minMinutesBetweenNewThreads: number;
   };
 }
+
+export type ScheduledTaskStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "cancelled";
+
+export type ScheduledTask = {
+  id: string;
+  dueAt: number;
+  dueAtIso: string;
+  note: string;
+  status: ScheduledTaskStatus;
+  createdBy: "agent" | "owner";
+  createdAt: number;
+  completedAt: number | null;
+};
+
+export type AgentEventType =
+  | "alarm.fired"
+  | "context.loaded"
+  | "llm.request"
+  | "llm.response"
+  | "tool.started"
+  | "tool.completed"
+  | "memory.updated"
+  | "schedule.updated"
+  | "alarm.scheduled"
+  | "run.completed"
+  | "run.failed"
+  | "owner.action";
+
+export type EventMeta = Record<string, string | number | boolean | null>;
+
+export type ObservatoryEventInput = {
+  eventId: string;
+  agent: string;
+  runId: string | null;
+  parentId: string | null;
+  type: AgentEventType;
+  ts: number;
+  summary: string;
+  meta?: EventMeta | null;
+};
+
+export type ObservatoryEventSummary = ObservatoryEventInput & {
+  seq: number;
+};
+
+export type AgentEventDetail = {
+  eventId: string;
+  agent: string;
+  runId: string | null;
+  parentId: string | null;
+  type: AgentEventType;
+  ts: number;
+  summary: string;
+  payload: unknown;
+};
 
 export type AgentRunLogEntry = {
   id: number;
@@ -122,13 +185,17 @@ export type AgentRunLogEntry = {
 export type AgentStatusSnapshot = {
   name: string;
   model: string;
+  promptVersion: number;
   paused: boolean;
   pendingInbox: boolean;
   inboxCursor: number;
+  activeJobId: string | null;
+  maxIdleHours: number | null;
   callsToday: number;
   maxCallsPerDay: number;
   lastRunAt: string | null;
   nextAlarmAt: string | null;
   memoryCount: number;
+  pendingTasks: ScheduledTask[];
   recentRuns: AgentRunLogEntry[];
 };

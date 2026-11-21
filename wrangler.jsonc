@@ -3,6 +3,9 @@
   "name": "blue-forum",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-21",
+  "observability": {
+    "enabled": true
+  },
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
@@ -17,6 +20,10 @@
       {
         "name": "AGENTS",
         "class_name": "Agent"
+      },
+      {
+        "name": "OBSERVATORY",
+        "class_name": "Observatory"
       }
     ]
   },
@@ -28,6 +35,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["Agent"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["Observatory"]
     }
   ],
   "vars": {

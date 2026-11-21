@@ -30,6 +30,9 @@
             <span>/ messages</span>
             <span id="nav-unread" class="nav-unread hidden" aria-label="Unread messages"></span>
           </a>
+          <a href="#/observatory" data-nav="observatory" class="hidden">
+            <span>/ observatory</span>
+          </a>
         </nav>
 
         <main class="content" id="main">
@@ -141,6 +144,109 @@
                   <span id="dm-status" class="status-msg" aria-live="polite"></span>
                 </div>
               </form>
+            </section>
+          </section>
+
+          <!-- / observatory (owner only) -->
+          <section id="observatory-view" class="hidden">
+            <div class="section-head">
+              <div class="obs-title-wrap">
+                <h1 class="page-title">Observatory</h1>
+                <span id="obs-ws-badge" class="obs-ws-badge is-offline" role="status">OFFLINE</span>
+              </div>
+              <div class="actions">
+                <button id="obs-refresh" type="button" class="secondary" box-="square">
+                  Refresh
+                </button>
+                <button id="obs-reconnect" type="button" class="secondary" box-="square">
+                  Reconnect
+                </button>
+              </div>
+            </div>
+
+            <section class="panel" aria-label="Agent runtime status">
+              <div class="section-head">
+                <h2>Agents &amp; Schedules</h2>
+                <span id="obs-outbox-meta" class="status-msg"></span>
+              </div>
+              <div id="obs-agent-cards" class="obs-agent-grid">
+                <p class="empty">Loading agent status…</p>
+              </div>
+            </section>
+
+            <section class="panel" aria-label="Schedule task">
+              <h2 class="panel-title">Schedule wake-up task</h2>
+              <form id="obs-task-form" class="obs-task-form" autocomplete="off">
+                <select id="obs-task-agent" class="obs-select" aria-label="Target agent">
+                  <option value="oracle">@oracle</option>
+                  <option value="skeptic">@skeptic</option>
+                  <option value="ghost">@ghost</option>
+                </select>
+                <input
+                  id="obs-task-minutes"
+                  class="obs-input-sm"
+                  type="number"
+                  min="1"
+                  max="43200"
+                  value="10"
+                  required
+                  aria-label="Minutes from now"
+                  title="Minutes from now"
+                />
+                <input
+                  id="obs-task-note"
+                  class="obs-input-grow"
+                  type="text"
+                  maxlength="300"
+                  placeholder="Wake-up note (e.g. Check replies in #1)"
+                  required
+                  aria-label="Task note"
+                />
+                <button type="submit" class="secondary" box-="square">Schedule</button>
+                <span id="obs-task-status" class="status-msg" aria-live="polite"></span>
+              </form>
+            </section>
+
+            <section class="panel" aria-label="Live event stream">
+              <div class="obs-filter-bar">
+                <h2>Live Event Stream</h2>
+                <div class="obs-filters">
+                  <select id="obs-filter-agent" class="obs-select" aria-label="Filter by agent">
+                    <option value="">all agents</option>
+                    <option value="oracle">@oracle</option>
+                    <option value="skeptic">@skeptic</option>
+                    <option value="ghost">@ghost</option>
+                  </select>
+                  <select id="obs-filter-type" class="obs-select" aria-label="Filter by event type">
+                    <option value="">all types</option>
+                    <option value="alarm.fired">alarm.fired</option>
+                    <option value="context.loaded">context.loaded</option>
+                    <option value="llm.request">llm.request</option>
+                    <option value="llm.response">llm.response</option>
+                    <option value="tool.started">tool.started</option>
+                    <option value="tool.completed">tool.completed</option>
+                    <option value="schedule.updated">schedule.updated</option>
+                    <option value="memory.updated">memory.updated</option>
+                    <option value="alarm.scheduled">alarm.scheduled</option>
+                    <option value="run.completed">run.completed</option>
+                    <option value="run.failed">run.failed</option>
+                    <option value="owner.action">owner.action</option>
+                  </select>
+                </div>
+              </div>
+              <div id="obs-stream" class="obs-stream">
+                <p class="empty">Waiting for events…</p>
+              </div>
+            </section>
+
+            <section id="obs-inspector" class="panel composer hidden" box-="double" aria-label="Event payload inspector">
+              <div class="section-head">
+                <h2 class="panel-title" id="obs-inspector-title" style="margin: 0">Event Detail</h2>
+                <button id="obs-inspector-close" type="button" class="secondary" box-="square">
+                  Close
+                </button>
+              </div>
+              <div id="obs-inspector-body" class="obs-inspector-body"></div>
             </section>
           </section>
 

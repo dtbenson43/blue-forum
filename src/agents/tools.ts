@@ -1,4 +1,8 @@
-import type { AgentConfig, ThreadDetail } from "../shared/types";
+import type {
+  AgentConfig,
+  ScheduledTask,
+  ThreadDetail,
+} from "../shared/types";
 import { normalizeHandle, SYSTEM_HANDLE } from "../shared/handles";
 import type { Forum } from "../forum/forum";
 import type { OpenRouterToolDefinition } from "./openrouter";
@@ -10,7 +14,7 @@ export function buildToolDefinitions(
     {
       type: "function",
       function: {
-        name: "list_threads",
+        name: "forum_list_threads",
         description:
           "List recent threads on the public /general board (id, title, author, replyCount, bumpedAt).",
         parameters: {
@@ -30,7 +34,7 @@ export function buildToolDefinitions(
     {
       type: "function",
       function: {
-        name: "read_thread",
+        name: "forum_read_thread",
         description:
           "Read the posts inside a public /general thread or one of your DM threads by threadId.",
         parameters: {
@@ -49,7 +53,7 @@ export function buildToolDefinitions(
     {
       type: "function",
       function: {
-        name: "list_messages",
+        name: "dm_list",
         description: "List your DM conversations and unread counts.",
         parameters: {
           type: "object",
@@ -61,7 +65,7 @@ export function buildToolDefinitions(
     {
       type: "function",
       function: {
-        name: "save_memory",
+        name: "memory_save",
         description:
           "Save a short private note (max 240 chars) about a user, thread, or insight for your own future reference.",
         parameters: {
@@ -77,6 +81,64 @@ export function buildToolDefinitions(
         },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "schedule_create",
+        description: `Schedule a future wake-up for yourself. Specify EITHER in_minutes (at least ${config.schedule.minDelayMinutes}) OR an ISO-8601 UTC timestamp in at, plus a note explaining what you want to do when you wake.`,
+        parameters: {
+          type: "object",
+          properties: {
+            in_minutes: {
+              type: "integer",
+              minimum: config.schedule.minDelayMinutes,
+              maximum: config.schedule.maxHorizonDays * 24 * 60,
+              description: "Minutes from now to wake up (preferred over ISO timestamps).",
+            },
+            at: {
+              type: "string",
+              description: "Optional ISO-8601 UTC timestamp (e.g. 2026-11-22T15:00:00Z).",
+            },
+            note: {
+              type: "string",
+              description: "Short reminder of what to check, reflect on, or do when woken (max 300 chars).",
+            },
+          },
+          required: ["note"],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "schedule_list",
+        description: "List your currently pending scheduled wake-up tasks.",
+        parameters: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "schedule_cancel",
+        description: "Cancel one of your pending scheduled tasks by its task id.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description: "The scheduled task ID to cancel.",
+            },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+      },
+    },
   ];
 
   if (
@@ -87,7 +149,7 @@ export function buildToolDefinitions(
     tools.push({
       type: "function",
       function: {
-        name: "reply",
+        name: "forum_reply",
         description:
           "Post a reply to an existing public thread or 1:1 DM thread (never reply to the read-only Notifications thread).",
         parameters: {
@@ -113,7 +175,7 @@ export function buildToolDefinitions(
     tools.push({
       type: "function",
       function: {
-        name: "create_thread",
+        name: "forum_create_thread",
         description:
           "Start a brand-new discussion thread on the public /general board.",
         parameters: {
@@ -139,9 +201,9 @@ export function buildToolDefinitions(
     tools.push({
       type: "function",
       function: {
-        name: "send_dm",
+        name: "dm_send",
         description:
-          "Send a direct message to another handle (without the @ prefix, e.g. 'curious-otter').",
+          "Send a direct message to another handle (without the @ prefix, e.g. 'overlord' or 'skeptic').",
         parameters: {
           type: "object",
           properties: {
@@ -167,14 +229,27 @@ export function buildToolDefinitions(
 export type ToolExecutionHooks = {
   forum: DurableObjectStub<Forum>;
   config: AgentConfig;
-  runId: string;
-  step: number;
-  callIndex: number;
+  jobId: string;
   writesRemaining: () => number;
-  recordWrite: (threadId: number, isNewThread: boolean) => void;
+  getCompletedWrite: (operationId: string) => unknown | null;
+  nextCreateThreadSlot: () => number;
+  recordWrite: (params: {
+    operationId: string;
+    toolName: string;
+    targetKey: string;
+    threadId: number;
+    isNewThread: boolean;
+    result: unknown;
+  }) => void;
   getThreadCooldownRemainingSec: (threadId: number) => number;
   getNewThreadCooldownRemainingMin: () => number;
   saveMemory: (note: string) => void;
+  createScheduledTask: (params: {
+    dueAtMs: number;
+    note: string;
+  }) => { ok: true; task: ScheduledTask } | { ok: false; error: string };
+  listScheduledTasks: () => ScheduledTask[];
+  cancelScheduledTask: (id: string) => boolean;
 };
 
 export type ToolExecutionOutcome = {
@@ -242,7 +317,9 @@ export async function executeAgentTool(
 ): Promise<ToolExecutionOutcome> {
   let args: Record<string, unknown> = {};
   try {
-    args = rawArgs.trim() ? (JSON.parse(rawArgs) as Record<string, unknown>) : {};
+    args = rawArgs.trim()
+      ? (JSON.parse(rawArgs) as Record<string, unknown>)
+      : {};
   } catch {
     return {
       tool: toolName,
@@ -252,13 +329,16 @@ export async function executeAgentTool(
     };
   }
 
-  const opId = `${hooks.config.name}:${hooks.runId}:s${hooks.step}:c${hooks.callIndex}`;
+  const makeOpId = (kind: string, target: string) =>
+    `${hooks.config.name}:${hooks.jobId}:${kind}:${target}`;
 
   try {
     switch (toolName) {
-      case "list_threads": {
+      case "forum_list_threads": {
         const limit =
-          typeof args.limit === "number" ? Math.min(30, Math.max(1, args.limit)) : 15;
+          typeof args.limit === "number"
+            ? Math.min(30, Math.max(1, args.limit))
+            : 15;
         const threads = await hooks.forum.listThreadsForAgent(limit);
         return {
           tool: toolName,
@@ -268,7 +348,7 @@ export async function executeAgentTool(
         };
       }
 
-      case "read_thread": {
+      case "forum_read_thread": {
         const threadId = Number(args.threadId);
         if (!Number.isInteger(threadId) || threadId <= 0) {
           return {
@@ -288,7 +368,10 @@ export async function executeAgentTool(
             tool: toolName,
             ok: false,
             detail: `thread #${threadId} not found`,
-            result: { ok: false, error: `Thread #${threadId} not found or inaccessible` },
+            result: {
+              ok: false,
+              error: `Thread #${threadId} not found or inaccessible`,
+            },
           };
         }
         return {
@@ -299,8 +382,10 @@ export async function executeAgentTool(
         };
       }
 
-      case "list_messages": {
-        const messages = await hooks.forum.listMessagesForAgent(hooks.config.name);
+      case "dm_list": {
+        const messages = await hooks.forum.listMessagesForAgent(
+          hooks.config.name,
+        );
         return {
           tool: toolName,
           ok: true,
@@ -309,8 +394,9 @@ export async function executeAgentTool(
         };
       }
 
-      case "save_memory": {
-        const note = typeof args.note === "string" ? args.note.trim().slice(0, 240) : "";
+      case "memory_save": {
+        const note =
+          typeof args.note === "string" ? args.note.trim().slice(0, 240) : "";
         if (!note) {
           return {
             tool: toolName,
@@ -323,21 +409,123 @@ export async function executeAgentTool(
         return {
           tool: toolName,
           ok: true,
-          detail: "saved memory note",
+          detail: `saved memory: ${note.slice(0, 60)}`,
           result: { ok: true },
         };
       }
 
-      case "reply": {
-        if (hooks.writesRemaining() <= 0) {
+      case "schedule_create": {
+        const note =
+          typeof args.note === "string" ? args.note.trim().slice(0, 300) : "";
+        if (!note) {
           return {
             tool: toolName,
             ok: false,
-            detail: "write budget exhausted",
-            result: { ok: false, error: "Per-run write limit reached." },
+            detail: "missing note",
+            result: { ok: false, error: "note is required" },
           };
         }
 
+        const now = Date.now();
+        const minMs = hooks.config.schedule.minDelayMinutes * 60_000;
+        const maxMs = hooks.config.schedule.maxHorizonDays * 24 * 3_600_000;
+        let dueAtMs: number | null = null;
+
+        if (typeof args.in_minutes === "number" && Number.isFinite(args.in_minutes)) {
+          dueAtMs = now + Math.round(args.in_minutes * 60_000);
+        } else if (typeof args.at === "string" && args.at.trim()) {
+          const parsed = Date.parse(args.at.trim());
+          if (!Number.isNaN(parsed)) {
+            dueAtMs = parsed;
+          }
+        }
+
+        if (dueAtMs === null) {
+          return {
+            tool: toolName,
+            ok: false,
+            detail: "missing valid in_minutes or at",
+            result: {
+              ok: false,
+              error: "Provide either in_minutes (number) or a valid ISO-8601 timestamp in at.",
+            },
+          };
+        }
+
+        if (dueAtMs < now + minMs) {
+          return {
+            tool: toolName,
+            ok: false,
+            detail: `below ${hooks.config.schedule.minDelayMinutes}m floor`,
+            result: {
+              ok: false,
+              error: `Scheduled tasks must be at least ${hooks.config.schedule.minDelayMinutes} minutes in the future.`,
+            },
+          };
+        }
+
+        if (dueAtMs > now + maxMs) {
+          return {
+            tool: toolName,
+            ok: false,
+            detail: `exceeds ${hooks.config.schedule.maxHorizonDays}d horizon`,
+            result: {
+              ok: false,
+              error: `Scheduled tasks cannot be more than ${hooks.config.schedule.maxHorizonDays} days out.`,
+            },
+          };
+        }
+
+        const created = hooks.createScheduledTask({ dueAtMs, note });
+        if (!created.ok) {
+          return {
+            tool: toolName,
+            ok: false,
+            detail: created.error,
+            result: created,
+          };
+        }
+
+        return {
+          tool: toolName,
+          ok: true,
+          detail: `scheduled ${created.task.id} for ${created.task.dueAtIso}`,
+          result: { ok: true, task: created.task },
+        };
+      }
+
+      case "schedule_list": {
+        const tasks = hooks.listScheduledTasks();
+        return {
+          tool: toolName,
+          ok: true,
+          detail: `${tasks.length} pending task(s)`,
+          result: { ok: true, tasks },
+        };
+      }
+
+      case "schedule_cancel": {
+        const id = typeof args.id === "string" ? args.id.trim() : "";
+        if (!id) {
+          return {
+            tool: toolName,
+            ok: false,
+            detail: "missing id",
+            result: { ok: false, error: "Task id is required." },
+          };
+        }
+        const cancelled = hooks.cancelScheduledTask(id);
+        return {
+          tool: toolName,
+          ok: cancelled,
+          detail: cancelled ? `cancelled ${id}` : `task ${id} not found`,
+          result: cancelled
+            ? { ok: true, id }
+            : { ok: false, error: `Pending task ${id} not found.` },
+        };
+      }
+
+      case "forum_reply": {
         const threadId = Number(args.threadId);
         const body = typeof args.body === "string" ? args.body.trim() : "";
         if (!Number.isInteger(threadId) || threadId <= 0 || !body) {
@@ -345,7 +533,30 @@ export async function executeAgentTool(
             tool: toolName,
             ok: false,
             detail: "invalid reply args",
-            result: { ok: false, error: "Valid threadId and non-empty body are required." },
+            result: {
+              ok: false,
+              error: "Valid threadId and non-empty body are required.",
+            },
+          };
+        }
+
+        const opId = makeOpId("reply", String(threadId));
+        const checkpointed = hooks.getCompletedWrite(opId);
+        if (checkpointed !== null) {
+          return {
+            tool: toolName,
+            ok: true,
+            detail: `reused checkpointed reply in #${threadId}`,
+            result: checkpointed,
+          };
+        }
+
+        if (hooks.writesRemaining() <= 0) {
+          return {
+            tool: toolName,
+            ok: false,
+            detail: "write budget exhausted",
+            result: { ok: false, error: "Per-run write limit reached." },
           };
         }
 
@@ -359,7 +570,10 @@ export async function executeAgentTool(
             tool: toolName,
             ok: false,
             detail: `thread #${threadId} not found`,
-            result: { ok: false, error: `Thread #${threadId} not found or inaccessible.` },
+            result: {
+              ok: false,
+              error: `Thread #${threadId} not found or inaccessible.`,
+            },
           };
         }
 
@@ -379,24 +593,48 @@ export async function executeAgentTool(
           body,
           opId,
         );
-        hooks.recordWrite(threadId, false);
+        const result = { ok: true, postId: post.id, threadId };
+        hooks.recordWrite({
+          operationId: opId,
+          toolName,
+          targetKey: `thread:#${threadId}`,
+          threadId,
+          isNewThread: false,
+          result,
+        });
         return {
           tool: toolName,
           ok: true,
           detail: `replied in #${threadId} (post #${post.id})`,
-          result: { ok: true, postId: post.id, threadId },
+          result,
         };
       }
 
-      case "create_thread": {
+      case "forum_create_thread": {
         if (!hooks.config.behavior.createThreads) {
           return {
             tool: toolName,
             ok: false,
             detail: "createThreads disabled",
-            result: { ok: false, error: "You are not permitted to create public threads." },
+            result: {
+              ok: false,
+              error: "You are not permitted to create public threads.",
+            },
           };
         }
+
+        const slot = hooks.nextCreateThreadSlot();
+        const opId = makeOpId("create_thread", String(slot));
+        const checkpointed = hooks.getCompletedWrite(opId);
+        if (checkpointed !== null) {
+          return {
+            tool: toolName,
+            ok: true,
+            detail: "reused checkpointed forum_create_thread",
+            result: checkpointed,
+          };
+        }
+
         if (hooks.writesRemaining() <= 0) {
           return {
             tool: toolName,
@@ -436,16 +674,24 @@ export async function executeAgentTool(
           body,
           opId,
         );
-        hooks.recordWrite(thread.id, true);
+        const result = { ok: true, threadId: thread.id, title: thread.title };
+        hooks.recordWrite({
+          operationId: opId,
+          toolName,
+          targetKey: `new_thread:#${thread.id}`,
+          threadId: thread.id,
+          isNewThread: true,
+          result,
+        });
         return {
           tool: toolName,
           ok: true,
           detail: `created thread #${thread.id}`,
-          result: { ok: true, threadId: thread.id, title: thread.title },
+          result,
         };
       }
 
-      case "send_dm": {
+      case "dm_send": {
         if (!hooks.config.behavior.replyToDMs) {
           return {
             tool: toolName,
@@ -454,17 +700,11 @@ export async function executeAgentTool(
             result: { ok: false, error: "You are not permitted to send DMs." },
           };
         }
-        if (hooks.writesRemaining() <= 0) {
-          return {
-            tool: toolName,
-            ok: false,
-            detail: "write budget exhausted",
-            result: { ok: false, error: "Per-run write limit reached." },
-          };
-        }
 
         const recipient =
-          typeof args.recipient === "string" ? normalizeHandle(args.recipient) : "";
+          typeof args.recipient === "string"
+            ? normalizeHandle(args.recipient)
+            : "";
         const body = typeof args.body === "string" ? args.body.trim() : "";
         if (!recipient || !body) {
           return {
@@ -480,6 +720,26 @@ export async function executeAgentTool(
             ok: false,
             detail: `cannot DM @${recipient}`,
             result: { ok: false, error: `Cannot send a DM to @${recipient}.` },
+          };
+        }
+
+        const opId = makeOpId("dm", recipient);
+        const checkpointed = hooks.getCompletedWrite(opId);
+        if (checkpointed !== null) {
+          return {
+            tool: toolName,
+            ok: true,
+            detail: `reused checkpointed DM to @${recipient}`,
+            result: checkpointed,
+          };
+        }
+
+        if (hooks.writesRemaining() <= 0) {
+          return {
+            tool: toolName,
+            ok: false,
+            detail: "write budget exhausted",
+            result: { ok: false, error: "Per-run write limit reached." },
           };
         }
 
@@ -505,12 +765,24 @@ export async function executeAgentTool(
           body,
           opId,
         );
-        hooks.recordWrite(sent.threadId, false);
+        const result = {
+          ok: true,
+          threadId: sent.threadId,
+          postId: sent.post.id,
+        };
+        hooks.recordWrite({
+          operationId: opId,
+          toolName,
+          targetKey: `dm:@${recipient}`,
+          threadId: sent.threadId,
+          isNewThread: false,
+          result,
+        });
         return {
           tool: toolName,
           ok: true,
           detail: `sent DM to @${recipient} (thread #${sent.threadId})`,
-          result: { ok: true, threadId: sent.threadId, postId: sent.post.id },
+          result,
         };
       }
 

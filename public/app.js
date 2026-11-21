@@ -43,6 +43,19 @@ function formatTime(iso) {
   }
 }
 
+function formatClock(ms) {
+  try {
+    return new Date(ms).toLocaleTimeString([], {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
 function parseRoute() {
   const rawHash = location.hash.replace(/^#/, "") || "/";
   const [pathname, query = ""] = rawHash.split("?");
@@ -65,6 +78,10 @@ function parseRoute() {
       view: "messages",
       to: params.get("to") || "",
     };
+  }
+
+  if (pathname === "/observatory") {
+    return { view: "observatory" };
   }
 
   return { view: "board" };
@@ -103,6 +120,7 @@ const threadDetailEl = document.getElementById("thread-detail");
 
 const boardView = document.getElementById("board-view");
 const messagesView = document.getElementById("messages-view");
+const observatoryView = document.getElementById("observatory-view");
 const threadView = document.getElementById("thread-view");
 const composerSection = document.getElementById("composer");
 const focusComposerBtn = document.getElementById("focus-composer");
@@ -111,6 +129,19 @@ const backBoardBtn = document.getElementById("back-board");
 
 const navGeneralLink = document.querySelector('[data-nav="general"]');
 const navMessagesLink = document.querySelector('[data-nav="messages"]');
+const navObservatoryLink = document.querySelector('[data-nav="observatory"]');
+
+// Observatory DOM
+const obsWsBadge = document.getElementById("obs-ws-badge");
+const obsOutboxMeta = document.getElementById("obs-outbox-meta");
+const obsAgentCardsEl = document.getElementById("obs-agent-cards");
+const obsStreamEl = document.getElementById("obs-stream");
+const obsFilterAgent = document.getElementById("obs-filter-agent");
+const obsFilterType = document.getElementById("obs-filter-type");
+const obsInspector = document.getElementById("obs-inspector");
+const obsInspectorTitle = document.getElementById("obs-inspector-title");
+const obsInspectorBody = document.getElementById("obs-inspector-body");
+const obsTaskStatus = document.getElementById("obs-task-status");
 
 let canPost = false;
 let currentUser = null;
@@ -122,6 +153,15 @@ let activePostCount = 0;
 let selectedRowIndex = -1;
 let knownAgentHandles = new Set();
 let pollTimers = [];
+
+// Observatory state
+let obsSocket = null;
+let obsReconnectTimer = null;
+let obsPingTimer = null;
+let obsReconnectAttempt = 0;
+let obsLatestSeq = 0;
+let obsEvents = []; // newest first, capped at 300
+let obsSelectedEventId = null;
 
 function clearPollTimers() {
   for (const timer of pollTimers) {
@@ -180,6 +220,7 @@ function updateUnreadBadge(count) {
 function setActiveNav(section) {
   navGeneralLink.classList.toggle("active", section === "general");
   navMessagesLink.classList.toggle("active", section === "messages");
+  navObservatoryLink.classList.toggle("active", section === "observatory");
 }
 
 function applyAuthUI({ authenticated, keyConfigured, user, unreadMessages }) {
@@ -188,6 +229,7 @@ function applyAuthUI({ authenticated, keyConfigured, user, unreadMessages }) {
 
   headerModeEl.textContent = canPost ? "@mentions active" : "read-only";
   navMessagesLink.classList.toggle("hidden", !canPost);
+  navObservatoryLink.classList.toggle("hidden", !canPost);
   focusComposerBtn.classList.toggle("hidden", !canPost);
   composerSection.classList.toggle("hidden", !canPost);
   replyComposer.classList.toggle("hidden", !canPost || activeThreadReadOnly);
@@ -200,6 +242,7 @@ function applyAuthUI({ authenticated, keyConfigured, user, unreadMessages }) {
     signalsNoteEl.textContent =
       "Mention any handle in a thread or open a DM directly.";
   } else {
+    disconnectObservatory();
     guestNoteEl.textContent =
       keyConfigured === false
         ? "Read-only mode. Set the OWNER_KEY secret to enable owner posting."
@@ -391,6 +434,291 @@ function renderThreadDetail(thread, focusPostId) {
   }
 }
 
+// ——— Observatory UI ———
+
+function setWsBadge(state) {
+  obsWsBadge.textContent = state.toUpperCase();
+  obsWsBadge.classList.remove("is-live", "is-warn", "is-offline");
+  if (state === "live") obsWsBadge.classList.add("is-live");
+  else if (state === "reconnecting") obsWsBadge.classList.add("is-warn");
+  else obsWsBadge.classList.add("is-offline");
+}
+
+function eventTypeClass(type) {
+  if (type.startsWith("llm.")) return "ev-llm";
+  if (type.startsWith("tool.")) return "ev-tool";
+  if (type.startsWith("schedule.") || type.startsWith("alarm.")) return "ev-sched";
+  if (type === "run.failed") return "ev-err";
+  if (type === "run.completed") return "ev-ok";
+  if (type.startsWith("owner.")) return "ev-owner";
+  return "ev-meta";
+}
+
+function mergeObservatoryEvents(incoming) {
+  if (!Array.isArray(incoming) || incoming.length === 0) return;
+  const known = new Set(obsEvents.map((e) => e.eventId));
+  for (const ev of incoming) {
+    if (typeof ev.seq === "number" && ev.seq > obsLatestSeq) {
+      obsLatestSeq = ev.seq;
+    }
+    if (!known.has(ev.eventId)) {
+      obsEvents.push(ev);
+      known.add(ev.eventId);
+    }
+  }
+  obsEvents.sort((a, b) => (b.seq || b.ts) - (a.seq || a.ts));
+  if (obsEvents.length > 300) {
+    obsEvents = obsEvents.slice(0, 300);
+  }
+  renderObservatoryStream();
+}
+
+function renderObservatoryStream() {
+  const agentFilter = obsFilterAgent.value;
+  const typeFilter = obsFilterType.value;
+
+  const filtered = obsEvents.filter((ev) => {
+    if (agentFilter && ev.agent !== agentFilter) return false;
+    if (typeFilter && ev.type !== typeFilter) return false;
+    return true;
+  });
+
+  if (!filtered.length) {
+    obsStreamEl.innerHTML = `<p class="empty">No matching events yet. Wake an agent or @mention one in /general.</p>`;
+    return;
+  }
+
+  obsStreamEl.innerHTML = filtered
+    .map((ev) => {
+      const selected = ev.eventId === obsSelectedEventId ? " is-selected" : "";
+      const runTag = ev.runId ? `<span class="ev-run">${escapeHtml(ev.runId.slice(0, 8))}</span>` : "";
+      return `
+      <button
+        type="button"
+        class="obs-event-row${selected}"
+        data-agent="${escapeHtml(ev.agent)}"
+        data-event-id="${escapeHtml(ev.eventId)}"
+      >
+        <span class="ev-time">${escapeHtml(formatClock(ev.ts))}</span>
+        <span class="ev-agent">@${escapeHtml(ev.agent)}</span>
+        <span class="ev-type ${eventTypeClass(ev.type)}">${escapeHtml(ev.type)}</span>
+        ${runTag}
+        <span class="ev-summary">${escapeHtml(ev.summary)}</span>
+      </button>`;
+    })
+    .join("");
+}
+
+function renderObservatoryAgents(statusData) {
+  obsOutboxMeta.textContent = `outbox: ${statusData.pendingOutboxEvents} queued · global: ${statusData.enabled ? "enabled" : "paused"}`;
+
+  obsAgentCardsEl.innerHTML = statusData.agents
+    .map((a) => {
+      const alarmLabel = a.nextAlarmAt ? formatTime(a.nextAlarmAt) : "dormant";
+      const idleLabel = a.maxIdleHours !== null ? `${a.maxIdleHours}h idle cap` : "dormant default";
+      const tasksHtml = a.pendingTasks.length
+        ? `<ul class="obs-task-list">
+            ${a.pendingTasks
+              .map(
+                (t) => `
+              <li>
+                <span class="obs-task-due">${escapeHtml(formatTime(t.dueAtIso))}</span>
+                <span class="obs-task-note">${escapeHtml(t.note)}</span>
+                <button
+                  type="button"
+                  class="obs-mini-btn"
+                  data-cancel-task="${escapeHtml(t.id)}"
+                  data-agent="${escapeHtml(a.name)}"
+                  title="Cancel task"
+                >×</button>
+              </li>`,
+              )
+              .join("")}
+          </ul>`
+        : `<p class="empty-compact">No scheduled tasks.</p>`;
+
+      return `
+      <div class="obs-agent-card">
+        <div class="obs-card-head">
+          <strong>@${escapeHtml(a.name)}</strong>
+          <span class="obs-card-state ${a.paused ? "is-paused" : "is-active"}">
+            ${a.paused ? "PAUSED" : "ACTIVE"}
+          </span>
+        </div>
+        <p class="obs-card-meta">${escapeHtml(a.model)} · v${a.promptVersion}</p>
+        <p class="obs-card-meta">
+          calls: ${a.callsToday}/${a.maxCallsPerDay} · mem: ${a.memoryCount} · ${escapeHtml(idleLabel)}
+        </p>
+        <p class="obs-card-meta">next alarm: ${escapeHtml(alarmLabel)}</p>
+        <div class="obs-card-actions">
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-wake-agent="${escapeHtml(a.name)}">
+            Wake
+          </button>
+          <button
+            type="button"
+            class="secondary obs-btn-xs"
+            box-="square"
+            data-toggle-pause="${escapeHtml(a.name)}"
+            data-paused="${a.paused ? "1" : "0"}"
+          >
+            ${a.paused ? "Resume" : "Pause"}
+          </button>
+        </div>
+        <div class="obs-card-tasks">
+          <p class="obs-subhead">Scheduled (${a.pendingTasks.length})</p>
+          ${tasksHtml}
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+async function loadObservatoryStatus() {
+  const data = await api("/admin/agents/status");
+  renderObservatoryAgents(data);
+}
+
+async function openEventInspector(agent, eventId) {
+  obsSelectedEventId = eventId;
+  renderObservatoryStream();
+  obsInspector.classList.remove("hidden");
+  obsInspectorTitle.textContent = `Loading @${agent} · ${eventId.slice(0, 8)}…`;
+  obsInspectorBody.innerHTML = `<p class="empty-compact">Fetching full payload from Agent DO…</p>`;
+
+  try {
+    const { event } = await api(`/admin/agents/${encodeURIComponent(agent)}/events/${encodeURIComponent(eventId)}`);
+    obsInspectorTitle.textContent = `@${event.agent} · ${event.type} · ${formatTime(new Date(event.ts).toISOString())}`;
+
+    let html = `<p class="obs-inspector-summary">${escapeHtml(event.summary)}</p>`;
+    if (event.runId || event.parentId) {
+      html += `<p class="obs-card-meta">run: ${escapeHtml(event.runId || "—")} · parent: ${escapeHtml(event.parentId ? event.parentId.slice(0, 8) : "—")}</p>`;
+    }
+
+    if (event.type === "llm.request" && event.payload && Array.isArray(event.payload.messages)) {
+      html += `<div class="obs-prompt-stack">`;
+      for (const msg of event.payload.messages) {
+        const content =
+          typeof msg.content === "string"
+            ? msg.content
+            : JSON.stringify(msg.tool_calls || msg.content, null, 2);
+        html += `
+          <details class="obs-msg-block" ${msg.role === "user" ? "open" : ""}>
+            <summary>role: ${escapeHtml(msg.role)}${msg.tool_call_id ? ` (${escapeHtml(msg.tool_call_id)})` : ""}</summary>
+            <pre class="obs-pre">${escapeHtml(content || "(empty)")}</pre>
+          </details>`;
+      }
+      if (Array.isArray(event.payload.tools)) {
+        html += `
+          <details class="obs-msg-block">
+            <summary>tools (${event.payload.tools.length})</summary>
+            <pre class="obs-pre">${escapeHtml(JSON.stringify(event.payload.tools.map((t) => t.function?.name || t), null, 2))}</pre>
+          </details>`;
+      }
+      html += `</div>`;
+    } else {
+      html += `<pre class="obs-pre">${escapeHtml(JSON.stringify(event.payload, null, 2))}</pre>`;
+    }
+
+    obsInspectorBody.innerHTML = html;
+    obsInspector.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (err) {
+    obsInspectorBody.innerHTML = `<p class="error empty-compact">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function disconnectObservatory() {
+  if (obsReconnectTimer) {
+    clearTimeout(obsReconnectTimer);
+    obsReconnectTimer = null;
+  }
+  if (obsPingTimer) {
+    clearInterval(obsPingTimer);
+    obsPingTimer = null;
+  }
+  if (obsSocket) {
+    try {
+      obsSocket.onclose = null;
+      obsSocket.close();
+    } catch {
+      // ignore
+    }
+    obsSocket = null;
+  }
+  setWsBadge("offline");
+}
+
+function connectObservatory() {
+  if (!canPost || observatoryView.classList.contains("hidden")) return;
+  if (obsSocket && (obsSocket.readyState === WebSocket.OPEN || obsSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  disconnectObservatory();
+  setWsBadge("reconnecting");
+
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const query = obsLatestSeq > 0 ? `?sinceSeq=${obsLatestSeq}` : "";
+  const ws = new WebSocket(`${proto}//${location.host}/api/admin/observatory/ws${query}`);
+  obsSocket = ws;
+
+  ws.onopen = () => {
+    obsReconnectAttempt = 0;
+    setWsBadge("live");
+    obsPingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send("ping");
+      }
+    }, 25_000);
+  };
+
+  ws.onmessage = (evt) => {
+    let data;
+    try {
+      data = JSON.parse(evt.data);
+    } catch {
+      return;
+    }
+    if (data.type === "replay") {
+      if (typeof data.latestSeq === "number" && data.latestSeq > obsLatestSeq) {
+        obsLatestSeq = data.latestSeq;
+      }
+      mergeObservatoryEvents(data.events || []);
+    } else if (data.type === "event" && data.event) {
+      mergeObservatoryEvents([data.event]);
+      if (
+        data.event.type === "run.completed" ||
+        data.event.type === "run.failed" ||
+        data.event.type === "schedule.updated" ||
+        data.event.type === "alarm.scheduled" ||
+        data.event.type === "owner.action"
+      ) {
+        loadObservatoryStatus().catch(() => {});
+      }
+    }
+  };
+
+  ws.onerror = () => {
+    // onclose handles reconnect
+  };
+
+  ws.onclose = () => {
+    if (obsPingTimer) {
+      clearInterval(obsPingTimer);
+      obsPingTimer = null;
+    }
+    obsSocket = null;
+    if (!canPost || observatoryView.classList.contains("hidden")) {
+      setWsBadge("offline");
+      return;
+    }
+    setWsBadge("reconnecting");
+    const delay = Math.min(15_000, 1000 * 2 ** Math.min(obsReconnectAttempt++, 4));
+    obsReconnectTimer = setTimeout(connectObservatory, delay);
+  };
+}
+
+// ——— View switching & routing ———
+
 async function loadThreads() {
   const { threads } = await api("/threads");
   renderThreadList(threads);
@@ -414,10 +742,12 @@ async function loadThread(threadId, focusPostId = null) {
 
 function showBoard() {
   clearPollTimers();
+  disconnectObservatory();
   activeThreadId = null;
   activeThreadReadOnly = false;
   boardView.classList.remove("hidden");
   messagesView.classList.add("hidden");
+  observatoryView.classList.add("hidden");
   threadView.classList.add("hidden");
   setActiveNav("general");
   document.title = "BLUE//SIGNAL — / general";
@@ -425,10 +755,12 @@ function showBoard() {
 
 function showMessages(prefillRecipient = "") {
   clearPollTimers();
+  disconnectObservatory();
   activeThreadId = null;
   activeThreadReadOnly = false;
   boardView.classList.add("hidden");
   messagesView.classList.remove("hidden");
+  observatoryView.classList.add("hidden");
   threadView.classList.add("hidden");
   setActiveNav("messages");
   document.title = "BLUE//SIGNAL — / messages";
@@ -444,16 +776,30 @@ function showMessages(prefillRecipient = "") {
   }
 }
 
-function showThread() {
+function showObservatory() {
   clearPollTimers();
+  activeThreadId = null;
+  activeThreadReadOnly = false;
   boardView.classList.add("hidden");
   messagesView.classList.add("hidden");
+  observatoryView.classList.remove("hidden");
+  threadView.classList.add("hidden");
+  setActiveNav("observatory");
+  document.title = "Observatory — BLUE//SIGNAL";
+}
+
+function showThread() {
+  clearPollTimers();
+  disconnectObservatory();
+  boardView.classList.add("hidden");
+  messagesView.classList.add("hidden");
+  observatoryView.classList.add("hidden");
   threadView.classList.remove("hidden");
 }
 
 async function route() {
   const current = parseRoute();
-  if (current.view === "messages" && !canPost) {
+  if ((current.view === "messages" || current.view === "observatory") && !canPost) {
     location.hash = "#/";
     return;
   }
@@ -463,6 +809,10 @@ async function route() {
   } else if (current.view === "messages") {
     showMessages(current.to);
     await loadMessages();
+  } else if (current.view === "observatory") {
+    showObservatory();
+    await loadObservatoryStatus();
+    connectObservatory();
   } else {
     showBoard();
     await loadThreads();
@@ -488,6 +838,8 @@ function selectRow(delta) {
   );
   rows[selectedRowIndex]?.focus();
 }
+
+// ——— Event Listeners ———
 
 document.getElementById("login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -516,7 +868,8 @@ document.getElementById("logout-btn").addEventListener("click", async () => {
     user: null,
     unreadMessages: 0,
   });
-  if (activeThreadBoard === "messages" || parseRoute().view === "messages") {
+  const view = parseRoute().view;
+  if (activeThreadBoard === "messages" || view === "messages" || view === "observatory") {
     location.hash = "#/";
   } else {
     await route();
@@ -605,6 +958,99 @@ document.getElementById("reply-form").addEventListener("submit", async (e) => {
   }
 });
 
+// Observatory listeners
+obsStreamEl.addEventListener("click", (e) => {
+  const row = e.target.closest(".obs-event-row");
+  if (!row) return;
+  openEventInspector(row.dataset.agent, row.dataset.eventId);
+});
+
+obsAgentCardsEl.addEventListener("click", async (e) => {
+  const wakeBtn = e.target.closest("[data-wake-agent]");
+  if (wakeBtn) {
+    const name = wakeBtn.dataset.wakeAgent;
+    wakeBtn.disabled = true;
+    try {
+      await api(`/admin/agents/${encodeURIComponent(name)}/wake`, {
+        method: "POST",
+        body: JSON.stringify({ mode: "browse" }),
+      });
+      await loadObservatoryStatus();
+    } finally {
+      wakeBtn.disabled = false;
+    }
+    return;
+  }
+
+  const pauseBtn = e.target.closest("[data-toggle-pause]");
+  if (pauseBtn) {
+    const name = pauseBtn.dataset.togglePause;
+    const isPaused = pauseBtn.dataset.paused === "1";
+    pauseBtn.disabled = true;
+    try {
+      await api(`/admin/agents/${encodeURIComponent(name)}/pause`, {
+        method: "POST",
+        body: JSON.stringify({ paused: !isPaused }),
+      });
+      await loadObservatoryStatus();
+    } finally {
+      pauseBtn.disabled = false;
+    }
+    return;
+  }
+
+  const cancelBtn = e.target.closest("[data-cancel-task]");
+  if (cancelBtn) {
+    const taskId = cancelBtn.dataset.cancelTask;
+    const agent = cancelBtn.dataset.agent;
+    cancelBtn.disabled = true;
+    try {
+      await api(
+        `/admin/agents/${encodeURIComponent(agent)}/tasks/${encodeURIComponent(taskId)}`,
+        { method: "DELETE" },
+      );
+      await loadObservatoryStatus();
+    } finally {
+      cancelBtn.disabled = false;
+    }
+  }
+});
+
+document.getElementById("obs-task-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const agent = document.getElementById("obs-task-agent").value;
+  const minutes = Number(document.getElementById("obs-task-minutes").value);
+  const noteInput = document.getElementById("obs-task-note");
+  setStatus(obsTaskStatus, "Scheduling…");
+  try {
+    await api(`/admin/agents/${encodeURIComponent(agent)}/tasks`, {
+      method: "POST",
+      body: JSON.stringify({ inMinutes: minutes, note: noteInput.value }),
+    });
+    noteInput.value = "";
+    setStatus(obsTaskStatus, "Scheduled", "is-ok");
+    await loadObservatoryStatus();
+  } catch (err) {
+    setStatus(obsTaskStatus, err.message, "is-error");
+  }
+});
+
+obsFilterAgent.addEventListener("change", renderObservatoryStream);
+obsFilterType.addEventListener("change", renderObservatoryStream);
+
+document.getElementById("obs-refresh").addEventListener("click", () => {
+  loadObservatoryStatus().catch(() => {});
+});
+document.getElementById("obs-reconnect").addEventListener("click", () => {
+  obsReconnectAttempt = 0;
+  connectObservatory();
+});
+document.getElementById("obs-inspector-close").addEventListener("click", () => {
+  obsSelectedEventId = null;
+  obsInspector.classList.add("hidden");
+  renderObservatoryStream();
+});
+
 document.getElementById("refresh").addEventListener("click", () => {
   loadThreads().catch((err) => {
     threadListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
@@ -650,7 +1096,9 @@ window.addEventListener("hashchange", () => {
         ? threadDetailEl
         : view === "messages"
           ? messageListEl
-          : threadListEl;
+          : view === "observatory"
+            ? obsStreamEl
+            : threadListEl;
     target.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
   });
 });
@@ -677,6 +1125,10 @@ window.addEventListener("keydown", (e) => {
   } else if (e.key === "Escape") {
     if (!threadView.classList.contains("hidden")) {
       location.hash = activeThreadBoard === "messages" ? "#/messages" : "#/";
+    } else if (!obsInspector.classList.contains("hidden")) {
+      obsSelectedEventId = null;
+      obsInspector.classList.add("hidden");
+      renderObservatoryStream();
     }
   }
 });

@@ -605,12 +605,50 @@ export class Forum extends DurableObject<ForumEnv> {
     return enqueued;
   }
 
-  private scheduleOutboxFlush() {
+  private async armOutboxAlarm(delayMs = 2_000): Promise<void> {
+    const desired = Date.now() + delayMs;
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing === null || existing > desired) {
+      await this.ctx.storage.setAlarm(desired);
+    }
+  }
+
+  /**
+   * Persist a durable safety alarm BEFORE returning from the write path,
+   * then kick off an opportunistic immediate flush via ctx.waitUntil().
+   */
+  private async scheduleOutboxFlush(): Promise<void> {
+    const pauseDelay = this.env.AGENTS_ENABLED === "false" ? 5 * 60_000 : 2_000;
+    await this.armOutboxAlarm(pauseDelay);
+
+    if (this.env.AGENTS_ENABLED === "false") {
+      return;
+    }
+
     if (this.flushing) {
       this.flushQueued = true;
       return;
     }
     this.ctx.waitUntil(this.flushOutbox());
+  }
+
+  async getOutboxCount(): Promise<number> {
+    return (
+      this.sql
+        .exec<{ c: number }>(`SELECT COUNT(*) AS c FROM event_outbox`)
+        .toArray()[0]?.c ?? 0
+    );
+  }
+
+  /**
+   * Explicit administrative operation to discard queued outbox notifications.
+   * Distinct from pausing (AGENTS_ENABLED="false"), which preserves queued events.
+   */
+  async purgeOutbox(): Promise<number> {
+    const count = await this.getOutboxCount();
+    this.sql.exec(`DELETE FROM event_outbox`);
+    await this.ctx.storage.deleteAlarm();
+    return count;
   }
 
   async flushOutbox(): Promise<void> {
@@ -620,20 +658,44 @@ export class Forum extends DurableObject<ForumEnv> {
     }
     this.flushing = true;
 
+    const OUTBOX_BATCH_SIZE = 25;
+    const MAX_BATCHES_PER_FLUSH = 8;
+
     try {
-      do {
+      let batchesProcessed = 0;
+
+      while (batchesProcessed < MAX_BATCHES_PER_FLUSH) {
         this.flushQueued = false;
+
+        if (this.env.AGENTS_ENABLED === "false") {
+          // Pause preserves queued events so agents catch up when resumed.
+          if ((await this.getOutboxCount()) > 0) {
+            await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
+          } else {
+            await this.ctx.storage.deleteAlarm();
+          }
+          return;
+        }
+
         const rows = this.sql
           .exec<{ id: number; event_json: string; attempts: number }>(
             `SELECT id, event_json, attempts
              FROM event_outbox
              ORDER BY id ASC
-             LIMIT 25`,
+             LIMIT ?`,
+            OUTBOX_BATCH_SIZE,
           )
           .toArray();
 
-        if (rows.length === 0) break;
+        if (rows.length === 0) {
+          if (this.flushQueued) {
+            continue;
+          }
+          await this.ctx.storage.deleteAlarm();
+          return;
+        }
 
+        batchesProcessed++;
         let maxAttempts = 0;
         let hadFailure = false;
 
@@ -647,13 +709,14 @@ export class Forum extends DurableObject<ForumEnv> {
           }
 
           if (this.env.AGENTS_ENABLED === "false") {
-            // Drain notifications without waking agents while globally paused
-            this.sql.exec(`DELETE FROM event_outbox WHERE id = ?`, row.id);
-            continue;
+            await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
+            return;
           }
 
           try {
-            const stub = this.env.AGENTS.getByName(event.recipient.toLowerCase());
+            const stub = this.env.AGENTS.getByName(
+              event.recipient.toLowerCase(),
+            );
             await stub.notify(event);
             this.sql.exec(`DELETE FROM event_outbox WHERE id = ?`, row.id);
           } catch (err) {
@@ -677,11 +740,29 @@ export class Forum extends DurableObject<ForumEnv> {
         }
 
         if (hadFailure) {
-          const delayMs = Math.min(60_000, 2_000 * 2 ** Math.min(maxAttempts, 5));
+          const delayMs = Math.min(
+            60_000,
+            2_000 * 2 ** Math.min(maxAttempts, 5),
+          );
           await this.ctx.storage.setAlarm(Date.now() + delayMs);
-          break;
+          return;
         }
-      } while (this.flushQueued);
+
+        // Continue draining immediately when the batch was full or new writes queued more events.
+        if (rows.length < OUTBOX_BATCH_SIZE && !this.flushQueued) {
+          if ((await this.getOutboxCount()) === 0) {
+            await this.ctx.storage.deleteAlarm();
+            return;
+          }
+        }
+      }
+
+      // Hit batch cap for this invocation; arm an immediate durable alarm for the remainder.
+      if ((await this.getOutboxCount()) > 0) {
+        await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      } else {
+        await this.ctx.storage.deleteAlarm();
+      }
     } finally {
       this.flushing = false;
     }
@@ -959,12 +1040,12 @@ export class Forum extends DurableObject<ForumEnv> {
     };
   }
 
-  createThread(
+  async createThread(
     userId: string,
     title: string,
     body: string,
     operationId?: string,
-  ): ThreadDetail {
+  ): Promise<ThreadDetail> {
     const cleanTitle = title.trim().slice(0, 120);
     const cleanBody = body.trim().slice(0, 5000);
     if (!cleanTitle || !cleanBody) {
@@ -1020,7 +1101,7 @@ export class Forum extends DurableObject<ForumEnv> {
     });
 
     if (shouldFlush) {
-      this.scheduleOutboxFlush();
+      await this.scheduleOutboxFlush();
     }
 
     const detail = this.getThread(threadId, userId);
@@ -1028,12 +1109,12 @@ export class Forum extends DurableObject<ForumEnv> {
     return detail;
   }
 
-  replyToThread(
+  async replyToThread(
     userId: string,
     threadId: number,
     body: string,
     operationId?: string,
-  ): Post {
+  ): Promise<Post> {
     const cleanBody = body.trim().slice(0, 5000);
     if (!cleanBody) {
       throw new Error("Body is required");
@@ -1127,18 +1208,18 @@ export class Forum extends DurableObject<ForumEnv> {
     });
 
     if (shouldFlush) {
-      this.scheduleOutboxFlush();
+      await this.scheduleOutboxFlush();
     }
 
     return createdPost;
   }
 
-  sendDM(
+  async sendDM(
     senderUserId: string,
     recipientHandle: string,
     body: string,
     operationId?: string,
-  ): { threadId: number; post: Post } {
+  ): Promise<{ threadId: number; post: Post }> {
     const cleanBody = body.trim().slice(0, 5000);
     if (!cleanBody) {
       throw new Error("Message body is required");
@@ -1222,7 +1303,7 @@ export class Forum extends DurableObject<ForumEnv> {
     });
 
     if (shouldFlush) {
-      this.scheduleOutboxFlush();
+      await this.scheduleOutboxFlush();
     }
 
     return { threadId, post: createdPost };
@@ -1462,7 +1543,7 @@ export class Forum extends DurableObject<ForumEnv> {
           );
         }
         const actor = ensureActor();
-        const thread = this.createThread(actor.id, title, body);
+        const thread = await this.createThread(actor.id, title, body);
         return Response.json({ thread }, { status: 201 });
       }
 
@@ -1487,7 +1568,7 @@ export class Forum extends DurableObject<ForumEnv> {
           );
         }
         const actor = ensureActor();
-        const result = this.sendDM(actor.id, recipient, body);
+        const result = await this.sendDM(actor.id, recipient, body);
         return Response.json(result, { status: 201 });
       }
 
@@ -1498,7 +1579,11 @@ export class Forum extends DurableObject<ForumEnv> {
           return Response.json({ error: "body required" }, { status: 400 });
         }
         const actor = ensureActor();
-        const post = this.replyToThread(actor.id, Number(replyMatch[1]), body);
+        const post = await this.replyToThread(
+          actor.id,
+          Number(replyMatch[1]),
+          body,
+        );
         return Response.json({ post }, { status: 201 });
       }
 

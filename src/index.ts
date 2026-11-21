@@ -1,5 +1,6 @@
 import { Forum } from "./forum/forum";
 import { Agent } from "./agents/agent";
+import { Observatory } from "./observatory/observatory";
 import {
   AGENT_NAMES,
   getAgentDirectory,
@@ -15,11 +16,12 @@ import {
   verifyPassphrase,
 } from "./shared/auth";
 
-export { Forum, Agent };
+export { Forum, Agent, Observatory };
 
 export type Env = {
   FORUM: DurableObjectNamespace<Forum>;
   AGENTS: DurableObjectNamespace<Agent>;
+  OBSERVATORY: DurableObjectNamespace<Observatory>;
   ASSETS: Fetcher;
   OPENROUTER_API_KEY?: string;
   OPENROUTER_DEFAULT_MODEL?: string;
@@ -49,6 +51,10 @@ function forumStub(env: Env) {
   return env.FORUM.getByName("general");
 }
 
+function observatoryStub(env: Env) {
+  return env.OBSERVATORY.getByName("main");
+}
+
 function getOwnerHandle(env: Env): string {
   return env.OWNER_HANDLE?.trim() || "overlord";
 }
@@ -61,10 +67,14 @@ async function isSignedInOwner(request: Request, env: Env): Promise<boolean> {
 }
 
 async function bootstrapAllAgents(env: Env): Promise<void> {
-  await forumStub(env).registerAgents([...AGENT_NAMES]);
+  const forum = forumStub(env);
+  await forum.registerAgents([...AGENT_NAMES]);
   await Promise.all(
     AGENT_NAMES.map((name) => env.AGENTS.getByName(name).bootstrap(name)),
   );
+  if (env.AGENTS_ENABLED !== "false") {
+    await forum.flushOutbox();
+  }
 }
 
 function ensureAgentsBootstrapped(env: Env, ctx: ExecutionContext) {
@@ -116,16 +126,145 @@ async function handleAdminRoute(
     );
   }
 
-  if (request.method === "GET" && url.pathname === "/api/admin/agents/status") {
-    const agents = await Promise.all(
-      AGENT_NAMES.map((name) => env.AGENTS.getByName(name).getStatus(name)),
+  // Live WebSocket stream (Cloudflare WebSocket Hibernation on Observatory DO)
+  if (url.pathname === "/api/admin/observatory/ws") {
+    return observatoryStub(env).fetch(request);
+  }
+
+  // REST event stream listing / replay
+  if (
+    request.method === "GET" &&
+    url.pathname === "/api/admin/observatory/events"
+  ) {
+    const sinceParam = url.searchParams.get("sinceSeq");
+    const limitParam = url.searchParams.get("limit");
+    const result = await observatoryStub(env).listEvents({
+      sinceSeq:
+        sinceParam && /^\d+$/.test(sinceParam) ? Number(sinceParam) : undefined,
+      agent: url.searchParams.get("agent") || undefined,
+      type: url.searchParams.get("type") || undefined,
+      runId: url.searchParams.get("runId") || undefined,
+      limit:
+        limitParam && /^\d+$/.test(limitParam) ? Number(limitParam) : undefined,
+    });
+    return Response.json(result);
+  }
+
+  // Full event payload lookup directly from the owning Agent DO
+  const eventDetailMatch = url.pathname.match(
+    /^\/api\/admin\/agents\/([a-z0-9_-]+)\/events\/([a-z0-9-]+)$/i,
+  );
+  if (request.method === "GET" && eventDetailMatch) {
+    const name = eventDetailMatch[1]!.toLowerCase();
+    const eventId = eventDetailMatch[2]!;
+    if (!isRegisteredAgent(name)) {
+      return Response.json(
+        { error: `Unknown agent @${name}` },
+        { status: 404 },
+      );
+    }
+    const event = await env.AGENTS.getByName(name).getEventDetail(
+      name,
+      eventId,
     );
+    if (!event) {
+      return Response.json({ error: "Event not found" }, { status: 404 });
+    }
+    return Response.json({ event });
+  }
+
+  // Agent scheduled tasks (list / create / cancel as owner)
+  const tasksMatch = url.pathname.match(
+    /^\/api\/admin\/agents\/([a-z0-9_-]+)\/tasks$/,
+  );
+  if (tasksMatch) {
+    const name = tasksMatch[1]!.toLowerCase();
+    if (!isRegisteredAgent(name)) {
+      return Response.json(
+        { error: `Unknown agent @${name}` },
+        { status: 404 },
+      );
+    }
+    if (request.method === "GET") {
+      const tasks = await env.AGENTS.getByName(name).listScheduledTasks(name);
+      return Response.json({ agent: name, tasks });
+    }
+    if (request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as {
+        note?: string;
+        inMinutes?: number;
+        at?: string;
+      };
+      const note = typeof body.note === "string" ? body.note.trim() : "";
+      if (!note) {
+        return Response.json({ error: "note required" }, { status: 400 });
+      }
+      let dueAtMs: number | null = null;
+      if (typeof body.inMinutes === "number" && Number.isFinite(body.inMinutes)) {
+        dueAtMs = Date.now() + Math.max(10_000, Math.round(body.inMinutes * 60_000));
+      } else if (typeof body.at === "string" && body.at.trim()) {
+        const parsed = Date.parse(body.at.trim());
+        if (!Number.isNaN(parsed)) dueAtMs = parsed;
+      }
+      if (dueAtMs === null) {
+        return Response.json(
+          { error: "inMinutes or valid ISO at required" },
+          { status: 400 },
+        );
+      }
+      const task = await env.AGENTS.getByName(name).createOwnerTask(
+        name,
+        note,
+        dueAtMs,
+      );
+      return Response.json({ ok: true, task }, { status: 201 });
+    }
+  }
+
+  const taskDeleteMatch = url.pathname.match(
+    /^\/api\/admin\/agents\/([a-z0-9_-]+)\/tasks\/([a-z0-9_-]+)$/i,
+  );
+  if (request.method === "DELETE" && taskDeleteMatch) {
+    const name = taskDeleteMatch[1]!.toLowerCase();
+    const taskId = taskDeleteMatch[2]!;
+    if (!isRegisteredAgent(name)) {
+      return Response.json(
+        { error: `Unknown agent @${name}` },
+        { status: 404 },
+      );
+    }
+    const cancelled = await env.AGENTS.getByName(name).cancelOwnerTask(
+      name,
+      taskId,
+    );
+    return Response.json({ ok: cancelled, id: taskId }, { status: cancelled ? 200 : 404 });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/admin/agents/status") {
+    const [pendingOutboxEvents, agents] = await Promise.all([
+      forumStub(env).getOutboxCount(),
+      Promise.all(
+        AGENT_NAMES.map((name) => env.AGENTS.getByName(name).getStatus(name)),
+      ),
+    ]);
     return Response.json({
       enabled: env.AGENTS_ENABLED !== "false",
       hasOpenRouterKey: Boolean(env.OPENROUTER_API_KEY?.trim()),
       hasOwnerKey: Boolean(env.OWNER_KEY?.trim()),
+      pendingOutboxEvents,
       agents,
     });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/outbox/flush") {
+    await forumStub(env).flushOutbox();
+    const pendingOutboxEvents = await forumStub(env).getOutboxCount();
+    return Response.json({ ok: true, pendingOutboxEvents });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/outbox/purge") {
+    const discarded = await forumStub(env).purgeOutbox();
+    return Response.json({ ok: true, discarded });
   }
 
   if (
@@ -316,7 +455,6 @@ export default {
         });
       }
 
-      // Public read-only routes: GET /api/threads and GET /api/threads/:id (general only)
       const isPublicRead =
         request.method === "GET" &&
         (url.pathname === "/api/threads" ||
