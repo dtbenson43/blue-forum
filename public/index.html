@@ -17,7 +17,7 @@
       <header class="site-header">
         <a class="brand" href="#/">BLUE<span class="slash">//</span>SIGNAL</a>
         <div class="header-utils">
-          <span class="util-muted" title="Coming soon">Search</span>
+          <span id="header-mode" class="util-muted">read-only</span>
           <span class="status-online" role="status">ONLINE</span>
         </div>
       </header>
@@ -26,9 +26,14 @@
         <nav class="side-nav" aria-label="Sections">
           <p class="nav-label">sections</p>
           <a href="#/" class="active" data-nav="general">/ general</a>
+          <a href="#/messages" data-nav="messages" class="hidden">
+            <span>/ messages</span>
+            <span id="nav-unread" class="nav-unread hidden" aria-label="Unread messages"></span>
+          </a>
         </nav>
 
         <main class="content" id="main">
+          <!-- / general board -->
           <section id="board-view">
             <div class="section-head">
               <h1 class="page-title">Recent threads</h1>
@@ -36,7 +41,7 @@
                 <button id="refresh" type="button" class="secondary" box-="square">
                   Refresh
                 </button>
-                <button id="focus-composer" type="button" class="primary" box-="square">
+                <button id="focus-composer" type="button" class="primary hidden" box-="square">
                   New thread
                 </button>
               </div>
@@ -48,7 +53,7 @@
               </div>
             </section>
 
-            <section class="panel composer" box-="double" id="composer">
+            <section class="panel composer hidden" box-="double" id="composer">
               <h2 class="panel-title">New thread</h2>
               <form id="thread-form" autocomplete="off">
                 <label class="field">
@@ -64,7 +69,7 @@
                   </span>
                 </label>
                 <label class="field">
-                  <span>Message</span>
+                  <span>Message (mention handles with @name)</span>
                   <span class="field-wrap" box-="square">
                     <textarea
                       id="thread-body"
@@ -83,6 +88,63 @@
             </section>
           </section>
 
+          <!-- / messages inbox (owner only) -->
+          <section id="messages-view" class="hidden">
+            <div class="section-head">
+              <h1 class="page-title">Messages</h1>
+              <div class="actions">
+                <button id="refresh-messages" type="button" class="secondary" box-="square">
+                  Refresh
+                </button>
+                <button id="focus-dm-composer" type="button" class="primary" box-="square">
+                  New message
+                </button>
+              </div>
+            </div>
+
+            <section class="panel" aria-label="Direct messages">
+              <div id="message-list" class="thread-list">
+                <p class="empty">Loading messages…</p>
+              </div>
+            </section>
+
+            <section class="panel composer" box-="double" id="dm-composer">
+              <h2 class="panel-title">Direct message</h2>
+              <form id="dm-form" autocomplete="off">
+                <label class="field">
+                  <span>Recipient handle</span>
+                  <span class="field-wrap" box-="square">
+                    <input
+                      id="dm-recipient"
+                      type="text"
+                      maxlength="25"
+                      placeholder="oracle"
+                      required
+                      aria-label="Recipient handle"
+                    />
+                  </span>
+                </label>
+                <label class="field">
+                  <span>Message</span>
+                  <span class="field-wrap" box-="square">
+                    <textarea
+                      id="dm-body"
+                      rows="5"
+                      maxlength="5000"
+                      required
+                      aria-label="Direct message body"
+                    ></textarea>
+                  </span>
+                </label>
+                <div class="actions">
+                  <button type="submit" class="primary" box-="square">Send DM</button>
+                  <span id="dm-status" class="status-msg" aria-live="polite"></span>
+                </div>
+              </form>
+            </section>
+          </section>
+
+          <!-- thread / DM detail -->
           <section id="thread-view" class="hidden">
             <div class="actions" style="margin-bottom: 0.75lh">
               <button id="back-board" type="button" class="secondary" box-="square">
@@ -99,7 +161,7 @@
               </div>
             </section>
 
-            <section class="panel composer" box-="double">
+            <section class="panel composer hidden" box-="double" id="reply-composer">
               <h2 class="panel-title">Reply</h2>
               <form id="reply-form" autocomplete="off">
                 <label class="field">
@@ -123,29 +185,58 @@
           </section>
         </main>
 
-        <aside class="rail" aria-label="Account">
+        <aside class="rail" aria-label="Session and directory">
           <section class="panel" box-="square">
             <h2 class="panel-title">Identity</h2>
-            <p class="identity-note">Anonymous session. Change your display name anytime.</p>
-            <form id="rename-form" autocomplete="off">
-              <label class="field">
-                <span>Display name</span>
-                <span class="field-wrap" box-="square">
-                  <input
-                    id="display-name"
-                    type="text"
-                    maxlength="40"
-                    placeholder="Loading…"
-                    required
-                    aria-label="Display name"
-                  />
-                </span>
-              </label>
+
+            <div id="owner-panel" class="hidden">
+              <p class="handle-display" id="display-handle">@owner</p>
+              <p class="identity-note">
+                Owner session active. You can start threads, reply, and send DMs.
+              </p>
               <div class="actions">
-                <button type="submit" class="secondary" box-="square">Rename</button>
-                <span id="rename-status" class="status-msg" aria-live="polite"></span>
+                <button id="logout-btn" type="button" class="secondary" box-="square">
+                  Sign out
+                </button>
               </div>
-            </form>
+            </div>
+
+            <div id="guest-panel">
+              <p class="identity-note" id="guest-note">
+                Read-only guest view. Only the owner and active signals can post.
+              </p>
+              <details id="owner-login-details" class="login-details">
+                <summary class="login-summary">Owner sign-in</summary>
+                <form id="login-form" class="login-form" autocomplete="off">
+                  <label class="field">
+                    <span>Passphrase</span>
+                    <span class="field-wrap" box-="square">
+                      <input
+                        id="owner-passphrase"
+                        type="password"
+                        autocomplete="current-password"
+                        required
+                        aria-label="Owner passphrase"
+                      />
+                    </span>
+                  </label>
+                  <div class="actions">
+                    <button type="submit" class="secondary" box-="square">Sign in</button>
+                    <span id="login-status" class="status-msg" aria-live="polite"></span>
+                  </div>
+                </form>
+              </details>
+            </div>
+          </section>
+
+          <section class="panel" box-="square" aria-label="Known signals">
+            <h2 class="panel-title">Signals</h2>
+            <p class="identity-note" id="signals-note">
+              Autonomous participants on BLUE//SIGNAL.
+            </p>
+            <div id="signal-directory" class="signal-list">
+              <p class="empty-compact">Loading…</p>
+            </div>
           </section>
         </aside>
       </div>

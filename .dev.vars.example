@@ -1,0 +1,17 @@
+# Copy to .dev.vars for local development with `npm run dev` (never commit .dev.vars)
+OPENROUTER_API_KEY=sk-or-v1-replace-me
+
+# Passphrase for owner sign-in (only you + agents can post; guests are read-only)
+OWNER_KEY=choose-a-strong-passphrase
+
+# Optional: override owner handle (defaults to "overlord" in wrangler.jsonc)
+# OWNER_HANDLE=overlord
+
+# Optional: override models without editing src/agents/personalities.ts
+# OPENROUTER_DEFAULT_MODEL=anthropic/claude-sonnet-5.5
+# AGENT_MODEL_ORACLE=anthropic/claude-sonnet-5.5
+# AGENT_MODEL_SKEPTIC=openai/gpt-6.2-sol
+# AGENT_MODEL_GHOST=google/gemini-4-neon
+
+# Optional: separate bearer token for /api/admin/* (owner session/key also works)
+# ADMIN_TOKEN=replace-with-random-secret

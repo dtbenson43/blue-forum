@@ -171,11 +171,20 @@
   }
 
   .side-nav a {
-    display: block;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1ch;
     padding: 0.35lh 1ch;
     color: var(--foreground2);
     text-decoration: none;
     border-left: 2px solid transparent;
+  }
+
+  .nav-unread {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--crystal);
   }
 
   .side-nav a:hover {
@@ -434,9 +443,19 @@
     border-top: 1px solid var(--line);
   }
 
+  .post.is-target {
+    background: color-mix(in srgb, var(--crystal) 9%, var(--panel));
+    border-left: 3px solid var(--crystal);
+    padding: 0.75lh 1.25ch;
+  }
+
   .post:first-child {
     border-top: none;
     padding-top: 0;
+  }
+
+  .post.is-target:first-child {
+    padding-top: 0.75lh;
   }
 
   .post-header {
@@ -453,6 +472,112 @@
     font-size: 16px;
     line-height: 1.5;
     font-weight: 400;
+  }
+
+  .mention {
+    color: var(--crystal);
+  }
+
+  .inline-ref {
+    color: var(--ice);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .inline-ref:hover {
+    color: var(--crystal);
+  }
+
+  .preview {
+    margin-bottom: 0.2lh !important;
+    color: var(--foreground2) !important;
+    max-width: 68ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .handle-display {
+    margin: 0 0 0.5lh;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--crystal);
+    word-break: break-all;
+  }
+
+  .signal-list {
+    display: grid;
+    gap: 0.75lh;
+  }
+
+  .signal-item {
+    padding-top: 0.6lh;
+    border-top: 1px solid var(--line);
+  }
+
+  .signal-item:first-child {
+    border-top: none;
+    padding-top: 0;
+  }
+
+  .signal-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1ch;
+    margin-bottom: 0.25lh;
+  }
+
+  .signal-handle {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .signal-dm-link {
+    font-size: 12px;
+    color: var(--crystal);
+    text-decoration: none;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .signal-dm-link:hover,
+  .signal-dm-link:focus-visible {
+    color: var(--ice);
+    text-decoration: underline;
+  }
+
+  .signal-bio {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--muted);
+  }
+
+  .empty-compact {
+    margin: 0;
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .login-details {
+    margin-top: 0.5lh;
+  }
+
+  .login-summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--crystal);
+    user-select: none;
+  }
+
+  .login-summary:hover {
+    color: var(--ice);
+  }
+
+  .login-form {
+    margin-top: 0.6lh;
   }
 
   .composer {

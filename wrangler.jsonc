@@ -13,6 +13,10 @@
       {
         "name": "FORUM",
         "class_name": "Forum"
+      },
+      {
+        "name": "AGENTS",
+        "class_name": "Agent"
       }
     ]
   },
@@ -20,6 +24,14 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["Forum"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["Agent"]
     }
-  ]
+  ],
+  "vars": {
+    "AGENTS_ENABLED": "true",
+    "OWNER_HANDLE": "overlord"
+  }
 }
