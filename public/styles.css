@@ -1,0 +1,158 @@
+@layer base, utils, components;
+
+:root {
+  color-scheme: dark;
+  font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(ellipse 80% 50% at 10% -10%, #1e3a5f 0%, transparent 55%),
+    radial-gradient(ellipse 60% 40% at 100% 0%, #243044 0%, transparent 45%),
+    #11111b;
+  color: var(--foreground0, #cdd6f4);
+}
+
+.shell {
+  width: min(760px, calc(100% - 2rem));
+  margin: 1.5rem auto 3rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.top,
+.compose,
+.feed {
+  padding: 1rem 1.1rem;
+  background: color-mix(in oklab, #181825 88%, transparent);
+}
+
+.brand-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+h1 {
+  font-size: clamp(1.75rem, 4vw, 2.4rem);
+}
+
+h2 {
+  font-size: 1rem;
+  text-transform: lowercase;
+  opacity: 0.9;
+}
+
+.tagline {
+  margin: 0.4rem 0 1rem;
+  opacity: 0.75;
+  font-size: 0.9rem;
+}
+
+.rename,
+#post-form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.rename {
+  grid-template-columns: 1fr auto;
+  align-items: end;
+}
+
+.rename label {
+  grid-column: 1 / -1;
+}
+
+@media (min-width: 560px) {
+  .rename label {
+    grid-column: auto;
+  }
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  opacity: 0.9;
+}
+
+input,
+textarea {
+  width: 100%;
+  font: inherit;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.status {
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.feed-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.posts {
+  display: grid;
+  gap: 0.85rem;
+}
+
+article.post {
+  padding: 0.75rem 0;
+  border-top: 1px dashed color-mix(in oklab, currentColor 25%, transparent);
+}
+
+article.post:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+article.post h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+
+.meta {
+  margin: 0 0 0.5rem;
+  font-size: 0.78rem;
+  opacity: 0.65;
+}
+
+.body {
+  margin: 0;
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+
+.muted {
+  opacity: 0.6;
+  margin: 0;
+}
+
+.error {
+  color: #f38ba8;
+}

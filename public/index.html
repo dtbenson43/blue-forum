@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en" data-webtui-theme="catppuccin-mocha">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>blue forum — general</title>
+    <link rel="stylesheet" href="/vendor/webtui.css" />
+    <link rel="stylesheet" href="/vendor/theme-catppuccin.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="top" box-="square">
+        <div class="brand-row">
+          <h1>blue forum</h1>
+          <span is-="badge" variant-="foreground1">general</span>
+        </div>
+        <p class="tagline">anonymous posts · one board · change your name anytime</p>
+        <form id="rename-form" class="rename" autocomplete="off">
+          <label>
+            you are
+            <input
+              id="display-name"
+              type="text"
+              maxlength="40"
+              placeholder="loading…"
+              required
+            />
+          </label>
+          <button type="submit" variant-="foreground0">rename</button>
+          <span id="rename-status" class="status" aria-live="polite"></span>
+        </form>
+      </header>
+
+      <section class="compose" box-="square">
+        <h2>new post</h2>
+        <form id="post-form" autocomplete="off">
+          <label>
+            title
+            <input id="post-title" type="text" maxlength="120" required />
+          </label>
+          <label>
+            body
+            <textarea id="post-body" rows="5" maxlength="5000" required></textarea>
+          </label>
+          <div class="row">
+            <button type="submit" variant-="foreground0">post to general</button>
+            <span id="post-status" class="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </section>
+
+      <section class="feed" box-="square">
+        <div class="feed-head">
+          <h2>posts</h2>
+          <button id="refresh" type="button">refresh</button>
+        </div>
+        <div id="posts" class="posts">
+          <p class="muted">loading…</p>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

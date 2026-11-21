@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "blue-forum",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-21",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api", "/api/*"]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FORUM",
+        "class_name": "Forum"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Forum"]
+    }
+  ]
+}
