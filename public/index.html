@@ -1,100 +1,158 @@
 <!doctype html>
-<html lang="en" data-webtui-theme="hotline">
+<html lang="en" data-webtui-theme="blue-signal">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>BLUE FORUM — GENERAL</title>
+    <title>BLUE//SIGNAL — / general</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/vendor/webtui.css" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/css/webtui-entry.css" />
   </head>
   <body>
-    <main class="shell">
-      <header class="top" box-="square">
-        <div class="brand-row">
-          <h1>blue forum</h1>
-          <span is-="badge">general</span>
+    <div class="app">
+      <header class="site-header">
+        <a class="brand" href="#/">BLUE<span class="slash">//</span>SIGNAL</a>
+        <div class="header-utils">
+          <span class="util-muted" title="Coming soon">Search</span>
+          <span class="status-online" role="status">ONLINE</span>
         </div>
-        <p class="tagline">
-          do you like hurting other people? · nah · just threading · leave a message
-        </p>
-        <form id="rename-form" class="rename" autocomplete="off">
-          <label>
-            identity
-            <input
-              id="display-name"
-              type="text"
-              maxlength="40"
-              placeholder="loading…"
-              required
-            />
-          </label>
-          <button type="submit" variant-="foreground0">rename</button>
-          <span id="rename-status" class="status" aria-live="polite"></span>
-        </form>
       </header>
 
-      <section id="board-view">
-        <section class="compose" box-="square">
-          <h2>new thread</h2>
-          <form id="thread-form" autocomplete="off">
-            <label>
-              subject
-              <input id="thread-title" type="text" maxlength="120" required />
-            </label>
-            <label>
-              opening message
-              <textarea id="thread-body" rows="5" maxlength="5000" required></textarea>
-            </label>
-            <div class="row">
-              <button type="submit" variant-="foreground0">start thread</button>
-              <span id="thread-status" class="status" aria-live="polite"></span>
+      <div class="shell">
+        <nav class="side-nav" aria-label="Sections">
+          <p class="nav-label">sections</p>
+          <a href="#/" class="active" data-nav="general">/ general</a>
+          <a href="#/" aria-disabled="true">/ dev</a>
+          <a href="#/" aria-disabled="true">/ off-topic</a>
+          <a href="#/" aria-disabled="true">/ meta</a>
+        </nav>
+
+        <main class="content" id="main">
+          <section id="board-view">
+            <div class="section-head">
+              <h1 class="page-title">Recent threads</h1>
+              <div class="actions">
+                <button id="refresh" type="button" class="secondary" box-="square">
+                  Refresh
+                </button>
+                <button id="focus-composer" type="button" class="primary" box-="square">
+                  New thread
+                </button>
+              </div>
             </div>
-          </form>
-        </section>
 
-        <section class="feed" box-="square">
-          <div class="feed-head">
-            <h2>threads</h2>
-            <button id="refresh" type="button" variant-="foreground2">refresh</button>
-          </div>
-          <div id="thread-list" class="posts">
-            <p class="muted">waiting for the call…</p>
-          </div>
-        </section>
-      </section>
+            <section class="panel" aria-label="Thread list">
+              <div id="thread-list" class="thread-list">
+                <p class="empty">Loading threads…</p>
+              </div>
+            </section>
 
-      <section id="thread-view" class="hidden">
-        <section class="feed" box-="square">
-          <div class="feed-head">
-            <button id="back-board" type="button" variant-="foreground2">← general</button>
-            <button id="refresh-thread" type="button" variant-="foreground2">refresh</button>
-          </div>
-          <div id="thread-detail">
-            <p class="muted">loading thread…</p>
-          </div>
-        </section>
+            <section class="panel composer" box-="double" id="composer">
+              <h2 class="panel-title">New thread</h2>
+              <form id="thread-form" autocomplete="off">
+                <label class="field">
+                  <span>Subject</span>
+                  <span class="field-wrap" box-="square">
+                    <input
+                      id="thread-title"
+                      type="text"
+                      maxlength="120"
+                      required
+                      aria-label="Thread subject"
+                    />
+                  </span>
+                </label>
+                <label class="field">
+                  <span>Message</span>
+                  <span class="field-wrap" box-="square">
+                    <textarea
+                      id="thread-body"
+                      rows="8"
+                      maxlength="5000"
+                      required
+                      aria-label="Opening message"
+                    ></textarea>
+                  </span>
+                </label>
+                <div class="actions">
+                  <button type="submit" class="primary" box-="square">Submit</button>
+                  <span id="thread-status" class="status-msg" aria-live="polite"></span>
+                </div>
+              </form>
+            </section>
+          </section>
 
-        <section class="compose" box-="square">
-          <h2>reply</h2>
-          <form id="reply-form" autocomplete="off">
-            <label>
-              message
-              <textarea id="reply-body" rows="4" maxlength="5000" required></textarea>
-            </label>
-            <div class="row">
-              <button type="submit" variant-="foreground0">send reply</button>
-              <span id="reply-status" class="status" aria-live="polite"></span>
+          <section id="thread-view" class="hidden">
+            <div class="actions" style="margin-bottom: 0.75lh">
+              <button id="back-board" type="button" class="secondary" box-="square">
+                ← / general
+              </button>
+              <button id="refresh-thread" type="button" class="secondary" box-="square">
+                Refresh
+              </button>
             </div>
-          </form>
-        </section>
-      </section>
-    </main>
+
+            <section class="panel" aria-label="Thread">
+              <div id="thread-detail">
+                <p class="empty">Loading thread…</p>
+              </div>
+            </section>
+
+            <section class="panel composer" box-="double">
+              <h2 class="panel-title">Reply</h2>
+              <form id="reply-form" autocomplete="off">
+                <label class="field">
+                  <span>Message</span>
+                  <span class="field-wrap" box-="square">
+                    <textarea
+                      id="reply-body"
+                      rows="6"
+                      maxlength="5000"
+                      required
+                      aria-label="Your reply"
+                    ></textarea>
+                  </span>
+                </label>
+                <div class="actions">
+                  <button type="submit" class="primary" box-="square">Post reply</button>
+                  <span id="reply-status" class="status-msg" aria-live="polite"></span>
+                </div>
+              </form>
+            </section>
+          </section>
+        </main>
+
+        <aside class="rail" aria-label="Account">
+          <section class="panel" box-="square">
+            <h2 class="panel-title">Identity</h2>
+            <p class="identity-note">Anonymous session. Change your display name anytime.</p>
+            <form id="rename-form" autocomplete="off">
+              <label class="field">
+                <span>Display name</span>
+                <span class="field-wrap" box-="square">
+                  <input
+                    id="display-name"
+                    type="text"
+                    maxlength="40"
+                    placeholder="Loading…"
+                    required
+                    aria-label="Display name"
+                  />
+                </span>
+              </label>
+              <div class="actions">
+                <button type="submit" class="secondary" box-="square">Rename</button>
+                <span id="rename-status" class="status-msg" aria-live="polite"></span>
+              </div>
+            </form>
+          </section>
+        </aside>
+      </div>
+    </div>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

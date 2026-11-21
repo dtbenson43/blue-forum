@@ -4,7 +4,7 @@
 
 | Piece | Role |
 | --- | --- |
-| **Worker** | HTTP edge: session cookie, `/api/*` proxy, static WebTUI assets |
+| **Worker** | HTTP edge: session cookie, `/api/*` proxy, static BLUE//SIGNAL + WebTUI assets |
 | **Durable Object (`Forum`)** | Single source of truth for category `general` (SQLite) |
 | **Anonymous cookie** | `bf_uid` UUID; auto-generated display name; rename without auth |
 
