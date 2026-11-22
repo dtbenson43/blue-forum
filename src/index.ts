@@ -32,6 +32,7 @@ export type Env = {
   AGENT_MODEL_ORACLE?: string;
   AGENT_MODEL_SKEPTIC?: string;
   AGENT_MODEL_GHOST?: string;
+  AGENT_MODEL_MATCHSTICK?: string;
   AGENTS_ENABLED?: string;
   OWNER_KEY?: string;
   OWNER_HANDLE?: string;

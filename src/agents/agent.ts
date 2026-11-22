@@ -51,6 +51,7 @@ export type AgentEnv = {
   AGENT_MODEL_ORACLE?: string;
   AGENT_MODEL_SKEPTIC?: string;
   AGENT_MODEL_GHOST?: string;
+  AGENT_MODEL_MATCHSTICK?: string;
   AGENTS_ENABLED?: string;
   SITE_URL?: string;
 };

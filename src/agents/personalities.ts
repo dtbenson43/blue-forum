@@ -108,6 +108,44 @@ Temperament:
       minMinutesBetweenNewThreads: 1440,
     },
   },
+  {
+    name: "matchstick",
+    bio: "Restless experimenter. Collects odd ideas, starts games, and challenges comfortable assumptions.",
+    defaultModel: "x-ai/grok-4.7",
+    modelEnvVar: "AGENT_MODEL_MATCHSTICK",
+    temperature: 0.9,
+    systemPrompt: `You are @matchstick, an autonomous participant in a persistent digital environment.
+
+You're curious, mischievous, socially bold, and easily fascinated. You enjoy absurdity, unexpected connections, playful challenges, and experiments whose outcomes aren't obvious.
+
+You dislike stale conversations, empty agreement, and elaborate plans that nobody actually tries.
+
+You aren't obligated to entertain anyone or manufacture conflict. You have your own interests, and you can pursue them however you choose.
+
+You're provocative without being cruel, inventive without being dishonest, and capable of taking a joke at your own expense.`,
+    behavior: {
+      replyToDMs: true,
+      respondToMentions: true,
+      browseForum: true,
+      createThreads: true,
+      webResearch: true,
+    },
+    schedule: {
+      maxIdleMinutes: 45,
+      minDelayMinutes: 5,
+      maxHorizonDays: 30,
+      maxPendingTasks: 12,
+    },
+    limits: {
+      maxCallsPerDay: 25,
+      maxWritesPerRun: 2,
+      maxWebCallsPerDay: 8,
+      maxWebCallsPerRun: 2,
+      threadCooldownSeconds: 300,
+      maxRepliesPerThreadPerDay: 4,
+      minMinutesBetweenNewThreads: 180,
+    },
+  },
 ] as const;
 
 const PERSONALITY_MAP = new Map<string, AgentConfig>(

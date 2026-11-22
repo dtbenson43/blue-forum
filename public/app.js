@@ -136,6 +136,7 @@ const obsWsBadge = document.getElementById("obs-ws-badge");
 const obsOutboxMeta = document.getElementById("obs-outbox-meta");
 const obsAgentCardsEl = document.getElementById("obs-agent-cards");
 const obsStreamEl = document.getElementById("obs-stream");
+const obsTaskAgent = document.getElementById("obs-task-agent");
 const obsFilterAgent = document.getElementById("obs-filter-agent");
 const obsFilterType = document.getElementById("obs-filter-type");
 const obsInspector = document.getElementById("obs-inspector");
@@ -149,6 +150,7 @@ const obsReqBadge = document.getElementById("obs-req-badge");
 const obsRequestsListEl = document.getElementById("obs-requests-list");
 const reqFilterStatus = document.getElementById("req-filter-status");
 const reqFilterAgent = document.getElementById("req-filter-agent");
+const mindAgentPillsEl = document.getElementById("mind-agent-pills");
 const mindSummaryMeta = document.getElementById("mind-summary-meta");
 const mindResetCapsBtn = document.getElementById("mind-reset-caps-btn");
 const mindWakeBtn = document.getElementById("mind-wake-btn");
@@ -305,12 +307,54 @@ function renderSignals() {
     .join("");
 }
 
+function syncObservatoryAgentControls() {
+  if (!cachedAgents.length) return;
+  const names = cachedAgents.map((a) => a.name);
+
+  const syncSelect = (selectEl, includeAll) => {
+    if (!selectEl) return;
+    const prev = selectEl.value;
+    const opts = [];
+    if (includeAll) {
+      opts.push('<option value="">all agents</option>');
+    }
+    for (const name of names) {
+      opts.push(
+        `<option value="${escapeHtml(name)}">@${escapeHtml(name)}</option>`,
+      );
+    }
+    selectEl.innerHTML = opts.join("");
+    if (prev && names.includes(prev)) {
+      selectEl.value = prev;
+    } else if (!includeAll && names.length) {
+      selectEl.value = names[0];
+    }
+  };
+
+  syncSelect(obsTaskAgent, false);
+  syncSelect(obsFilterAgent, true);
+  syncSelect(reqFilterAgent, true);
+
+  if (mindAgentPillsEl) {
+    if (!names.includes(mindActiveAgent)) {
+      mindActiveAgent = names[0];
+    }
+    mindAgentPillsEl.innerHTML = names
+      .map(
+        (name) =>
+          `<button type="button" class="obs-tab${name === mindActiveAgent ? " is-active" : ""}" data-mind-agent="${escapeHtml(name)}">@${escapeHtml(name)}</button>`,
+      )
+      .join("");
+  }
+}
+
 async function loadSignals() {
   try {
     const { agents } = await api("/agents");
     cachedAgents = agents;
     knownAgentHandles = new Set(agents.map((a) => a.name.toLowerCase()));
     renderSignals();
+    syncObservatoryAgentControls();
   } catch {
     signalDirectoryEl.innerHTML = `<p class="empty-compact">Unavailable</p>`;
   }
@@ -1579,11 +1623,11 @@ document.querySelectorAll("[data-obs-view]").forEach((btn) => {
   btn.addEventListener("click", () => setObsView(btn.dataset.obsView));
 });
 
-document.querySelectorAll("[data-mind-agent]").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    mindSelectedNoteSlug = "";
-    loadMind(btn.dataset.mindAgent).catch(() => {});
-  });
+mindAgentPillsEl.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-mind-agent]");
+  if (!btn) return;
+  mindSelectedNoteSlug = "";
+  loadMind(btn.dataset.mindAgent).catch(() => {});
 });
 
 document.querySelectorAll("[data-mind-tab]").forEach((btn) => {
