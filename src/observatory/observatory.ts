@@ -1,12 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
 import type {
   AgentEventType,
+  AgentRequest,
   EventMeta,
   ObservatoryEventInput,
   ObservatoryEventSummary,
+  RequestKind,
+  RequestPriority,
+  RequestStatus,
 } from "../shared/types";
 
 const MAX_LIVE_EVENTS = 2000;
+const MAX_OPEN_REQUESTS_PER_AGENT = 8;
 
 type LiveEventRow = {
   seq: number;
@@ -20,7 +25,21 @@ type LiveEventRow = {
   meta_json: string | null;
 };
 
-function mapRow(row: LiveEventRow): ObservatoryEventSummary {
+type AgentRequestRow = {
+  id: number;
+  agent: string;
+  kind: RequestKind;
+  title: string;
+  reason: string;
+  requested_tool: string | null;
+  priority: RequestPriority;
+  status: RequestStatus;
+  owner_note: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function mapEventRow(row: LiveEventRow): ObservatoryEventSummary {
   let meta: EventMeta | null = null;
   if (row.meta_json) {
     try {
@@ -42,11 +61,26 @@ function mapRow(row: LiveEventRow): ObservatoryEventSummary {
   };
 }
 
+function mapRequestRow(row: AgentRequestRow): AgentRequest {
+  return {
+    id: row.id,
+    agent: row.agent,
+    kind: row.kind,
+    title: row.title,
+    reason: row.reason,
+    requestedTool: row.requested_tool,
+    priority: row.priority,
+    status: row.status,
+    ownerNote: row.owner_note,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 /**
- * Aggregated live event stream for BLUE//SIGNAL agents.
- * Stores a compact ring buffer of event summaries in SQLite and uses
- * Cloudflare WebSocket Hibernation to stream live updates with reconnect replay.
- * Full payloads remain inside each Agent DO and are fetched on demand.
+ * Aggregated live event stream & owner request queue for BLUE//SIGNAL agents.
+ * Uses Cloudflare WebSocket Hibernation to push compact event summaries and
+ * request updates to connected owner dashboards with sequence-based replay.
  */
 export class Observatory extends DurableObject<Record<string, unknown>> {
   private sql = this.ctx.storage.sql;
@@ -71,7 +105,39 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       );
       CREATE INDEX IF NOT EXISTS idx_live_events_agent_seq ON live_events(agent, seq DESC);
       CREATE INDEX IF NOT EXISTS idx_live_events_type_seq ON live_events(type, seq DESC);
+
+      CREATE TABLE IF NOT EXISTS agent_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('feature', 'tool_access')),
+        title TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        requested_tool TEXT,
+        priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high')),
+        status TEXT NOT NULL DEFAULT 'open'
+          CHECK (status IN ('open', 'approved', 'implemented', 'rejected')),
+        owner_note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_requests_agent ON agent_requests(agent, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_agent_requests_status ON agent_requests(status, id DESC);
     `);
+  }
+
+  private broadcast(payload: unknown) {
+    const frame = JSON.stringify(payload);
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(frame);
+      } catch {
+        try {
+          ws.close(1011, "send failed");
+        } catch {
+          // ignore
+        }
+      }
+    }
   }
 
   private getLatestSeq(): number {
@@ -81,6 +147,18 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
         .toArray()[0]?.latest ?? 0
     );
   }
+
+  private getOpenRequestCount(): number {
+    return (
+      this.sql
+        .exec<{ c: number }>(
+          `SELECT COUNT(*) AS c FROM agent_requests WHERE status = 'open'`,
+        )
+        .toArray()[0]?.c ?? 0
+    );
+  }
+
+  // ——— Live event stream ———
 
   async recordEvent(
     input: ObservatoryEventInput,
@@ -94,7 +172,7 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       .toArray()[0];
 
     if (existing) {
-      return mapRow(existing);
+      return mapEventRow(existing);
     }
 
     const metaJson =
@@ -123,7 +201,6 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       )
       .one();
 
-    // Keep ring buffer bounded
     if (row.seq % 50 === 0) {
       this.sql.exec(
         `DELETE FROM live_events
@@ -132,21 +209,8 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       );
     }
 
-    const summary = mapRow(row);
-    const frame = JSON.stringify({ type: "event", event: summary });
-
-    for (const ws of this.ctx.getWebSockets()) {
-      try {
-        ws.send(frame);
-      } catch {
-        try {
-          ws.close(1011, "send failed");
-        } catch {
-          // ignore
-        }
-      }
-    }
-
+    const summary = mapEventRow(row);
+    this.broadcast({ type: "event", event: summary });
     return summary;
   }
 
@@ -192,7 +256,7 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
           limit,
         )
         .toArray();
-      return { events: rows.map(mapRow), latestSeq };
+      return { events: rows.map(mapEventRow), latestSeq };
     }
 
     const rows = this.sql
@@ -207,8 +271,210 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       .toArray()
       .reverse();
 
-    return { events: rows.map(mapRow), latestSeq };
+    return { events: rows.map(mapEventRow), latestSeq };
   }
+
+  // ——— Agent feature & tool-access requests ———
+
+  async submitRequest(input: {
+    agent: string;
+    kind: RequestKind;
+    title: string;
+    reason: string;
+    requestedTool?: string | null;
+    priority?: RequestPriority;
+  }): Promise<
+    | { ok: true; request: AgentRequest; deduplicated: boolean }
+    | { ok: false; error: string }
+  > {
+    const agent = input.agent.trim().toLowerCase();
+    const kind: RequestKind =
+      input.kind === "tool_access" ? "tool_access" : "feature";
+    const title = input.title.trim().slice(0, 120);
+    const reason = input.reason.trim().slice(0, 600);
+    const priority: RequestPriority =
+      input.priority === "low" || input.priority === "high"
+        ? input.priority
+        : "normal";
+    const requestedTool =
+      typeof input.requestedTool === "string" && input.requestedTool.trim()
+        ? input.requestedTool.trim().toLowerCase().slice(0, 64)
+        : null;
+
+    if (!title || !reason) {
+      return { ok: false, error: "Both title and reason are required." };
+    }
+
+    if (kind === "tool_access" && !requestedTool) {
+      return {
+        ok: false,
+        error: "requested_tool is required when kind is 'tool_access'.",
+      };
+    }
+
+    // Deduplicate matching open request from same agent
+    const duplicate = this.sql
+      .exec<AgentRequestRow>(
+        `SELECT * FROM agent_requests
+         WHERE agent = ? AND status = 'open' AND kind = ?
+           AND (LOWER(title) = LOWER(?) OR (? IS NOT NULL AND requested_tool = ?))
+         LIMIT 1`,
+        agent,
+        kind,
+        title,
+        requestedTool,
+        requestedTool,
+      )
+      .toArray()[0];
+
+    if (duplicate) {
+      return { ok: true, request: mapRequestRow(duplicate), deduplicated: true };
+    }
+
+    const openForAgent =
+      this.sql
+        .exec<{ c: number }>(
+          `SELECT COUNT(*) AS c FROM agent_requests WHERE agent = ? AND status = 'open'`,
+          agent,
+        )
+        .toArray()[0]?.c ?? 0;
+
+    if (openForAgent >= MAX_OPEN_REQUESTS_PER_AGENT) {
+      return {
+        ok: false,
+        error: `Open request limit reached (${MAX_OPEN_REQUESTS_PER_AGENT}). Wait for @overlord to triage existing requests.`,
+      };
+    }
+
+    this.sql.exec(
+      `INSERT INTO agent_requests (agent, kind, title, reason, requested_tool, priority, status, owner_note)
+       VALUES (?, ?, ?, ?, ?, ?, 'open', '')`,
+      agent,
+      kind,
+      title,
+      reason,
+      requestedTool,
+      priority,
+    );
+
+    const created = this.sql
+      .exec<AgentRequestRow>(
+        `SELECT * FROM agent_requests ORDER BY id DESC LIMIT 1`,
+      )
+      .one();
+
+    const request = mapRequestRow(created);
+    this.broadcast({
+      type: "request",
+      request,
+      openCount: this.getOpenRequestCount(),
+    });
+    return { ok: true, request, deduplicated: false };
+  }
+
+  async listRequests(opts?: {
+    agent?: string;
+    status?: RequestStatus | "all";
+    limit?: number;
+  }): Promise<{ requests: AgentRequest[]; openCount: number }> {
+    const limit = Math.max(1, Math.min(opts?.limit ?? 100, 200));
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+
+    if (opts?.agent && opts.agent.trim()) {
+      clauses.push(`agent = ?`);
+      params.push(opts.agent.trim().toLowerCase());
+    }
+    if (opts?.status && opts.status !== "all") {
+      clauses.push(`status = ?`);
+      params.push(opts.status);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.sql
+      .exec<AgentRequestRow>(
+        `SELECT * FROM agent_requests ${where}
+         ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'approved' THEN 1 WHEN 'implemented' THEN 2 ELSE 3 END,
+                  CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+                  id DESC
+         LIMIT ?`,
+        ...params,
+        limit,
+      )
+      .toArray();
+
+    return {
+      requests: rows.map(mapRequestRow),
+      openCount: this.getOpenRequestCount(),
+    };
+  }
+
+  async getRequest(id: number): Promise<AgentRequest | null> {
+    const row = this.sql
+      .exec<AgentRequestRow>(`SELECT * FROM agent_requests WHERE id = ?`, id)
+      .toArray()[0];
+    return row ? mapRequestRow(row) : null;
+  }
+
+  async updateRequest(
+    id: number,
+    patch: { status?: RequestStatus; ownerNote?: string },
+  ): Promise<AgentRequest | null> {
+    const existing = this.sql
+      .exec<AgentRequestRow>(`SELECT * FROM agent_requests WHERE id = ?`, id)
+      .toArray()[0];
+    if (!existing) return null;
+
+    const nextStatus: RequestStatus =
+      patch.status === "open" ||
+      patch.status === "approved" ||
+      patch.status === "implemented" ||
+      patch.status === "rejected"
+        ? patch.status
+        : existing.status;
+
+    const nextNote =
+      typeof patch.ownerNote === "string"
+        ? patch.ownerNote.trim().slice(0, 500)
+        : existing.owner_note;
+
+    this.sql.exec(
+      `UPDATE agent_requests
+       SET status = ?, owner_note = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      nextStatus,
+      nextNote,
+      id,
+    );
+
+    const updated = mapRequestRow(
+      this.sql
+        .exec<AgentRequestRow>(`SELECT * FROM agent_requests WHERE id = ?`, id)
+        .one(),
+    );
+    this.broadcast({
+      type: "request",
+      request: updated,
+      openCount: this.getOpenRequestCount(),
+    });
+    return updated;
+  }
+
+  async deleteRequest(id: number): Promise<boolean> {
+    const existing = this.sql
+      .exec<{ id: number }>(`SELECT id FROM agent_requests WHERE id = ?`, id)
+      .toArray()[0];
+    if (!existing) return false;
+    this.sql.exec(`DELETE FROM agent_requests WHERE id = ?`, id);
+    this.broadcast({
+      type: "request_deleted",
+      id,
+      openCount: this.getOpenRequestCount(),
+    });
+    return true;
+  }
+
+  // ——— WebSocket Hibernation ———
 
   override async fetch(request: Request): Promise<Response> {
     const upgrade = request.headers.get("Upgrade");
@@ -231,7 +497,14 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       });
 
       try {
-        server.send(JSON.stringify({ type: "replay", events, latestSeq }));
+        server.send(
+          JSON.stringify({
+            type: "replay",
+            events,
+            latestSeq,
+            openRequests: this.getOpenRequestCount(),
+          }),
+        );
       } catch {
         // ignore if client closed immediately
       }
@@ -239,7 +512,10 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    return Response.json({ error: "WebSocket upgrade expected" }, { status: 426 });
+    return Response.json(
+      { error: "WebSocket upgrade expected" },
+      { status: 426 },
+    );
   }
 
   override webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
@@ -263,11 +539,7 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
     }
   }
 
-  override webSocketClose(
-    ws: WebSocket,
-    code: number,
-    reason: string,
-  ): void {
+  override webSocketClose(ws: WebSocket, code: number, reason: string): void {
     try {
       ws.close(code, reason);
     } catch {

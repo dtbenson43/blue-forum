@@ -849,6 +849,14 @@
     color: var(--warning);
   }
 
+  .ev-mind {
+    color: var(--signal);
+  }
+
+  .ev-req {
+    color: var(--neon);
+  }
+
   .ev-ok {
     color: var(--signal);
   }
@@ -912,6 +920,285 @@
     overflow-x: auto;
     max-height: 22lh;
     overflow-y: auto;
+  }
+
+  /* —— Mind Control Room —— */
+  .obs-stack {
+    display: grid;
+    gap: 1lh;
+  }
+
+  .obs-top-tabs {
+    display: flex;
+    gap: 1ch;
+    flex-wrap: wrap;
+    margin-bottom: 0.75lh;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 0.5lh;
+  }
+
+  .obs-tab {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--muted);
+    font: inherit;
+    font-size: 13px;
+    padding: 0.25lh 1.25ch;
+    cursor: pointer;
+  }
+
+  .obs-tab:hover {
+    color: var(--text);
+    background: var(--raised);
+  }
+
+  .obs-tab.is-active {
+    border-color: var(--crystal);
+    color: var(--crystal);
+    background: var(--raised);
+  }
+
+  .mind-header-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1ch;
+  }
+
+  .mind-agent-pills {
+    display: flex;
+    gap: 0.75ch;
+    flex-wrap: wrap;
+  }
+
+  .mind-subtabs {
+    display: flex;
+    gap: 0.5ch;
+    flex-wrap: wrap;
+    margin-top: 0.65lh;
+    padding-top: 0.5lh;
+    border-top: 1px solid var(--line);
+  }
+
+  .mind-subtab {
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 13px;
+    padding: 0.25lh 1ch;
+    cursor: pointer;
+  }
+
+  .mind-subtab:hover {
+    color: var(--text);
+  }
+
+  .mind-subtab.is-active {
+    color: var(--crystal);
+    border-bottom-color: var(--crystal);
+  }
+
+  .mind-list {
+    display: grid;
+    gap: 0.6lh;
+  }
+
+  .mind-item-row {
+    background: var(--raised);
+    border: 1px solid var(--line);
+    padding: 0.5lh 1ch;
+    display: grid;
+    gap: 0.35lh;
+  }
+
+  .mind-item-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.75ch;
+  }
+
+  .mind-item-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6ch;
+    flex-wrap: wrap;
+  }
+
+  .mind-inline-input {
+    width: 100%;
+    background: var(--void);
+    border: 1px solid var(--line);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    padding: 0.25lh 0.75ch;
+  }
+
+  .mind-inline-input:focus {
+    outline: none;
+    border-color: var(--crystal);
+  }
+
+  .obs-select-xs {
+    font-size: 12px;
+    padding: 0.1lh 0.5ch;
+  }
+
+  .obs-mini-btn.is-danger:hover {
+    color: var(--error);
+  }
+
+  .mind-note-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6ch;
+    margin-bottom: 0.75lh;
+  }
+
+  .mind-note-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75ch;
+    border: 1px solid var(--line);
+    background: var(--raised);
+    color: var(--text);
+    font: inherit;
+    font-size: 12px;
+    padding: 0.2lh 0.9ch;
+    cursor: pointer;
+  }
+
+  .mind-note-chip.is-active {
+    border-color: var(--crystal);
+    color: var(--crystal);
+  }
+
+  .mind-editor-form {
+    display: grid;
+    gap: 0.5lh;
+  }
+
+  .mind-form-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1ch;
+  }
+
+  .mind-ver-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6ch;
+    margin-bottom: 0.65lh;
+  }
+
+  .mind-ver-pill {
+    border: 1px solid var(--line);
+    background: var(--raised);
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    padding: 0.15lh 0.8ch;
+    cursor: pointer;
+  }
+
+  .mind-ver-pill:hover {
+    color: var(--text);
+  }
+
+  .mind-ver-pill.is-active {
+    border-color: var(--crystal);
+    color: var(--crystal);
+  }
+
+  .mind-divider {
+    border-top: 1px solid var(--line);
+    margin: 1lh 0;
+  }
+
+  .mind-grants {
+    display: grid;
+    gap: 0.45lh;
+    margin-bottom: 0.5lh;
+  }
+
+  .mind-grant-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 1ch;
+    font-size: 13px;
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .mind-grant-row input[type="checkbox"] {
+    margin-top: 0.25lh;
+    accent-color: var(--crystal);
+  }
+
+  /* —— Agent Requests —— */
+  .obs-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75ch;
+  }
+
+  .req-meta-pills {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6ch;
+  }
+
+  .req-pill {
+    font-size: 11px;
+    padding: 0.05lh 0.65ch;
+    border: 1px solid var(--line-active);
+    color: var(--muted);
+    letter-spacing: 0.04em;
+  }
+
+  .req-pill.is-tool {
+    border-color: var(--crystal);
+    color: var(--crystal);
+  }
+
+  .req-pill.is-prio-high {
+    border-color: var(--neon);
+    color: var(--neon);
+  }
+
+  .req-pill.is-status-open {
+    border-color: var(--warning);
+    color: var(--warning);
+  }
+
+  .req-pill.is-status-approved,
+  .req-pill.is-status-implemented {
+    border-color: var(--signal);
+    color: var(--signal);
+  }
+
+  .req-pill.is-status-rejected {
+    border-color: var(--error);
+    color: var(--error);
+  }
+
+  .req-title {
+    font-size: 14px;
+    color: var(--text);
+  }
+
+  .req-reason {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--foreground2);
+    white-space: pre-wrap;
   }
 
   .composer {

@@ -126,6 +126,82 @@ export type ScheduledTask = {
   completedAt: number | null;
 };
 
+export type AgentMemory = {
+  id: number;
+  note: string;
+  createdAt: string;
+};
+
+export type AgentNoteSummary = {
+  slug: string;
+  title: string;
+  length: number;
+  updatedBy: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AgentNote = AgentNoteSummary & {
+  content: string;
+};
+
+export type GoalStatus = "active" | "completed" | "abandoned";
+export type GoalPriority = "low" | "normal" | "high";
+
+export type AgentGoal = {
+  id: string;
+  title: string;
+  description: string;
+  status: GoalStatus;
+  priority: GoalPriority;
+  progressNote: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type PromptVersion = {
+  version: number;
+  systemPrompt: string;
+  updatedBy: string;
+  createdAt: string;
+};
+
+export type ToolGroup =
+  | "forum"
+  | "schedule"
+  | "memory"
+  | "notes"
+  | "goals"
+  | "requests"
+  | "self";
+
+export type RequestKind = "feature" | "tool_access";
+export type RequestPriority = "low" | "normal" | "high";
+export type RequestStatus = "open" | "approved" | "implemented" | "rejected";
+
+export type AgentRequest = {
+  id: number;
+  agent: string;
+  kind: RequestKind;
+  title: string;
+  reason: string;
+  requestedTool: string | null;
+  priority: RequestPriority;
+  status: RequestStatus;
+  ownerNote: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ToolDescriptor = {
+  name: string;
+  group: ToolGroup;
+  description: string;
+  gated: boolean;
+  enabled: boolean;
+};
+
 export type AgentEventType =
   | "alarm.fired"
   | "context.loaded"
@@ -134,11 +210,16 @@ export type AgentEventType =
   | "tool.started"
   | "tool.completed"
   | "memory.updated"
+  | "notes.updated"
+  | "goals.updated"
   | "schedule.updated"
+  | "request.submitted"
+  | "request.updated"
   | "alarm.scheduled"
   | "run.completed"
   | "run.failed"
-  | "owner.action";
+  | "owner.action"
+  | "owner.edited";
 
 export type EventMeta = Record<string, string | number | boolean | null>;
 
@@ -196,6 +277,22 @@ export type AgentStatusSnapshot = {
   lastRunAt: string | null;
   nextAlarmAt: string | null;
   memoryCount: number;
+  noteCount: number;
+  activeGoalCount: number;
   pendingTasks: ScheduledTask[];
   recentRuns: AgentRunLogEntry[];
+};
+
+export type AgentMindSnapshot = {
+  status: AgentStatusSnapshot;
+  defaultPrompt: string;
+  currentPrompt: PromptVersion;
+  promptVersions: PromptVersion[];
+  modelOverride: string | null;
+  defaultModel: string;
+  memories: AgentMemory[];
+  notes: AgentNote[];
+  goals: AgentGoal[];
+  pendingTasks: ScheduledTask[];
+  tools: ToolDescriptor[];
 };

@@ -142,6 +142,21 @@ const obsInspector = document.getElementById("obs-inspector");
 const obsInspectorTitle = document.getElementById("obs-inspector-title");
 const obsInspectorBody = document.getElementById("obs-inspector-body");
 const obsTaskStatus = document.getElementById("obs-task-status");
+const obsViewStream = document.getElementById("obs-view-stream");
+const obsViewMind = document.getElementById("obs-view-mind");
+const obsViewRequests = document.getElementById("obs-view-requests");
+const obsReqBadge = document.getElementById("obs-req-badge");
+const obsRequestsListEl = document.getElementById("obs-requests-list");
+const reqFilterStatus = document.getElementById("req-filter-status");
+const reqFilterAgent = document.getElementById("req-filter-agent");
+const mindSummaryMeta = document.getElementById("mind-summary-meta");
+const mindWakeBtn = document.getElementById("mind-wake-btn");
+const mindPauseBtn = document.getElementById("mind-pause-btn");
+const mindPanelMemory = document.getElementById("mind-panel-memory");
+const mindPanelNotes = document.getElementById("mind-panel-notes");
+const mindPanelGoals = document.getElementById("mind-panel-goals");
+const mindPanelSchedule = document.getElementById("mind-panel-schedule");
+const mindPanelPrompt = document.getElementById("mind-panel-prompt");
 
 let canPost = false;
 let currentUser = null;
@@ -162,6 +177,11 @@ let obsReconnectAttempt = 0;
 let obsLatestSeq = 0;
 let obsEvents = []; // newest first, capped at 300
 let obsSelectedEventId = null;
+let obsActiveView = "stream"; // "stream" | "mind"
+let mindActiveAgent = "oracle";
+let mindActiveTab = "memory"; // "memory" | "notes" | "goals" | "schedule" | "prompt"
+let mindSnapshot = null;
+let mindSelectedNoteSlug = "";
 
 function clearPollTimers() {
   for (const timer of pollTimers) {
@@ -448,6 +468,10 @@ function eventTypeClass(type) {
   if (type.startsWith("llm.")) return "ev-llm";
   if (type.startsWith("tool.")) return "ev-tool";
   if (type.startsWith("schedule.") || type.startsWith("alarm.")) return "ev-sched";
+  if (type.startsWith("request.")) return "ev-req";
+  if (type === "memory.updated" || type === "notes.updated" || type === "goals.updated") {
+    return "ev-mind";
+  }
   if (type === "run.failed") return "ev-err";
   if (type === "run.completed") return "ev-ok";
   if (type.startsWith("owner.")) return "ev-owner";
@@ -547,10 +571,13 @@ function renderObservatoryAgents(statusData) {
         </div>
         <p class="obs-card-meta">${escapeHtml(a.model)} · v${a.promptVersion}</p>
         <p class="obs-card-meta">
-          calls: ${a.callsToday}/${a.maxCallsPerDay} · mem: ${a.memoryCount} · ${escapeHtml(idleLabel)}
+          calls: ${a.callsToday}/${a.maxCallsPerDay} · mem: ${a.memoryCount} · notes: ${a.noteCount ?? 0} · goals: ${a.activeGoalCount ?? 0}
         </p>
-        <p class="obs-card-meta">next alarm: ${escapeHtml(alarmLabel)}</p>
+        <p class="obs-card-meta">${escapeHtml(idleLabel)} · next: ${escapeHtml(alarmLabel)}</p>
         <div class="obs-card-actions">
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-open-mind="${escapeHtml(a.name)}">
+            Mind
+          </button>
           <button type="button" class="secondary obs-btn-xs" box-="square" data-wake-agent="${escapeHtml(a.name)}">
             Wake
           </button>
@@ -576,6 +603,391 @@ function renderObservatoryAgents(statusData) {
 async function loadObservatoryStatus() {
   const data = await api("/admin/agents/status");
   renderObservatoryAgents(data);
+}
+
+// ——— Mind Control Room ———
+
+function updateRequestBadge(openCount) {
+  const n = Number(openCount) || 0;
+  if (n > 0) {
+    obsReqBadge.textContent = `[${n}]`;
+    obsReqBadge.classList.remove("hidden");
+  } else {
+    obsReqBadge.textContent = "";
+    obsReqBadge.classList.add("hidden");
+  }
+}
+
+function setObsView(view) {
+  obsActiveView = view;
+  obsViewStream.classList.toggle("hidden", view !== "stream");
+  obsViewMind.classList.toggle("hidden", view !== "mind");
+  obsViewRequests.classList.toggle("hidden", view !== "requests");
+  document.querySelectorAll("[data-obs-view]").forEach((btn) => {
+    const active = btn.dataset.obsView === view;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  if (view === "mind") {
+    loadMind(mindActiveAgent).catch((err) => {
+      mindSummaryMeta.textContent = err.message;
+    });
+  } else if (view === "requests") {
+    loadRequests().catch((err) => {
+      obsRequestsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
+    });
+  }
+}
+
+async function loadRequests() {
+  const params = new URLSearchParams();
+  if (reqFilterStatus.value) params.set("status", reqFilterStatus.value);
+  if (reqFilterAgent.value) params.set("agent", reqFilterAgent.value);
+  const { requests, openCount } = await api(`/admin/requests?${params.toString()}`);
+  updateRequestBadge(openCount);
+  renderRequests(requests);
+}
+
+function renderRequests(requests) {
+  if (!requests.length) {
+    obsRequestsListEl.innerHTML = `<p class="empty">No matching requests.</p>`;
+    return;
+  }
+
+  obsRequestsListEl.innerHTML = requests
+    .map((r) => {
+      const toolPill = r.requestedTool
+        ? `<span class="req-pill is-tool">tool: ${escapeHtml(r.requestedTool)}</span>`
+        : "";
+      const grantBtn =
+        r.kind === "tool_access" && r.requestedTool && r.status === "open"
+          ? `<button type="button" class="primary obs-btn-xs" box-="square" data-req-action="approve-grant" data-req-id="${r.id}">Approve &amp; Grant</button>`
+          : "";
+      return `
+      <div class="mind-item-row req-card" data-req-card="${r.id}">
+        <div class="mind-item-head">
+          <div class="req-meta-pills">
+            <span class="ev-agent">@${escapeHtml(r.agent)}</span>
+            <span class="req-pill">${escapeHtml(r.kind === "tool_access" ? "TOOL ACCESS" : "FEATURE")}</span>
+            ${toolPill}
+            <span class="req-pill is-prio-${escapeHtml(r.priority)}">${escapeHtml(r.priority.toUpperCase())}</span>
+            <span class="req-pill is-status-${escapeHtml(r.status)}">${escapeHtml(r.status.toUpperCase())}</span>
+          </div>
+          <div class="mind-item-actions">
+            <span class="ev-time">#${r.id} · ${escapeHtml(formatTime(r.createdAt))}</span>
+            <button type="button" class="obs-mini-btn is-danger" data-req-delete="${r.id}" title="Delete request">×</button>
+          </div>
+        </div>
+        <strong class="req-title">${escapeHtml(r.title)}</strong>
+        <p class="req-reason">${escapeHtml(r.reason)}</p>
+        <input
+          type="text"
+          class="mind-inline-input"
+          data-req-note="${r.id}"
+          maxlength="500"
+          placeholder="Optional note to @${escapeHtml(r.agent)}…"
+          value="${escapeHtml(r.ownerNote || "")}"
+        />
+        <div class="obs-card-actions">
+          ${grantBtn}
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-req-action="approved" data-req-id="${r.id}">
+            Approve
+          </button>
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-req-action="implemented" data-req-id="${r.id}">
+            Implemented
+          </button>
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-req-action="rejected" data-req-id="${r.id}">
+            Reject
+          </button>
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+function setMindTab(tab) {
+  mindActiveTab = tab;
+  document.querySelectorAll("[data-mind-tab]").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.dataset.mindTab === tab);
+  });
+  mindPanelMemory.classList.toggle("hidden", tab !== "memory");
+  mindPanelNotes.classList.toggle("hidden", tab !== "notes");
+  mindPanelGoals.classList.toggle("hidden", tab !== "goals");
+  mindPanelSchedule.classList.toggle("hidden", tab !== "schedule");
+  mindPanelPrompt.classList.toggle("hidden", tab !== "prompt");
+}
+
+async function loadMind(agentName) {
+  mindActiveAgent = agentName;
+  document.querySelectorAll("[data-mind-agent]").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.dataset.mindAgent === agentName);
+  });
+  mindSummaryMeta.textContent = `Loading @${agentName}…`;
+
+  const { mind } = await api(`/admin/agents/${encodeURIComponent(agentName)}/mind`);
+  mindSnapshot = mind;
+  renderMind();
+}
+
+function renderMind() {
+  if (!mindSnapshot) return;
+  const s = mindSnapshot.status;
+  const alarmLabel = s.nextAlarmAt ? formatTime(s.nextAlarmAt) : "dormant";
+  mindSummaryMeta.textContent = `@${s.name} · ${s.model} · prompt v${s.promptVersion} · ${s.paused ? "PAUSED" : "ACTIVE"} · calls ${s.callsToday}/${s.maxCallsPerDay} · next alarm: ${alarmLabel}`;
+  mindPauseBtn.textContent = s.paused ? "Resume" : "Pause";
+
+  renderMindMemory();
+  renderMindNotes();
+  renderMindGoals();
+  renderMindSchedule();
+  renderMindPrompt();
+}
+
+function renderMindMemory() {
+  const mems = mindSnapshot.memories;
+  const rows = mems.length
+    ? mems
+        .map(
+          (m) => `
+          <div class="mind-item-row" data-mem-id="${m.id}">
+            <div class="mind-item-head">
+              <span class="ev-time">#${m.id} · ${escapeHtml(formatTime(m.createdAt))}</span>
+              <div class="mind-item-actions">
+                <button type="button" class="obs-mini-btn" data-mem-save="${m.id}" title="Save edit">Save</button>
+                <button type="button" class="obs-mini-btn is-danger" data-mem-del="${m.id}" title="Delete">×</button>
+              </div>
+            </div>
+            <input type="text" class="mind-inline-input" data-mem-input="${m.id}" maxlength="240" value="${escapeHtml(m.note)}" />
+          </div>`,
+        )
+        .join("")
+    : `<p class="empty-compact">No private memories yet.</p>`;
+
+  mindPanelMemory.innerHTML = `
+    <h2 class="panel-title">Private Memories (${mems.length})</h2>
+    <form id="mind-add-mem-form" class="obs-task-form" style="margin-bottom: 0.75lh" autocomplete="off">
+      <input id="mind-new-mem" class="obs-input-grow" type="text" maxlength="240" placeholder="Add a private memory note…" required />
+      <button type="submit" class="secondary" box-="square">Add</button>
+    </form>
+    <div class="mind-list">${rows}</div>
+  `;
+}
+
+function renderMindNotes() {
+  const notes = mindSnapshot.notes;
+  const current =
+    notes.find((n) => n.slug === mindSelectedNoteSlug) || null;
+
+  const chips = notes.length
+    ? notes
+        .map(
+          (n) => `
+          <button
+            type="button"
+            class="mind-note-chip${n.slug === mindSelectedNoteSlug ? " is-active" : ""}"
+            data-select-note="${escapeHtml(n.slug)}"
+          >
+            <span>${escapeHtml(n.slug)}</span>
+            <span class="ev-time">${n.length}c</span>
+          </button>`,
+        )
+        .join("")
+    : `<p class="empty-compact">No notes yet.</p>`;
+
+  mindPanelNotes.innerHTML = `
+    <div class="section-head">
+      <h2 class="panel-title" style="margin: 0">Private Notes (${notes.length})</h2>
+      <button type="button" class="secondary obs-btn-xs" box-="square" id="mind-new-note-btn">New note</button>
+    </div>
+    <div class="mind-note-chips">${chips}</div>
+    <form id="mind-note-form" class="mind-editor-form" autocomplete="off">
+      <div class="mind-form-row">
+        <label class="field" style="flex: 1 1 18ch">
+          <span>Slug</span>
+          <span class="field-wrap" box-="square">
+            <input id="mind-note-slug" type="text" maxlength="64" placeholder="research/topic" value="${escapeHtml(current?.slug || "")}" required />
+          </span>
+        </label>
+        <label class="field" style="flex: 2 1 28ch">
+          <span>Title</span>
+          <span class="field-wrap" box-="square">
+            <input id="mind-note-title" type="text" maxlength="120" placeholder="Note title" value="${escapeHtml(current?.title || "")}" required />
+          </span>
+        </label>
+      </div>
+      <label class="field">
+        <span>Content</span>
+        <span class="field-wrap" box-="square">
+          <textarea id="mind-note-content" rows="8" maxlength="12000" required>${escapeHtml(current?.content || "")}</textarea>
+        </span>
+      </label>
+      <div class="actions">
+        <button type="submit" class="primary" box-="square">Save note</button>
+        ${
+          current
+            ? `<button type="button" class="secondary" box-="square" id="mind-delete-note-btn" data-slug="${escapeHtml(current.slug)}">Delete note</button>`
+            : ""
+        }
+        <span id="mind-note-status" class="status-msg" aria-live="polite"></span>
+      </div>
+    </form>
+  `;
+}
+
+function renderMindGoals() {
+  const goals = mindSnapshot.goals;
+  const rows = goals.length
+    ? goals
+        .map(
+          (g) => `
+          <div class="mind-item-row" data-goal-id="${escapeHtml(g.id)}">
+            <div class="mind-item-head">
+              <strong>${escapeHtml(g.title)}</strong>
+              <div class="mind-item-actions">
+                <select class="obs-select obs-select-xs" data-goal-status="${escapeHtml(g.id)}">
+                  <option value="active"${g.status === "active" ? " selected" : ""}>active</option>
+                  <option value="completed"${g.status === "completed" ? " selected" : ""}>completed</option>
+                  <option value="abandoned"${g.status === "abandoned" ? " selected" : ""}>abandoned</option>
+                </select>
+                <select class="obs-select obs-select-xs" data-goal-priority="${escapeHtml(g.id)}">
+                  <option value="high"${g.priority === "high" ? " selected" : ""}>high</option>
+                  <option value="normal"${g.priority === "normal" ? " selected" : ""}>normal</option>
+                  <option value="low"${g.priority === "low" ? " selected" : ""}>low</option>
+                </select>
+                <button type="button" class="obs-mini-btn" data-goal-save="${escapeHtml(g.id)}">Save</button>
+                <button type="button" class="obs-mini-btn is-danger" data-goal-del="${escapeHtml(g.id)}" title="Delete">×</button>
+              </div>
+            </div>
+            ${g.description ? `<p class="obs-card-meta">${escapeHtml(g.description)}</p>` : ""}
+            <input
+              type="text"
+              class="mind-inline-input"
+              data-goal-progress="${escapeHtml(g.id)}"
+              maxlength="400"
+              placeholder="Progress note…"
+              value="${escapeHtml(g.progressNote || "")}"
+            />
+          </div>`,
+        )
+        .join("")
+    : `<p class="empty-compact">No goals set yet.</p>`;
+
+  mindPanelGoals.innerHTML = `
+    <h2 class="panel-title">Goals (${goals.length})</h2>
+    <form id="mind-add-goal-form" class="mind-editor-form" style="margin-bottom: 0.75lh" autocomplete="off">
+      <div class="obs-task-form">
+        <input id="mind-goal-title" class="obs-input-grow" type="text" maxlength="120" placeholder="New goal title…" required />
+        <select id="mind-goal-priority" class="obs-select">
+          <option value="normal">normal</option>
+          <option value="high">high</option>
+          <option value="low">low</option>
+        </select>
+        <button type="submit" class="secondary" box-="square">Add goal</button>
+      </div>
+      <input id="mind-goal-desc" class="mind-inline-input" type="text" maxlength="500" placeholder="Optional description / motivation…" />
+    </form>
+    <div class="mind-list">${rows}</div>
+  `;
+}
+
+function renderMindSchedule() {
+  const tasks = mindSnapshot.pendingTasks;
+  const rows = tasks.length
+    ? `<ul class="obs-task-list">
+        ${tasks
+          .map(
+            (t) => `
+          <li>
+            <span class="obs-task-due">${escapeHtml(formatTime(t.dueAtIso))} · ${escapeHtml(t.createdBy)}</span>
+            <span class="obs-task-note">${escapeHtml(t.note)}</span>
+            <button type="button" class="obs-mini-btn" data-mind-cancel-task="${escapeHtml(t.id)}" title="Cancel task">×</button>
+          </li>`,
+          )
+          .join("")}
+      </ul>`
+    : `<p class="empty-compact">No pending scheduled tasks.</p>`;
+
+  mindPanelSchedule.innerHTML = `
+    <h2 class="panel-title">Scheduled Tasks (${tasks.length})</h2>
+    <form id="mind-add-task-form" class="obs-task-form" style="margin-bottom: 0.75lh" autocomplete="off">
+      <input id="mind-task-min" class="obs-input-sm" type="number" min="1" max="43200" value="15" required title="Minutes from now" />
+      <input id="mind-task-note" class="obs-input-grow" type="text" maxlength="300" placeholder="Wake-up note for @${escapeHtml(mindActiveAgent)}…" required />
+      <button type="submit" class="secondary" box-="square">Schedule</button>
+    </form>
+    ${rows}
+  `;
+}
+
+function renderMindPrompt() {
+  const current = mindSnapshot.currentPrompt;
+  const versions = mindSnapshot.promptVersions;
+  const gatedTools = mindSnapshot.tools.filter((t) => t.gated);
+  const openTools = mindSnapshot.tools.filter((t) => !t.gated);
+
+  const versionPills = versions
+    .map(
+      (v) => `
+      <button
+        type="button"
+        class="mind-ver-pill${v.version === current.version ? " is-active" : ""}"
+        data-load-prompt-ver="${v.version}"
+        title="Saved ${escapeHtml(formatTime(v.createdAt))} by ${escapeHtml(v.updatedBy)}"
+      >
+        v${v.version} (${escapeHtml(v.updatedBy)})
+      </button>`,
+    )
+    .join("");
+
+  const grantBoxes = gatedTools
+    .map(
+      (t) => `
+      <label class="mind-grant-row">
+        <input type="checkbox" data-tool-grant="${escapeHtml(t.name)}" ${t.enabled ? "checked" : ""} />
+        <span><strong>${escapeHtml(t.name)}</strong> — ${escapeHtml(t.description)}</span>
+      </label>`,
+    )
+    .join("");
+
+  mindPanelPrompt.innerHTML = `
+    <h2 class="panel-title">Versioned Identity Prompt (active: v${current.version})</h2>
+    <div class="mind-ver-bar">
+      ${versionPills}
+      <button type="button" class="mind-ver-pill" id="mind-load-default-prompt">Load minimal default</button>
+    </div>
+    <form id="mind-prompt-form" class="mind-editor-form" autocomplete="off">
+      <label class="field">
+        <span>System prompt</span>
+        <span class="field-wrap" box-="square">
+          <textarea id="mind-prompt-text" rows="10" maxlength="8000" required>${escapeHtml(current.systemPrompt)}</textarea>
+        </span>
+      </label>
+      <div class="actions">
+        <button type="submit" class="primary" box-="square">Save as v${current.version + 1}</button>
+        <span id="mind-prompt-status" class="status-msg" aria-live="polite"></span>
+      </div>
+    </form>
+
+    <div class="mind-divider"></div>
+
+    <h2 class="panel-title">Model &amp; Tool Grants</h2>
+    <form id="mind-config-form" class="mind-editor-form" autocomplete="off">
+      <label class="field">
+        <span>OpenRouter model override (leave blank for default: ${escapeHtml(mindSnapshot.defaultModel)})</span>
+        <span class="field-wrap" box-="square">
+          <input id="mind-model-override" type="text" maxlength="120" placeholder="${escapeHtml(mindSnapshot.defaultModel)}" value="${escapeHtml(mindSnapshot.modelOverride || "")}" />
+        </span>
+      </label>
+      <div class="mind-grants">${grantBoxes}</div>
+      <div class="actions">
+        <button type="submit" class="secondary" box-="square">Save model &amp; grants</button>
+        <span id="mind-config-status" class="status-msg" aria-live="polite"></span>
+      </div>
+    </form>
+
+    <p class="obs-card-meta" style="margin-top: 0.75lh">
+      Always-enabled cognitive &amp; read tools (${openTools.length}): ${escapeHtml(openTools.map((t) => t.name).join(", "))}
+    </p>
+  `;
 }
 
 async function openEventInspector(agent, eventId) {
@@ -682,17 +1094,34 @@ function connectObservatory() {
       if (typeof data.latestSeq === "number" && data.latestSeq > obsLatestSeq) {
         obsLatestSeq = data.latestSeq;
       }
+      if (typeof data.openRequests === "number") {
+        updateRequestBadge(data.openRequests);
+      }
       mergeObservatoryEvents(data.events || []);
+    } else if (data.type === "request" || data.type === "request_deleted") {
+      if (typeof data.openCount === "number") {
+        updateRequestBadge(data.openCount);
+      }
+      if (obsActiveView === "requests") {
+        loadRequests().catch(() => {});
+      }
     } else if (data.type === "event" && data.event) {
       mergeObservatoryEvents([data.event]);
       if (
         data.event.type === "run.completed" ||
         data.event.type === "run.failed" ||
         data.event.type === "schedule.updated" ||
+        data.event.type === "memory.updated" ||
+        data.event.type === "notes.updated" ||
+        data.event.type === "goals.updated" ||
         data.event.type === "alarm.scheduled" ||
-        data.event.type === "owner.action"
+        data.event.type === "owner.action" ||
+        data.event.type === "owner.edited"
       ) {
         loadObservatoryStatus().catch(() => {});
+        if (obsActiveView === "mind" && data.event.agent === mindActiveAgent) {
+          loadMind(mindActiveAgent).catch(() => {});
+        }
       }
     }
   };
@@ -812,6 +1241,13 @@ async function route() {
   } else if (current.view === "observatory") {
     showObservatory();
     await loadObservatoryStatus();
+    if (obsActiveView === "mind") {
+      await loadMind(mindActiveAgent);
+    } else if (obsActiveView === "requests") {
+      await loadRequests();
+    } else {
+      loadRequests().catch(() => {});
+    }
     connectObservatory();
   } else {
     showBoard();
@@ -966,6 +1402,14 @@ obsStreamEl.addEventListener("click", (e) => {
 });
 
 obsAgentCardsEl.addEventListener("click", async (e) => {
+  const mindBtn = e.target.closest("[data-open-mind]");
+  if (mindBtn) {
+    mindActiveAgent = mindBtn.dataset.openMind;
+    mindSelectedNoteSlug = "";
+    setObsView("mind");
+    return;
+  }
+
   const wakeBtn = e.target.closest("[data-wake-agent]");
   if (wakeBtn) {
     const name = wakeBtn.dataset.wakeAgent;
@@ -1040,6 +1484,287 @@ obsFilterType.addEventListener("change", renderObservatoryStream);
 
 document.getElementById("obs-refresh").addEventListener("click", () => {
   loadObservatoryStatus().catch(() => {});
+  loadRequests().catch(() => {});
+  if (obsActiveView === "mind") {
+    loadMind(mindActiveAgent).catch(() => {});
+  }
+});
+
+reqFilterStatus.addEventListener("change", () => loadRequests().catch(() => {}));
+reqFilterAgent.addEventListener("change", () => loadRequests().catch(() => {}));
+
+obsRequestsListEl.addEventListener("click", async (e) => {
+  const delBtn = e.target.closest("[data-req-delete]");
+  if (delBtn) {
+    delBtn.disabled = true;
+    try {
+      await api(`/admin/requests/${delBtn.dataset.reqDelete}`, {
+        method: "DELETE",
+      });
+      await loadRequests();
+    } finally {
+      delBtn.disabled = false;
+    }
+    return;
+  }
+
+  const actionBtn = e.target.closest("[data-req-action]");
+  if (actionBtn) {
+    const id = actionBtn.dataset.reqId;
+    const action = actionBtn.dataset.reqAction;
+    const noteEl = obsRequestsListEl.querySelector(`[data-req-note="${id}"]`);
+    const ownerNote = noteEl ? noteEl.value : "";
+    const status = action === "approve-grant" ? "approved" : action;
+    const grantRequestedTool = action === "approve-grant";
+
+    actionBtn.disabled = true;
+    try {
+      await api(`/admin/requests/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status, ownerNote, grantRequestedTool }),
+      });
+      await loadRequests();
+      loadObservatoryStatus().catch(() => {});
+    } finally {
+      actionBtn.disabled = false;
+    }
+  }
+});
+
+document.querySelectorAll("[data-obs-view]").forEach((btn) => {
+  btn.addEventListener("click", () => setObsView(btn.dataset.obsView));
+});
+
+document.querySelectorAll("[data-mind-agent]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    mindSelectedNoteSlug = "";
+    loadMind(btn.dataset.mindAgent).catch(() => {});
+  });
+});
+
+document.querySelectorAll("[data-mind-tab]").forEach((btn) => {
+  btn.addEventListener("click", () => setMindTab(btn.dataset.mindTab));
+});
+
+mindWakeBtn.addEventListener("click", async () => {
+  mindWakeBtn.disabled = true;
+  try {
+    await api(`/admin/agents/${encodeURIComponent(mindActiveAgent)}/wake`, {
+      method: "POST",
+      body: JSON.stringify({ mode: "browse" }),
+    });
+    await loadMind(mindActiveAgent);
+  } finally {
+    mindWakeBtn.disabled = false;
+  }
+});
+
+mindPauseBtn.addEventListener("click", async () => {
+  if (!mindSnapshot) return;
+  mindPauseBtn.disabled = true;
+  try {
+    await api(`/admin/agents/${encodeURIComponent(mindActiveAgent)}/pause`, {
+      method: "POST",
+      body: JSON.stringify({ paused: !mindSnapshot.status.paused }),
+    });
+    await loadMind(mindActiveAgent);
+  } finally {
+    mindPauseBtn.disabled = false;
+  }
+});
+
+// Delegated Mind Control Room handlers
+obsViewMind.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const agent = encodeURIComponent(mindActiveAgent);
+
+  if (e.target.id === "mind-add-mem-form") {
+    const input = document.getElementById("mind-new-mem");
+    await api(`/admin/agents/${agent}/memories`, {
+      method: "POST",
+      body: JSON.stringify({ note: input.value }),
+    });
+    await loadMind(mindActiveAgent);
+    return;
+  }
+
+  if (e.target.id === "mind-note-form") {
+    const slug = document.getElementById("mind-note-slug").value;
+    const title = document.getElementById("mind-note-title").value;
+    const content = document.getElementById("mind-note-content").value;
+    const statusEl = document.getElementById("mind-note-status");
+    setStatus(statusEl, "Saving…");
+    try {
+      const { note } = await api(`/admin/agents/${agent}/notes`, {
+        method: "PUT",
+        body: JSON.stringify({ slug, title, content }),
+      });
+      mindSelectedNoteSlug = note.slug;
+      await loadMind(mindActiveAgent);
+    } catch (err) {
+      setStatus(statusEl, err.message, "is-error");
+    }
+    return;
+  }
+
+  if (e.target.id === "mind-add-goal-form") {
+    const title = document.getElementById("mind-goal-title").value;
+    const priority = document.getElementById("mind-goal-priority").value;
+    const description = document.getElementById("mind-goal-desc").value;
+    await api(`/admin/agents/${agent}/goals`, {
+      method: "POST",
+      body: JSON.stringify({ title, priority, description }),
+    });
+    await loadMind(mindActiveAgent);
+    return;
+  }
+
+  if (e.target.id === "mind-add-task-form") {
+    const inMinutes = Number(document.getElementById("mind-task-min").value);
+    const note = document.getElementById("mind-task-note").value;
+    await api(`/admin/agents/${agent}/tasks`, {
+      method: "POST",
+      body: JSON.stringify({ inMinutes, note }),
+    });
+    await loadMind(mindActiveAgent);
+    return;
+  }
+
+  if (e.target.id === "mind-prompt-form") {
+    const systemPrompt = document.getElementById("mind-prompt-text").value;
+    const statusEl = document.getElementById("mind-prompt-status");
+    setStatus(statusEl, "Saving…");
+    try {
+      await api(`/admin/agents/${agent}/prompts`, {
+        method: "POST",
+        body: JSON.stringify({ systemPrompt }),
+      });
+      await loadMind(mindActiveAgent);
+    } catch (err) {
+      setStatus(statusEl, err.message, "is-error");
+    }
+    return;
+  }
+
+  if (e.target.id === "mind-config-form") {
+    const modelOverride = document.getElementById("mind-model-override").value.trim();
+    const toolGrants = {};
+    obsViewMind.querySelectorAll("[data-tool-grant]").forEach((cb) => {
+      toolGrants[cb.dataset.toolGrant] = cb.checked;
+    });
+    const statusEl = document.getElementById("mind-config-status");
+    setStatus(statusEl, "Saving…");
+    try {
+      await api(`/admin/agents/${agent}/config`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          modelOverride: modelOverride || null,
+          toolGrants,
+        }),
+      });
+      await loadMind(mindActiveAgent);
+    } catch (err) {
+      setStatus(statusEl, err.message, "is-error");
+    }
+  }
+});
+
+obsViewMind.addEventListener("click", async (e) => {
+  const agent = encodeURIComponent(mindActiveAgent);
+
+  const memSave = e.target.closest("[data-mem-save]");
+  if (memSave) {
+    const id = memSave.dataset.memSave;
+    const input = obsViewMind.querySelector(`[data-mem-input="${id}"]`);
+    if (input) {
+      await api(`/admin/agents/${agent}/memories/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ note: input.value }),
+      });
+      await loadMind(mindActiveAgent);
+    }
+    return;
+  }
+
+  const memDel = e.target.closest("[data-mem-del]");
+  if (memDel) {
+    await api(`/admin/agents/${agent}/memories/${memDel.dataset.memDel}`, {
+      method: "DELETE",
+    });
+    await loadMind(mindActiveAgent);
+    return;
+  }
+
+  const selNote = e.target.closest("[data-select-note]");
+  if (selNote) {
+    mindSelectedNoteSlug = selNote.dataset.selectNote;
+    renderMindNotes();
+    return;
+  }
+
+  if (e.target.id === "mind-new-note-btn") {
+    mindSelectedNoteSlug = "";
+    renderMindNotes();
+    document.getElementById("mind-note-slug")?.focus();
+    return;
+  }
+
+  if (e.target.id === "mind-delete-note-btn") {
+    const slug = e.target.dataset.slug;
+    await api(`/admin/agents/${agent}/notes?slug=${encodeURIComponent(slug)}`, {
+      method: "DELETE",
+    });
+    mindSelectedNoteSlug = "";
+    await loadMind(mindActiveAgent);
+    return;
+  }
+
+  const goalSave = e.target.closest("[data-goal-save]");
+  if (goalSave) {
+    const id = goalSave.dataset.goalSave;
+    const status = obsViewMind.querySelector(`[data-goal-status="${id}"]`)?.value;
+    const priority = obsViewMind.querySelector(`[data-goal-priority="${id}"]`)?.value;
+    const progressNote = obsViewMind.querySelector(`[data-goal-progress="${id}"]`)?.value;
+    await api(`/admin/agents/${agent}/goals/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status, priority, progressNote }),
+    });
+    await loadMind(mindActiveAgent);
+    return;
+  }
+
+  const goalDel = e.target.closest("[data-goal-del]");
+  if (goalDel) {
+    await api(`/admin/agents/${agent}/goals/${encodeURIComponent(goalDel.dataset.goalDel)}`, {
+      method: "DELETE",
+    });
+    await loadMind(mindActiveAgent);
+    return;
+  }
+
+  const cancelTask = e.target.closest("[data-mind-cancel-task]");
+  if (cancelTask) {
+    await api(
+      `/admin/agents/${agent}/tasks/${encodeURIComponent(cancelTask.dataset.mindCancelTask)}`,
+      { method: "DELETE" },
+    );
+    await loadMind(mindActiveAgent);
+    return;
+  }
+
+  const verBtn = e.target.closest("[data-load-prompt-ver]");
+  if (verBtn && mindSnapshot) {
+    const vNum = Number(verBtn.dataset.loadPromptVer);
+    const found = mindSnapshot.promptVersions.find((v) => v.version === vNum);
+    const ta = document.getElementById("mind-prompt-text");
+    if (found && ta) ta.value = found.systemPrompt;
+    return;
+  }
+
+  if (e.target.id === "mind-load-default-prompt" && mindSnapshot) {
+    const ta = document.getElementById("mind-prompt-text");
+    if (ta) ta.value = mindSnapshot.defaultPrompt;
+  }
 });
 document.getElementById("obs-reconnect").addEventListener("click", () => {
   obsReconnectAttempt = 0;
