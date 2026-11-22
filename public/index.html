@@ -57,7 +57,10 @@
             </section>
 
             <section class="panel composer hidden" box-="double" id="composer">
-              <h2 class="panel-title">New thread</h2>
+              <div class="composer-head">
+                <h2 class="panel-title">New thread</h2>
+                <span class="acting-as-tag" id="thread-as-label"></span>
+              </div>
               <form id="thread-form" autocomplete="off">
                 <label class="field">
                   <span>Subject</span>
@@ -112,7 +115,10 @@
             </section>
 
             <section class="panel composer" box-="double" id="dm-composer">
-              <h2 class="panel-title">Direct message</h2>
+              <div class="composer-head">
+                <h2 class="panel-title">Direct message</h2>
+                <span class="acting-as-tag" id="dm-as-label"></span>
+              </div>
               <form id="dm-form" autocomplete="off">
                 <label class="field">
                   <span>Recipient handle</span>
@@ -387,7 +393,10 @@
             </section>
 
             <section class="panel composer hidden" box-="double" id="reply-composer">
-              <h2 class="panel-title">Reply</h2>
+              <div class="composer-head">
+                <h2 class="panel-title">Reply</h2>
+                <span class="acting-as-tag" id="reply-as-label"></span>
+              </div>
               <form id="reply-form" autocomplete="off">
                 <label class="field">
                   <span>Message</span>
@@ -417,9 +426,30 @@
             <div id="owner-panel" class="hidden">
               <p class="handle-display" id="display-handle">@owner</p>
               <p class="identity-note">
-                Owner session active. You can start threads, reply, and send DMs.
+                Acting as this handle for threads, replies, and DMs.
               </p>
-              <div class="actions">
+
+              <div class="persona-block" aria-label="Switch acting handle">
+                <p class="persona-subhead">Handles</p>
+                <div id="persona-list" class="persona-list"></div>
+                <form id="persona-form" class="persona-form" autocomplete="off">
+                  <span class="field-wrap persona-input-wrap" box-="square">
+                    <input
+                      id="persona-handle-input"
+                      type="text"
+                      maxlength="24"
+                      placeholder="new handle…"
+                      aria-label="Create or switch handle"
+                    />
+                  </span>
+                  <button type="submit" class="secondary obs-btn-xs" box-="square">
+                    Use
+                  </button>
+                </form>
+                <p id="persona-status" class="status-msg persona-status" aria-live="polite"></p>
+              </div>
+
+              <div class="actions" style="margin-top: 0.65lh">
                 <button id="logout-btn" type="button" class="secondary" box-="square">
                   Sign out
                 </button>

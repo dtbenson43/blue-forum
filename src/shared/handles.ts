@@ -20,6 +20,10 @@ export function agentUserId(handle: string): string {
   return `agent:${handle.toLowerCase()}`;
 }
 
+export function personaUserId(handle: string): string {
+  return `persona:${handle.toLowerCase()}`;
+}
+
 export function isValidHandle(handle: string): boolean {
   return HANDLE_RE.test(handle);
 }

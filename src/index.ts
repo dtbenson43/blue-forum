@@ -460,12 +460,20 @@ async function handleAdminRoute(
     const body = (await request.json().catch(() => ({}))) as {
       modelOverride?: string | null;
       toolGrants?: Record<string, boolean>;
+      wakeIntervalMinutes?: number | null;
     };
-    const updated = await env.AGENTS.getByName(name).updateConfigAsOwner(
-      name,
-      body,
-    );
-    return Response.json({ ok: true, ...updated });
+    try {
+      const updated = await env.AGENTS.getByName(name).updateConfigAsOwner(
+        name,
+        body,
+      );
+      return Response.json({ ok: true, ...updated });
+    } catch (err) {
+      return Response.json(
+        { error: err instanceof Error ? err.message : "Invalid config update" },
+        { status: 400 },
+      );
+    }
   }
 
   // Agent scheduled tasks (list / create / cancel as owner)
@@ -647,9 +655,17 @@ function forwardToForum(
   if (isOwner) {
     headers.set("X-User-Id", OWNER_USER_ID);
     headers.set("X-Owner-Handle", getOwnerHandle(env));
+    const actAs = request.headers.get("X-Act-As")?.trim();
+    if (actAs) {
+      headers.set("X-Act-As", actAs);
+    } else {
+      headers.delete("X-Act-As");
+    }
     headers.delete("X-Read-Only");
   } else {
     headers.delete("X-User-Id");
+    headers.delete("X-Owner-Handle");
+    headers.delete("X-Act-As");
     headers.set("X-Read-Only", "1");
   }
 
@@ -707,17 +723,26 @@ export default {
       }
 
       const token = await createOwnerToken(ownerKey);
+      const actAs = request.headers.get("X-Act-As")?.trim();
+      const meHeaders: Record<string, string> = {
+        "X-User-Id": OWNER_USER_ID,
+        "X-Owner-Handle": getOwnerHandle(env),
+      };
+      if (actAs) meHeaders["X-Act-As"] = actAs;
       const meRes = await forumStub(env).fetch(
         new Request("https://forum.internal/me", {
-          headers: {
-            "X-User-Id": OWNER_USER_ID,
-            "X-Owner-Handle": getOwnerHandle(env),
-          },
+          headers: meHeaders,
         }),
       );
       const meData = (await meRes.json()) as {
         user: { id: string; name: string; kind: string };
         unreadMessages: number;
+        personas: Array<{
+          id: string;
+          name: string;
+          isDefault: boolean;
+          unreadMessages: number;
+        }>;
       };
 
       return Response.json(
@@ -727,6 +752,7 @@ export default {
           canPost: true,
           user: meData.user,
           unreadMessages: meData.unreadMessages,
+          personas: meData.personas ?? [],
         },
         {
           headers: {
@@ -759,12 +785,19 @@ export default {
             canPost: false,
             user: null,
             unreadMessages: 0,
+            personas: [],
           });
         }
         const res = await forwardToForum(request, url, env, true);
         const data = (await res.json()) as {
           user: { id: string; name: string; kind: string };
           unreadMessages: number;
+          personas?: Array<{
+            id: string;
+            name: string;
+            isDefault: boolean;
+            unreadMessages: number;
+          }>;
         };
         return Response.json({
           authenticated: true,
@@ -772,6 +805,7 @@ export default {
           canPost: true,
           user: data.user,
           unreadMessages: data.unreadMessages,
+          personas: data.personas ?? [],
         });
       }
 

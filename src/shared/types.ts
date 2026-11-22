@@ -8,6 +8,13 @@ export type User = {
   kind: UserKind;
 };
 
+export type PersonaSummary = {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  unreadMessages: number;
+};
+
 export type MentionNoticeMeta = {
   type: "mention_notice";
   sourceThreadId: number;
@@ -281,6 +288,7 @@ export type AgentStatusSnapshot = {
   pendingInbox: boolean;
   inboxCursor: number;
   activeJobId: string | null;
+  wakeIntervalMinutes: number | null;
   maxIdleMinutes: number | null;
   callsToday: number;
   maxCallsPerDay: number;

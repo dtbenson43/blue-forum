@@ -1216,6 +1216,110 @@
     color: var(--muted);
   }
 
+  /* —— Persona Switcher & Composer Indicator —— */
+  .composer-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1ch;
+    flex-wrap: wrap;
+    margin-bottom: 0.65lh;
+  }
+
+  .composer-head .panel-title {
+    margin: 0;
+  }
+
+  .acting-as-tag {
+    font-size: 12px;
+    color: var(--crystal);
+    letter-spacing: 0.02em;
+  }
+
+  .persona-block {
+    margin-top: 0.4lh;
+    padding-top: 0.55lh;
+    border-top: 1px solid var(--line);
+    display: grid;
+    gap: 0.45lh;
+  }
+
+  .persona-subhead {
+    margin: 0;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+  }
+
+  .persona-list {
+    display: grid;
+    gap: 0.3lh;
+  }
+
+  .persona-btn {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75ch;
+    width: 100%;
+    text-align: left;
+    padding: 0.25lh 0.8ch;
+    border: 1px solid var(--line);
+    background: var(--raised);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .persona-btn:hover {
+    border-color: var(--line-active);
+    color: var(--ice);
+  }
+
+  .persona-btn.is-active {
+    border-color: var(--crystal);
+    color: var(--crystal);
+    font-weight: 600;
+  }
+
+  .persona-btn-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5ch;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--muted);
+  }
+
+  .persona-form {
+    display: flex;
+    align-items: stretch;
+    gap: 0.6ch;
+  }
+
+  .persona-input-wrap {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .persona-input-wrap input {
+    width: 100%;
+    font-size: 13px;
+    padding: 0.15lh 0.6ch;
+  }
+
+  .persona-status {
+    margin: 0;
+    font-size: 12px;
+    min-height: 0;
+  }
+
+  .persona-status:empty {
+    display: none;
+  }
+
   /* —— Responsive —— */
   @media (max-width: 1100px) {
     .shell {

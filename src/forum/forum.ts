@@ -4,6 +4,7 @@ import type {
   ForumEvent,
   InboxItem,
   MessageSummary,
+  PersonaSummary,
   Post,
   PostMeta,
   ThreadDetail,
@@ -18,6 +19,7 @@ import {
   makeDmKey,
   normalizeHandle,
   OWNER_USER_ID,
+  personaUserId,
   RESERVED_HANDLES,
   SYSTEM_HANDLE,
   SYSTEM_USER_ID,
@@ -474,6 +476,116 @@ export class Forum extends DurableObject<ForumEnv> {
       finalHandle,
     );
     return { id: OWNER_USER_ID, name: finalHandle, kind: "human" };
+  }
+
+  ensurePersona(rawHandle: string, ownerHandle: string): {
+    user: User;
+    created: boolean;
+  } {
+    const owner = this.ensureOwner(ownerHandle);
+    const normalized = rawHandle.trim().replace(/^@+/, "").toLowerCase();
+    if (!isValidHandle(normalized)) {
+      throw new Error(
+        "Handle must be 2–24 lowercase letters, digits, '-' or '_'.",
+      );
+    }
+    if (normalized === owner.name.toLowerCase()) {
+      return { user: owner, created: false };
+    }
+    if (RESERVED_HANDLES.has(normalized)) {
+      throw new Error(`Handle @${normalized} is reserved.`);
+    }
+    const agentSet = new Set(AGENT_NAMES.map((n) => n.toLowerCase()));
+    if (agentSet.has(normalized)) {
+      throw new Error(
+        `Handle @${normalized} belongs to an autonomous signal and cannot be used as a custom handle.`,
+      );
+    }
+
+    const existing = this.getUserByName(normalized);
+    if (existing) {
+      if (existing.kind !== "human") {
+        throw new Error(
+          `Handle @${normalized} is reserved for system or signal use.`,
+        );
+      }
+      return { user: existing, created: false };
+    }
+
+    const id = personaUserId(normalized);
+    this.sql.exec(
+      `INSERT INTO users (id, name, kind) VALUES (?, ?, 'human')`,
+      id,
+      normalized,
+    );
+    return {
+      user: { id, name: normalized, kind: "human" },
+      created: true,
+    };
+  }
+
+  listPersonas(ownerHandle: string): PersonaSummary[] {
+    this.ensureOwner(ownerHandle);
+    const rows = this.sql
+      .exec<{ id: string; name: string; unreadMessages: number }>(
+        `SELECT
+           u.id AS id,
+           u.name AS name,
+           (SELECT COUNT(*)
+            FROM thread_participants tp
+            JOIN threads t ON t.id = tp.thread_id
+            JOIN posts p ON p.thread_id = tp.thread_id
+            WHERE tp.user_id = u.id
+              AND t.board = 'messages'
+              AND p.id > tp.last_read_post_id
+              AND p.user_id != u.id) AS unreadMessages
+         FROM users u
+         WHERE u.kind = 'human'
+         ORDER BY CASE WHEN u.id = ? THEN 0 ELSE 1 END, u.name COLLATE NOCASE ASC`,
+        OWNER_USER_ID,
+      )
+      .toArray();
+
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      isDefault: row.id === OWNER_USER_ID,
+      unreadMessages: row.unreadMessages ?? 0,
+    }));
+  }
+
+  private resolvePersonaForRequest(
+    ownerHandle: string,
+    actAsHandle: string | null,
+    strict: boolean,
+  ): User {
+    const owner = this.ensureOwner(ownerHandle);
+    if (!actAsHandle || !actAsHandle.trim()) {
+      return owner;
+    }
+
+    const normalized = normalizeHandle(actAsHandle);
+    if (!normalized || normalized === owner.name.toLowerCase()) {
+      return owner;
+    }
+
+    const agentSet = new Set(AGENT_NAMES.map((n) => n.toLowerCase()));
+    if (RESERVED_HANDLES.has(normalized) || agentSet.has(normalized)) {
+      if (strict) {
+        throw new Error(`Cannot act as @${normalized}.`);
+      }
+      return owner;
+    }
+
+    const existing = this.getUserByName(normalized);
+    if (existing && existing.kind === "human") {
+      return existing;
+    }
+
+    if (strict) {
+      throw new Error(`Persona @${normalized} not found. Create it first.`);
+    }
+    return owner;
   }
 
   private getOrCreateDMInTx(userA: User, userB: User): number {
@@ -1703,35 +1815,33 @@ export class Forum extends DurableObject<ForumEnv> {
     const isReadOnly = request.headers.get("X-Read-Only") === "1";
     const userId = request.headers.get("X-User-Id");
     const ownerHandle = request.headers.get("X-Owner-Handle") || "overlord";
+    const actAsHandle = request.headers.get("X-Act-As");
 
     if (!isReadOnly && !userId) {
       return Response.json({ error: "Missing user id" }, { status: 400 });
     }
 
-    const ensureActor = (): User => {
+    const ensureActor = (strict = false): User => {
       if (userId === OWNER_USER_ID) {
-        return this.ensureOwner(ownerHandle);
+        return this.resolvePersonaForRequest(ownerHandle, actAsHandle, strict);
       }
       return this.ensureUser(userId!);
     };
 
     try {
       if (request.method === "GET" && url.pathname === "/threads") {
-        if (!isReadOnly) {
-          ensureActor();
-        }
+        const actor = isReadOnly ? null : ensureActor(false);
         return Response.json({
           board: "general",
-          threads: this.listThreads(100, isReadOnly ? null : userId),
+          threads: this.listThreads(100, actor ? actor.id : null),
+          ...(actor ? { personas: this.listPersonas(ownerHandle) } : {}),
         });
       }
 
       const threadMatch = url.pathname.match(/^\/threads\/(\d+)$/);
       if (request.method === "GET" && threadMatch) {
-        if (!isReadOnly) {
-          ensureActor();
-        }
-        const viewerId = isReadOnly ? "__guest__" : userId!;
+        const actor = isReadOnly ? null : ensureActor(false);
+        const viewerId = actor ? actor.id : "__guest__";
         const thread = this.getThread(Number(threadMatch[1]), viewerId, {
           markRead: !isReadOnly,
         });
@@ -1741,7 +1851,8 @@ export class Forum extends DurableObject<ForumEnv> {
         return Response.json({
           board: thread.board,
           thread,
-          unreadMessages: isReadOnly ? 0 : this.countUnreadMessages(viewerId),
+          unreadMessages: actor ? this.countUnreadMessages(actor.id) : 0,
+          ...(actor ? { personas: this.listPersonas(ownerHandle) } : {}),
         });
       }
 
@@ -1753,11 +1864,43 @@ export class Forum extends DurableObject<ForumEnv> {
       }
 
       if (request.method === "GET" && url.pathname === "/me") {
-        const user = ensureActor();
+        const user = ensureActor(false);
         return Response.json({
           user,
           unreadMessages: this.countUnreadMessages(user.id),
+          personas: this.listPersonas(ownerHandle),
         });
+      }
+
+      if (request.method === "GET" && url.pathname === "/personas") {
+        const activeUser = ensureActor(false);
+        return Response.json({
+          activeUser,
+          personas: this.listPersonas(ownerHandle),
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/personas") {
+        const { handle } = (await request.json().catch(() => ({}))) as {
+          handle?: string;
+        };
+        if (typeof handle !== "string" || !handle.trim()) {
+          return Response.json(
+            { error: "handle is required" },
+            { status: 400 },
+          );
+        }
+        const { user, created } = this.ensurePersona(handle, ownerHandle);
+        return Response.json(
+          {
+            ok: true,
+            created,
+            user,
+            unreadMessages: this.countUnreadMessages(user.id),
+            personas: this.listPersonas(ownerHandle),
+          },
+          { status: created ? 201 : 200 },
+        );
       }
 
       if (request.method === "PATCH" && url.pathname === "/me") {
@@ -1778,17 +1921,18 @@ export class Forum extends DurableObject<ForumEnv> {
             { status: 400 },
           );
         }
-        const actor = ensureActor();
+        const actor = ensureActor(true);
         const thread = await this.createThread(actor.id, title, body);
         return Response.json({ thread }, { status: 201 });
       }
 
       if (request.method === "GET" && url.pathname === "/messages") {
-        const actor = ensureActor();
+        const actor = ensureActor(false);
         return Response.json({
           board: "messages",
           messages: this.listMessages(actor.id),
           unreadMessages: this.countUnreadMessages(actor.id),
+          personas: this.listPersonas(ownerHandle),
         });
       }
 
@@ -1803,7 +1947,7 @@ export class Forum extends DurableObject<ForumEnv> {
             { status: 400 },
           );
         }
-        const actor = ensureActor();
+        const actor = ensureActor(true);
         const result = await this.sendDM(actor.id, recipient, body);
         return Response.json(result, { status: 201 });
       }
@@ -1814,7 +1958,7 @@ export class Forum extends DurableObject<ForumEnv> {
         if (typeof body !== "string") {
           return Response.json({ error: "body required" }, { status: 400 });
         }
-        const actor = ensureActor();
+        const actor = ensureActor(true);
         const post = await this.replyToThread(
           actor.id,
           Number(replyMatch[1]),

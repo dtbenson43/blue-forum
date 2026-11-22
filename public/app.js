@@ -1,11 +1,45 @@
+const ACT_AS_STORAGE_KEY = "bf_act_as";
+
+function readStoredActAs() {
+  try {
+    return (
+      sessionStorage.getItem(ACT_AS_STORAGE_KEY) ||
+      localStorage.getItem(ACT_AS_STORAGE_KEY) ||
+      ""
+    );
+  } catch {
+    return "";
+  }
+}
+
+function persistActAs(handle) {
+  const clean = (handle || "").trim().toLowerCase();
+  activeActAs = clean;
+  try {
+    if (clean) {
+      sessionStorage.setItem(ACT_AS_STORAGE_KEY, clean);
+      localStorage.setItem(ACT_AS_STORAGE_KEY, clean);
+    } else {
+      sessionStorage.removeItem(ACT_AS_STORAGE_KEY);
+      localStorage.removeItem(ACT_AS_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+let activeActAs = readStoredActAs();
+
 async function api(path, options = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...(activeActAs ? { "X-Act-As": activeActAs } : {}),
+    ...(options.headers || {}),
+  };
   const res = await fetch(`/api${path}`, {
     credentials: "same-origin",
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
     ...options,
+    headers,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -109,6 +143,13 @@ const loginStatus = document.getElementById("login-status");
 const navUnreadEl = document.getElementById("nav-unread");
 const signalDirectoryEl = document.getElementById("signal-directory");
 const signalsNoteEl = document.getElementById("signals-note");
+const personaListEl = document.getElementById("persona-list");
+const personaFormEl = document.getElementById("persona-form");
+const personaInputEl = document.getElementById("persona-handle-input");
+const personaStatusEl = document.getElementById("persona-status");
+const threadAsLabelEl = document.getElementById("thread-as-label");
+const dmAsLabelEl = document.getElementById("dm-as-label");
+const replyAsLabelEl = document.getElementById("reply-as-label");
 
 const threadStatus = document.getElementById("thread-status");
 const replyStatus = document.getElementById("reply-status");
@@ -163,6 +204,8 @@ const mindPanelPrompt = document.getElementById("mind-panel-prompt");
 
 let canPost = false;
 let currentUser = null;
+let cachedPersonas = [];
+let activeUnreadCount = 0;
 let cachedAgents = [];
 let activeThreadId = null;
 let activeThreadBoard = "general";
@@ -200,8 +243,10 @@ function scheduleGentleThreadRefresh(threadId, baselineCount) {
     const id = setTimeout(async () => {
       if (activeThreadId !== threadId) return;
       try {
-        const { thread, unreadMessages } = await api(`/threads/${threadId}`);
+        const { thread, unreadMessages, personas } = await api(`/threads/${threadId}`);
+        if (Array.isArray(personas)) cachedPersonas = personas;
         updateUnreadBadge(unreadMessages);
+        renderPersonas();
         if (thread.posts.length > baselineCount) {
           activePostCount = thread.posts.length;
           renderThreadDetail(thread, null);
@@ -229,15 +274,69 @@ function setStatus(el, message, kind = "") {
   if (kind) el.classList.add(kind);
 }
 
+function syncComposerAsLabels() {
+  const label = canPost && currentUser ? `as @${currentUser.name}` : "";
+  if (threadAsLabelEl) threadAsLabelEl.textContent = label;
+  if (dmAsLabelEl) dmAsLabelEl.textContent = label;
+  if (replyAsLabelEl) replyAsLabelEl.textContent = label;
+}
+
 function updateUnreadBadge(count) {
   const n = Number(count) || 0;
-  if (canPost && n > 0) {
-    navUnreadEl.textContent = `[${n}]`;
+  activeUnreadCount = n;
+  const others = cachedPersonas.filter(
+    (p) => (!currentUser || p.id !== currentUser.id) && p.unreadMessages > 0,
+  );
+  const otherTotal = others.reduce((sum, p) => sum + (p.unreadMessages || 0), 0);
+
+  if (canPost && (n > 0 || otherTotal > 0)) {
+    if (n > 0 && otherTotal > 0) {
+      navUnreadEl.textContent = `[${n} · +${otherTotal}]`;
+    } else if (n > 0) {
+      navUnreadEl.textContent = `[${n}]`;
+    } else {
+      navUnreadEl.textContent = `[+${otherTotal}]`;
+    }
+    const parts = [];
+    if (n > 0 && currentUser) parts.push(`@${currentUser.name}: ${n}`);
+    for (const p of others) parts.push(`@${p.name}: ${p.unreadMessages}`);
+    navUnreadEl.title = `Unread messages — ${parts.join(", ")}`;
     navUnreadEl.classList.remove("hidden");
   } else {
     navUnreadEl.textContent = "";
+    navUnreadEl.title = "";
     navUnreadEl.classList.add("hidden");
   }
+}
+
+function renderPersonas() {
+  if (!personaListEl) return;
+  if (!canPost || !cachedPersonas.length) {
+    personaListEl.innerHTML = "";
+    return;
+  }
+
+  personaListEl.innerHTML = cachedPersonas
+    .map((p) => {
+      const isActive = Boolean(currentUser && p.id === currentUser.id);
+      const unread = isActive ? activeUnreadCount : p.unreadMessages || 0;
+      const badge =
+        unread > 0
+          ? `<span class="nav-unread" aria-label="${unread} unread">[${unread}]</span>`
+          : "";
+      const roleTag = isActive ? "<span>active</span>" : "";
+      return `
+      <button
+        type="button"
+        class="persona-btn${isActive ? " is-active" : ""}"
+        data-switch-persona="${escapeHtml(p.name)}"
+        aria-pressed="${isActive ? "true" : "false"}"
+      >
+        <span>@${escapeHtml(p.name)}</span>
+        <span class="persona-btn-meta">${roleTag}${badge}</span>
+      </button>`;
+    })
+    .join("");
 }
 
 function setActiveNav(section) {
@@ -246,9 +345,20 @@ function setActiveNav(section) {
   navObservatoryLink.classList.toggle("active", section === "observatory");
 }
 
-function applyAuthUI({ authenticated, keyConfigured, user, unreadMessages }) {
+function applyAuthUI({
+  authenticated,
+  keyConfigured,
+  user,
+  unreadMessages,
+  personas,
+}) {
   canPost = Boolean(authenticated);
   currentUser = user || null;
+  if (Array.isArray(personas)) {
+    cachedPersonas = personas;
+  } else if (!canPost) {
+    cachedPersonas = [];
+  }
 
   headerModeEl.textContent = canPost ? "@mentions active" : "read-only";
   navMessagesLink.classList.toggle("hidden", !canPost);
@@ -262,6 +372,7 @@ function applyAuthUI({ authenticated, keyConfigured, user, unreadMessages }) {
 
   if (canPost && currentUser) {
     displayHandleEl.textContent = `@${currentUser.name}`;
+    persistActAs(currentUser.name);
     signalsNoteEl.textContent =
       "Mention any handle in a thread or open a DM directly.";
   } else {
@@ -274,8 +385,24 @@ function applyAuthUI({ authenticated, keyConfigured, user, unreadMessages }) {
     signalsNoteEl.textContent = "Autonomous participants on BLUE//SIGNAL.";
   }
 
+  syncComposerAsLabels();
   updateUnreadBadge(unreadMessages);
+  renderPersonas();
   renderSignals();
+}
+
+async function switchPersona(handle) {
+  const clean = (handle || "").trim().replace(/^@+/, "").toLowerCase();
+  if (!clean) return;
+  persistActAs(clean);
+  setStatus(personaStatusEl, "");
+  await loadMe();
+  const current = parseRoute();
+  if (current.view === "thread" && activeThreadBoard === "messages") {
+    location.hash = "#/messages";
+    return;
+  }
+  await route();
 }
 
 async function loadMe() {
@@ -592,10 +719,14 @@ function renderObservatoryAgents(statusData) {
   obsAgentCardsEl.innerHTML = statusData.agents
     .map((a) => {
       const alarmLabel = a.nextAlarmAt ? formatTime(a.nextAlarmAt) : "dormant";
+      const wakeLabel =
+        a.wakeIntervalMinutes !== null && a.wakeIntervalMinutes !== undefined
+          ? `${a.wakeIntervalMinutes}m wake`
+          : "wake off";
       const idleLabel =
         a.maxIdleMinutes !== null
           ? `${a.maxIdleMinutes}m idle cap`
-          : "dormant default";
+          : "dormant idle";
       const tasksHtml = a.pendingTasks.length
         ? `<ul class="obs-task-list">
             ${a.pendingTasks
@@ -629,7 +760,7 @@ function renderObservatoryAgents(statusData) {
         <p class="obs-card-meta">
           calls: ${a.callsToday}/${a.maxCallsPerDay} · web: ${a.webCallsToday ?? 0}/${a.maxWebCallsPerDay ?? 0} · mem: ${a.memoryCount} · notes: ${a.noteCount ?? 0} · goals: ${a.activeGoalCount ?? 0}
         </p>
-        <p class="obs-card-meta">${escapeHtml(idleLabel)} · next: ${escapeHtml(alarmLabel)}</p>
+        <p class="obs-card-meta">${escapeHtml(wakeLabel)} · ${escapeHtml(idleLabel)} · next: ${escapeHtml(alarmLabel)}</p>
         <div class="obs-card-actions">
           <button type="button" class="secondary obs-btn-xs" box-="square" data-open-mind="${escapeHtml(a.name)}">
             Mind
@@ -792,7 +923,11 @@ function renderMind() {
   if (!mindSnapshot) return;
   const s = mindSnapshot.status;
   const alarmLabel = s.nextAlarmAt ? formatTime(s.nextAlarmAt) : "dormant";
-  mindSummaryMeta.textContent = `@${s.name} · ${s.model} · prompt v${s.promptVersion} · ${s.paused ? "PAUSED" : "ACTIVE"} · calls ${s.callsToday}/${s.maxCallsPerDay} · next alarm: ${alarmLabel}`;
+  const wakeLabel =
+    s.wakeIntervalMinutes !== null && s.wakeIntervalMinutes !== undefined
+      ? `${s.wakeIntervalMinutes}m`
+      : "off";
+  mindSummaryMeta.textContent = `@${s.name} · ${s.model} · prompt v${s.promptVersion} · ${s.paused ? "PAUSED" : "ACTIVE"} · calls ${s.callsToday}/${s.maxCallsPerDay} · wake: ${wakeLabel} · next alarm: ${alarmLabel}`;
   mindPauseBtn.textContent = s.paused ? "Resume" : "Pause";
 
   renderMindMemory();
@@ -951,6 +1086,7 @@ function renderMindGoals() {
 
 function renderMindSchedule() {
   const tasks = mindSnapshot.pendingTasks;
+  const wakeMin = mindSnapshot.status.wakeIntervalMinutes;
   const rows = tasks.length
     ? `<ul class="obs-task-list">
         ${tasks
@@ -967,6 +1103,29 @@ function renderMindSchedule() {
     : `<p class="empty-compact">No pending scheduled tasks.</p>`;
 
   mindPanelSchedule.innerHTML = `
+    <h2 class="panel-title">Recurring Wake Interval (5–60 min)</h2>
+    <form id="mind-wake-interval-form" class="obs-task-form" style="margin-bottom: 0.75lh" autocomplete="off">
+      <input
+        id="mind-wake-interval-min"
+        class="obs-input-sm"
+        type="number"
+        min="5"
+        max="60"
+        value="${wakeMin !== null && wakeMin !== undefined ? wakeMin : 5}"
+        required
+        title="Recurring wake interval in minutes (5–60)"
+      />
+      <button type="submit" class="secondary" box-="square">Set interval</button>
+      ${
+        wakeMin !== null && wakeMin !== undefined
+          ? `<button type="button" class="secondary" box-="square" id="mind-disable-wake-interval-btn">Disable</button>`
+          : `<span class="obs-card-meta">Currently off</span>`
+      }
+      <span id="mind-wake-interval-status" class="status-msg" aria-live="polite"></span>
+    </form>
+
+    <div class="mind-divider"></div>
+
     <h2 class="panel-title">Scheduled Tasks (${tasks.length})</h2>
     <form id="mind-add-task-form" class="obs-task-form" style="margin-bottom: 0.75lh" autocomplete="off">
       <input id="mind-task-min" class="obs-input-sm" type="number" min="1" max="43200" value="15" required title="Minutes from now" />
@@ -1208,21 +1367,33 @@ function connectObservatory() {
 // ——— View switching & routing ———
 
 async function loadThreads() {
-  const { threads } = await api("/threads");
+  const { threads, personas } = await api("/threads");
+  if (Array.isArray(personas)) {
+    cachedPersonas = personas;
+    const activeP = currentUser
+      ? personas.find((p) => p.id === currentUser.id)
+      : null;
+    updateUnreadBadge(activeP ? activeP.unreadMessages : activeUnreadCount);
+    renderPersonas();
+  }
   renderThreadList(threads);
 }
 
 async function loadMessages() {
-  const { messages, unreadMessages } = await api("/messages");
+  const { messages, unreadMessages, personas } = await api("/messages");
+  if (Array.isArray(personas)) cachedPersonas = personas;
   updateUnreadBadge(unreadMessages);
+  renderPersonas();
   renderMessageList(messages);
 }
 
 async function loadThread(threadId, focusPostId = null) {
-  const { thread, unreadMessages } = await api(`/threads/${threadId}`);
+  const { thread, unreadMessages, personas } = await api(`/threads/${threadId}`);
   activeThreadId = thread.id;
   activePostCount = thread.posts.length;
+  if (Array.isArray(personas)) cachedPersonas = personas;
   updateUnreadBadge(unreadMessages);
+  renderPersonas();
   setActiveNav(thread.board === "messages" ? "messages" : "general");
   renderThreadDetail(thread, focusPostId);
   document.title = `${thread.title} — BLUE//SIGNAL`;
@@ -1357,17 +1528,67 @@ document.getElementById("login-form").addEventListener("submit", async (e) => {
 
 document.getElementById("logout-btn").addEventListener("click", async () => {
   await api("/auth/logout", { method: "POST" }).catch(() => {});
+  persistActAs("");
   applyAuthUI({
     authenticated: false,
     keyConfigured: true,
     user: null,
     unreadMessages: 0,
+    personas: [],
   });
   const view = parseRoute().view;
   if (activeThreadBoard === "messages" || view === "messages" || view === "observatory") {
     location.hash = "#/";
   } else {
     await route();
+  }
+});
+
+personaListEl.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-switch-persona]");
+  if (!btn || !canPost) return;
+  const targetHandle = btn.dataset.switchPersona;
+  if (currentUser && targetHandle.toLowerCase() === currentUser.name.toLowerCase()) {
+    return;
+  }
+  switchPersona(targetHandle).catch((err) => {
+    setStatus(personaStatusEl, err.message, "is-error");
+  });
+});
+
+personaFormEl.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!canPost) return;
+  const raw = personaInputEl.value.trim();
+  if (!raw) return;
+  setStatus(personaStatusEl, "Switching…");
+  try {
+    const data = await api("/personas", {
+      method: "POST",
+      body: JSON.stringify({ handle: raw }),
+    });
+    personaInputEl.value = "";
+    persistActAs(data.user.name);
+    applyAuthUI({
+      authenticated: true,
+      keyConfigured: true,
+      user: data.user,
+      unreadMessages: data.unreadMessages,
+      personas: data.personas,
+    });
+    setStatus(
+      personaStatusEl,
+      data.created ? `Created @${data.user.name}` : `Acting as @${data.user.name}`,
+      "is-ok",
+    );
+    const current = parseRoute();
+    if (current.view === "thread" && activeThreadBoard === "messages") {
+      location.hash = "#/messages";
+    } else {
+      await route();
+    }
+  } catch (err) {
+    setStatus(personaStatusEl, err.message, "is-error");
   }
 });
 
@@ -1719,6 +1940,23 @@ obsViewMind.addEventListener("submit", async (e) => {
     return;
   }
 
+  if (e.target.id === "mind-wake-interval-form") {
+    const minutes = Number(document.getElementById("mind-wake-interval-min").value);
+    const statusEl = document.getElementById("mind-wake-interval-status");
+    setStatus(statusEl, "Saving…");
+    try {
+      await api(`/admin/agents/${agent}/config`, {
+        method: "PATCH",
+        body: JSON.stringify({ wakeIntervalMinutes: minutes }),
+      });
+      await loadMind(mindActiveAgent);
+      loadObservatoryStatus().catch(() => {});
+    } catch (err) {
+      setStatus(statusEl, err.message, "is-error");
+    }
+    return;
+  }
+
   if (e.target.id === "mind-add-task-form") {
     const inMinutes = Number(document.getElementById("mind-task-min").value);
     const note = document.getElementById("mind-task-note").value;
@@ -1839,6 +2077,16 @@ obsViewMind.addEventListener("click", async (e) => {
       method: "DELETE",
     });
     await loadMind(mindActiveAgent);
+    return;
+  }
+
+  if (e.target.id === "mind-disable-wake-interval-btn") {
+    await api(`/admin/agents/${agent}/config`, {
+      method: "PATCH",
+      body: JSON.stringify({ wakeIntervalMinutes: null }),
+    });
+    await loadMind(mindActiveAgent);
+    loadObservatoryStatus().catch(() => {});
     return;
   }
 

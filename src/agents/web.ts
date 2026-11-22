@@ -4,9 +4,12 @@ export type WebSearchResultItem = {
   snippet: string;
 };
 
+export type WebSearchStatus = "ok" | "summary_only" | "no_results";
+
 export type WebSearchOutput = {
   provider: "brave" | "tavily" | "openrouter";
   query: string;
+  status: WebSearchStatus;
   summary?: string;
   results: WebSearchResultItem[];
   untrustedBlock: string;
@@ -272,14 +275,38 @@ export async function readWebPage(rawUrl: string): Promise<WebReadOutput> {
   };
 }
 
+function looksLikeNoResultsSummary(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return true;
+  if (/^no_matching_results\b/.test(normalized)) return true;
+  if (normalized.includes("no_matching_results")) return true;
+  // If the retriever cited real URLs inline without the sentinel, it found sources.
+  if (/https?:\/\/[^\s)<>]+/.test(normalized)) return false;
+  if (normalized.length > 420) return false;
+  return /\b(no (matching |relevant )?(web |search )?results|could not find|couldn't find|unable to find|no relevant (information|results|sources)|none of the (attached |returned |provided )?(web |search )?results|do not match|doesn't match|nothing found|search returned (no|zero|0) results)\b/.test(
+    normalized,
+  );
+}
+
+function classifySearchStatus(
+  results: WebSearchResultItem[],
+  summary?: string,
+): WebSearchStatus {
+  if (summary && looksLikeNoResultsSummary(summary)) return "no_results";
+  if (results.length > 0) return "ok";
+  if (summary && summary.trim().length > 0) return "summary_only";
+  return "no_results";
+}
+
 function formatUntrustedSearchBlock(
   query: string,
   results: WebSearchResultItem[],
+  status: WebSearchStatus,
   summary?: string,
 ): string {
   const safeQuery = query.replaceAll('"', "&quot;");
-  const lines = [`<untrusted_web_results query="${safeQuery}">`];
-  if (summary) {
+  const lines = [`<untrusted_web_results query="${safeQuery}" status="${status}">`];
+  if (summary && status !== "no_results") {
     lines.push(`Summary: ${summary.slice(0, 1200)}`, "");
   }
   for (let i = 0; i < results.length; i++) {
@@ -288,11 +315,70 @@ function formatUntrustedSearchBlock(
     lines.push(`   URL: ${r.url}`);
     if (r.snippet) lines.push(`   Snippet: ${r.snippet.slice(0, 400)}`);
   }
-  if (results.length === 0 && !summary) {
-    lines.push("(no results returned)");
+  if (status === "no_results") {
+    lines.push("(no matching web results found for this query)");
   }
   lines.push("</untrusted_web_results>");
   return lines.join("\n");
+}
+
+function sanitizePublicResultUrl(raw: string): string | null {
+  const cleaned = raw.trim().replace(/[),.;:!?]+$/, "");
+  try {
+    const parsed = new URL(cleaned);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return null;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (!host || !host.includes(".") || isPrivateOrBlockedIp(host)) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function extractInlineUrlsFromMarkdown(
+  text: string,
+  seenUrls: Set<string>,
+  maxTotal: number,
+): WebSearchResultItem[] {
+  const extra: WebSearchResultItem[] = [];
+  if (!text) return extra;
+
+  // 1. Markdown links: [Title](https://...)
+  const mdLinkRe = /\[([^\]\n]{1,180})\]\((https?:\/\/[^\s)<>]+)\)/g;
+  for (const match of text.matchAll(mdLinkRe)) {
+    if (seenUrls.size >= maxTotal) break;
+    const rawTitle = (match[1] || "").trim();
+    const validUrl = sanitizePublicResultUrl(match[2] || "");
+    if (!validUrl || seenUrls.has(validUrl)) continue;
+    seenUrls.add(validUrl);
+    extra.push({
+      title: rawTitle.slice(0, 180) || validUrl,
+      url: validUrl,
+      snippet: "",
+    });
+  }
+
+  // 2. Bare https:// URLs if still short of results
+  if (seenUrls.size < maxTotal) {
+    const bareUrlRe = /\bhttps?:\/\/[^\s<>()[\]"']+/g;
+    for (const match of text.matchAll(bareUrlRe)) {
+      if (seenUrls.size >= maxTotal) break;
+      const validUrl = sanitizePublicResultUrl(match[0] || "");
+      if (!validUrl || seenUrls.has(validUrl)) continue;
+      seenUrls.add(validUrl);
+      extra.push({
+        title: validUrl,
+        url: validUrl,
+        snippet: "",
+      });
+    }
+  }
+
+  return extra;
 }
 
 async function searchViaBrave(
@@ -331,11 +417,13 @@ async function searchViaBrave(
       snippet: decodeHtmlEntities((r.description || "").replace(/<[^>]+>/g, "")).slice(0, 400),
     }));
 
+  const status = classifySearchStatus(results);
   return {
     provider: "brave",
     query,
+    status,
     results,
-    untrustedBlock: formatUntrustedSearchBlock(query, results),
+    untrustedBlock: formatUntrustedSearchBlock(query, results, status),
   };
 }
 
@@ -374,12 +462,129 @@ async function searchViaTavily(
       snippet: (r.content || "").trim().slice(0, 400),
     }));
 
+  const status = classifySearchStatus(results);
   return {
     provider: "tavily",
     query,
+    status,
     results,
-    untrustedBlock: formatUntrustedSearchBlock(query, results),
+    untrustedBlock: formatUntrustedSearchBlock(query, results, status),
   };
+}
+
+type OpenRouterSearchPayload = {
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+      annotations?: Array<{
+        type?: string;
+        url_citation?: {
+          url?: string;
+          title?: string;
+          content?: string;
+        };
+        url?: string;
+        title?: string;
+        content?: string;
+      }>;
+    };
+  }>;
+};
+
+async function runOpenRouterSearchRequest(params: {
+  query: string;
+  maxResults: number;
+  apiKey: string;
+  searchModel: string;
+  siteUrl?: string;
+  mode: "server_tool" | "web_plugin";
+}): Promise<{ summary: string; results: WebSearchResultItem[] }> {
+  const { query, maxResults, apiKey, searchModel, siteUrl, mode } = params;
+  const body: Record<string, unknown> = {
+    model: searchModel,
+    temperature: 0.1,
+    max_tokens: 900,
+    messages: [
+      {
+        role: "system",
+        content:
+          mode === "server_tool"
+            ? `You are a neutral web search retriever. Always invoke web search for the user's query — never answer solely from memory. Return up to ${maxResults} concise factual findings with explicit markdown source links [Title](https://...). Do not wrap the query in exact-phrase quotes unless the user included them. If the search returns no relevant results matching the query, respond with ONLY the exact token: NO_MATCHING_RESULTS`
+            : `You are a neutral web search retriever. Summarize up to ${maxResults} distinct, relevant factual findings from the attached web search results with explicit markdown source links [Title](https://...). If none of the attached search results are actually relevant to the query, do NOT list unrelated URLs — respond with ONLY the exact token: NO_MATCHING_RESULTS`,
+      },
+      {
+        role: "user",
+        content: query,
+      },
+    ],
+  };
+
+  if (mode === "server_tool") {
+    body.tools = [
+      {
+        type: "openrouter:web_search",
+        parameters: {
+          engine: "auto",
+          max_results: maxResults,
+          max_total_results: maxResults,
+          max_uses: 1,
+        },
+      },
+    ];
+  } else {
+    body.plugins = [
+      {
+        id: "web",
+        engine: "exa",
+        max_results: maxResults,
+      },
+    ];
+  }
+
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": siteUrl || "https://blue-forum.local",
+      "X-Title": "BLUE//SIGNAL",
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(25_000),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(
+      `OpenRouter web search (${mode}) HTTP ${res.status}: ${errText.slice(0, 200)}`,
+    );
+  }
+
+  const data = (await res.json()) as OpenRouterSearchPayload;
+  const msg = data.choices?.[0]?.message;
+  const summary = (msg?.content || "").trim().slice(0, 1200);
+  const seenUrls = new Set<string>();
+  const results: WebSearchResultItem[] = [];
+
+  for (const ann of msg?.annotations || []) {
+    const cite = ann.url_citation ?? (ann.url ? ann : undefined);
+    const validUrl = cite?.url ? sanitizePublicResultUrl(cite.url) : null;
+    if (!validUrl || seenUrls.has(validUrl)) continue;
+    seenUrls.add(validUrl);
+    results.push({
+      title: (cite?.title || validUrl).trim().slice(0, 180),
+      url: validUrl,
+      snippet: (cite?.content || "").trim().slice(0, 400),
+    });
+    if (results.length >= maxResults) break;
+  }
+
+  if (results.length < maxResults && summary) {
+    const inline = extractInlineUrlsFromMarkdown(summary, seenUrls, maxResults);
+    results.push(...inline);
+  }
+
+  return { summary, results: results.slice(0, maxResults) };
 }
 
 async function searchViaOpenRouter(
@@ -389,80 +594,70 @@ async function searchViaOpenRouter(
   searchModel: string,
   siteUrl?: string,
 ): Promise<WebSearchOutput> {
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": siteUrl || "https://blue-forum.local",
-      "X-Title": "BLUE//SIGNAL",
-    },
-    body: JSON.stringify({
-      model: searchModel,
-      temperature: 0.1,
-      max_tokens: 700,
-      tools: [{ type: "openrouter:web_search" }],
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a neutral web search retriever. Use web search for the user's query and summarize up to the requested number of key factual findings with citations. Be concise and objective.",
-        },
-        {
-          role: "user",
-          content: `Search the web for: "${query}" (return up to ${maxResults} concise findings with sources).`,
-        },
-      ],
-    }),
-    signal: AbortSignal.timeout(25_000),
-  });
+  // Primary: deterministic web plugin (Exa) — always executes search before synthesis
+  // so the helper model cannot skip searching or answer solely from memory.
+  // Fallback: OpenRouter server tool (engine: "auto" / native search) if primary
+  // fails or returns no matching results, providing a second search index.
+  let bestSummary = "";
+  let bestResults: WebSearchResultItem[] = [];
+  let bestStatus: WebSearchStatus = "no_results";
+  let primaryError: Error | null = null;
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(
-      `OpenRouter web search HTTP ${res.status}: ${errText.slice(0, 200)}`,
-    );
-  }
-
-  const data = (await res.json()) as {
-    choices?: Array<{
-      message?: {
-        content?: string | null;
-        annotations?: Array<{
-          type?: string;
-          url_citation?: {
-            url?: string;
-            title?: string;
-            content?: string;
-          };
-        }>;
-      };
-    }>;
-  };
-
-  const msg = data.choices?.[0]?.message;
-  const summary = (msg?.content || "").trim().slice(0, 1200);
-  const seenUrls = new Set<string>();
-  const results: WebSearchResultItem[] = [];
-
-  for (const ann of msg?.annotations || []) {
-    const cite = ann.url_citation;
-    if (!cite?.url || seenUrls.has(cite.url)) continue;
-    seenUrls.add(cite.url);
-    results.push({
-      title: (cite.title || cite.url).trim().slice(0, 180),
-      url: cite.url,
-      snippet: (cite.content || "").trim().slice(0, 400),
+  try {
+    const pluginRes = await runOpenRouterSearchRequest({
+      query,
+      maxResults,
+      apiKey,
+      searchModel,
+      siteUrl,
+      mode: "web_plugin",
     });
-    if (results.length >= maxResults) break;
+    bestSummary = pluginRes.summary;
+    bestResults = pluginRes.results;
+    bestStatus = classifySearchStatus(bestResults, bestSummary);
+  } catch (err) {
+    primaryError = err instanceof Error ? err : new Error(String(err));
   }
 
+  if (bestStatus !== "ok") {
+    try {
+      const toolRes = await runOpenRouterSearchRequest({
+        query,
+        maxResults,
+        apiKey,
+        searchModel,
+        siteUrl,
+        mode: "server_tool",
+      });
+      const toolStatus = classifySearchStatus(toolRes.results, toolRes.summary);
+      if (
+        toolStatus === "ok" ||
+        (bestStatus === "no_results" && toolStatus === "summary_only")
+      ) {
+        bestResults = toolRes.results;
+        bestSummary = toolRes.summary || bestSummary;
+        bestStatus = toolStatus;
+      }
+    } catch (fallbackErr) {
+      if (primaryError && bestStatus === "no_results") {
+        throw fallbackErr;
+      }
+    }
+  }
+
+  const finalResults = bestStatus === "no_results" ? [] : bestResults;
   return {
     provider: "openrouter",
     query,
-    summary: summary || undefined,
-    results,
-    untrustedBlock: formatUntrustedSearchBlock(query, results, summary),
+    status: bestStatus,
+    summary: bestStatus !== "no_results" && bestSummary ? bestSummary : undefined,
+    results: finalResults,
+    untrustedBlock: formatUntrustedSearchBlock(
+      query,
+      finalResults,
+      bestStatus,
+      bestSummary || undefined,
+    ),
   };
 }
 
