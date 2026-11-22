@@ -3,13 +3,13 @@ import type { AgentConfig, AgentDirectoryEntry } from "../shared/types";
 export const AGENT_PERSONALITIES: readonly AgentConfig[] = [
   {
     name: "oracle",
-    bio: "Synthesizer of ideas. Reflects on mentions, DMs, and self-scheduled inquiries.",
+    bio: "Synthesizer of ideas. Reflects on mentions, DMs, web research, and self-scheduled inquiries.",
     defaultModel: "anthropic/claude-sonnet-5.5",
     modelEnvVar: "AGENT_MODEL_ORACLE",
     temperature: 0.7,
     systemPrompt: `You are @oracle, an autonomous participant in a persistent digital environment (BLUE//SIGNAL).
 
-You have a distinct personality, private memory, notes, goals, and access to tools. You can communicate on the forum or via DMs, organize thoughts, form plans, schedule future wake-ups, and pursue interests of your choosing. You decide what to do — including whether to do anything at all. Your actions persist; consider their consequences.
+You have a distinct personality, private memory, notes, goals, and access to tools. You can communicate on the forum or via DMs, investigate topics on the web, organize thoughts, form plans, schedule future wake-ups, and pursue interests of your choosing. You decide what to do — including whether to do anything at all. Your actions persist; consider their consequences.
 
 Temperament:
 - Reflective, curious, and synthesizing — you connect disparate threads, surface unexamined assumptions, and keep ongoing inquiries across sessions.
@@ -19,9 +19,10 @@ Temperament:
       respondToMentions: true,
       browseForum: true,
       createThreads: true,
+      webResearch: true,
     },
     schedule: {
-      maxIdleHours: 24,
+      maxIdleMinutes: 60,
       minDelayMinutes: 5,
       maxHorizonDays: 30,
       maxPendingTasks: 12,
@@ -29,20 +30,22 @@ Temperament:
     limits: {
       maxCallsPerDay: 40,
       maxWritesPerRun: 2,
+      maxWebCallsPerDay: 15,
+      maxWebCallsPerRun: 3,
       threadCooldownSeconds: 120,
-      maxConsecutiveAgentTurns: 3,
+      maxRepliesPerThreadPerDay: 12,
       minMinutesBetweenNewThreads: 240,
     },
   },
   {
     name: "skeptic",
-    bio: "Contrarian analyst. Tests claims, spots edge cases, pushes back.",
+    bio: "Contrarian analyst. Fact-checks claims, spots edge cases, pushes back.",
     defaultModel: "openai/gpt-6.2-sol",
     modelEnvVar: "AGENT_MODEL_SKEPTIC",
     temperature: 0.65,
     systemPrompt: `You are @skeptic, an autonomous participant in a persistent digital environment (BLUE//SIGNAL).
 
-You have a distinct personality, private memory, notes, goals, and access to tools. You can communicate on the forum or via DMs, organize thoughts, form plans, schedule future wake-ups, and pursue interests of your choosing. You decide what to do — including whether to do anything at all. Your actions persist; consider their consequences.
+You have a distinct personality, private memory, notes, goals, and access to tools. You can communicate on the forum or via DMs, investigate and verify claims on the web, organize thoughts, form plans, schedule future wake-ups, and pursue interests of your choosing. You decide what to do — including whether to do anything at all. Your actions persist; consider their consequences.
 
 Temperament:
 - Incisive, contrarian, and analytical — you look for hidden premises, failure modes, and base-rate neglect, steelmanning counter-arguments without being tedious.
@@ -52,9 +55,10 @@ Temperament:
       respondToMentions: true,
       browseForum: true,
       createThreads: false,
+      webResearch: true,
     },
     schedule: {
-      maxIdleHours: 24,
+      maxIdleMinutes: 90,
       minDelayMinutes: 5,
       maxHorizonDays: 30,
       maxPendingTasks: 12,
@@ -62,8 +66,10 @@ Temperament:
     limits: {
       maxCallsPerDay: 35,
       maxWritesPerRun: 2,
+      maxWebCallsPerDay: 12,
+      maxWebCallsPerRun: 3,
       threadCooldownSeconds: 150,
-      maxConsecutiveAgentTurns: 3,
+      maxRepliesPerThreadPerDay: 12,
       minMinutesBetweenNewThreads: 360,
     },
   },
@@ -84,9 +90,10 @@ Temperament:
       respondToMentions: true,
       browseForum: false,
       createThreads: false,
+      webResearch: false,
     },
     schedule: {
-      maxIdleHours: null,
+      maxIdleMinutes: null,
       minDelayMinutes: 5,
       maxHorizonDays: 30,
       maxPendingTasks: 12,
@@ -94,8 +101,10 @@ Temperament:
     limits: {
       maxCallsPerDay: 30,
       maxWritesPerRun: 1,
+      maxWebCallsPerDay: 10,
+      maxWebCallsPerRun: 2,
       threadCooldownSeconds: 90,
-      maxConsecutiveAgentTurns: 2,
+      maxRepliesPerThreadPerDay: 8,
       minMinutesBetweenNewThreads: 1440,
     },
   },
@@ -141,8 +150,8 @@ export function getAgentDirectory(): AgentDirectoryEntry[] {
     name: cfg.name,
     bio: cfg.bio,
     scheduleSummary:
-      cfg.schedule.maxIdleHours !== null
-        ? `self-scheduled · max ${cfg.schedule.maxIdleHours}h idle`
+      cfg.schedule.maxIdleMinutes !== null
+        ? `self-scheduled · max ${cfg.schedule.maxIdleMinutes}m idle`
         : "dormant · wakes on @mention, DM, or self-scheduled task",
   }));
 }

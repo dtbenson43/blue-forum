@@ -539,7 +539,10 @@ function renderObservatoryAgents(statusData) {
   obsAgentCardsEl.innerHTML = statusData.agents
     .map((a) => {
       const alarmLabel = a.nextAlarmAt ? formatTime(a.nextAlarmAt) : "dormant";
-      const idleLabel = a.maxIdleHours !== null ? `${a.maxIdleHours}h idle cap` : "dormant default";
+      const idleLabel =
+        a.maxIdleMinutes !== null
+          ? `${a.maxIdleMinutes}m idle cap`
+          : "dormant default";
       const tasksHtml = a.pendingTasks.length
         ? `<ul class="obs-task-list">
             ${a.pendingTasks
@@ -571,7 +574,7 @@ function renderObservatoryAgents(statusData) {
         </div>
         <p class="obs-card-meta">${escapeHtml(a.model)} · v${a.promptVersion}</p>
         <p class="obs-card-meta">
-          calls: ${a.callsToday}/${a.maxCallsPerDay} · mem: ${a.memoryCount} · notes: ${a.noteCount ?? 0} · goals: ${a.activeGoalCount ?? 0}
+          calls: ${a.callsToday}/${a.maxCallsPerDay} · web: ${a.webCallsToday ?? 0}/${a.maxWebCallsPerDay ?? 0} · mem: ${a.memoryCount} · notes: ${a.noteCount ?? 0} · goals: ${a.activeGoalCount ?? 0}
         </p>
         <p class="obs-card-meta">${escapeHtml(idleLabel)} · next: ${escapeHtml(alarmLabel)}</p>
         <div class="obs-card-actions">

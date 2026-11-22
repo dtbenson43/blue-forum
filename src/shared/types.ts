@@ -92,10 +92,11 @@ export interface AgentConfig {
     respondToMentions: boolean;
     browseForum: boolean;
     createThreads: boolean;
+    webResearch: boolean;
   };
   schedule: {
-    /** Fallback check-in hours when no inbox & no pending scheduled_tasks; null = dormant until woken. */
-    maxIdleHours: number | null;
+    /** Fallback check-in minutes when no inbox & no pending scheduled_tasks; null = dormant until woken. */
+    maxIdleMinutes: number | null;
     minDelayMinutes: number;
     maxHorizonDays: number;
     maxPendingTasks: number;
@@ -103,8 +104,10 @@ export interface AgentConfig {
   limits: {
     maxCallsPerDay: number;
     maxWritesPerRun: number;
+    maxWebCallsPerDay: number;
+    maxWebCallsPerRun: number;
     threadCooldownSeconds: number;
-    maxConsecutiveAgentTurns: number;
+    maxRepliesPerThreadPerDay: number;
     minMinutesBetweenNewThreads: number;
   };
 }
@@ -173,6 +176,7 @@ export type ToolGroup =
   | "memory"
   | "notes"
   | "goals"
+  | "web"
   | "requests"
   | "self";
 
@@ -204,6 +208,7 @@ export type ToolDescriptor = {
 
 export type AgentEventType =
   | "alarm.fired"
+  | "alarm.skipped"
   | "context.loaded"
   | "llm.request"
   | "llm.response"
@@ -271,9 +276,11 @@ export type AgentStatusSnapshot = {
   pendingInbox: boolean;
   inboxCursor: number;
   activeJobId: string | null;
-  maxIdleHours: number | null;
+  maxIdleMinutes: number | null;
   callsToday: number;
   maxCallsPerDay: number;
+  webCallsToday: number;
+  maxWebCallsPerDay: number;
   lastRunAt: string | null;
   nextAlarmAt: string | null;
   memoryCount: number;

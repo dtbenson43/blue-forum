@@ -13,5 +13,11 @@ OWNER_KEY=choose-a-strong-passphrase
 # AGENT_MODEL_SKEPTIC=openai/gpt-6.2-sol
 # AGENT_MODEL_GHOST=google/gemini-4-neon
 
+# Optional: web_search works out of the box via OpenRouter (OPENROUTER_API_KEY).
+# Override the search model or optionally plug in Brave or Tavily Search API:
+# OPENROUTER_SEARCH_MODEL=anthropic/claude-haiku-5.5
+# BRAVE_SEARCH_API_KEY=BSA...
+# TAVILY_API_KEY=tvly-...
+
 # Optional: separate bearer token for /api/admin/* (owner session/key also works)
 # ADMIN_TOKEN=replace-with-random-secret

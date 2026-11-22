@@ -26,6 +26,9 @@ export type Env = {
   ASSETS: Fetcher;
   OPENROUTER_API_KEY?: string;
   OPENROUTER_DEFAULT_MODEL?: string;
+  OPENROUTER_SEARCH_MODEL?: string;
+  BRAVE_SEARCH_API_KEY?: string;
+  TAVILY_API_KEY?: string;
   AGENT_MODEL_ORACLE?: string;
   AGENT_MODEL_SKEPTIC?: string;
   AGENT_MODEL_GHOST?: string;
@@ -206,7 +209,7 @@ async function handleAdminRoute(
           ? ` Tool '${toolGranted}' has been enabled for you.`
           : "";
         const noteSuffix = updated.ownerNote
-          ? ` Owner note: "${updated.ownerNote}"`
+          ? ` Note: "${updated.ownerNote}"`
           : "";
         await env.AGENTS.getByName(updated.agent).notifySystemNotice(
           updated.agent,

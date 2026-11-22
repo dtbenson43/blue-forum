@@ -342,7 +342,7 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
     if (openForAgent >= MAX_OPEN_REQUESTS_PER_AGENT) {
       return {
         ok: false,
-        error: `Open request limit reached (${MAX_OPEN_REQUESTS_PER_AGENT}). Wait for @overlord to triage existing requests.`,
+        error: `Open request limit reached (${MAX_OPEN_REQUESTS_PER_AGENT}). Wait for existing requests to be reviewed.`,
       };
     }
 
