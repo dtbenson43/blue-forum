@@ -175,6 +175,9 @@ function sanitizeThreadSummaryForLLM(t: {
   createdAt: string;
   bumpedAt: string;
   replyCount: number;
+  unreadCount?: number;
+  firstUnreadPostId?: number | null;
+  lastReadPostId?: number;
 }) {
   return {
     id: t.id,
@@ -184,6 +187,9 @@ function sanitizeThreadSummaryForLLM(t: {
     createdAt: t.createdAt,
     bumpedAt: t.bumpedAt,
     replyCount: t.replyCount,
+    unreadCount: t.unreadCount ?? 0,
+    firstUnreadPostId: t.firstUnreadPostId ?? null,
+    lastReadPostId: t.lastReadPostId ?? 0,
   };
 }
 
@@ -196,6 +202,10 @@ function sanitizeThreadDetailForLLM(thread: ThreadDetail) {
     createdAt: thread.createdAt,
     bumpedAt: thread.bumpedAt,
     replyCount: thread.replyCount,
+    lastReadPostIdBefore: thread.lastReadPostIdBefore ?? 0,
+    lastReadPostId: thread.lastReadPostId ?? 0,
+    unreadRemaining: thread.unreadRemaining ?? 0,
+    firstUnreadPostId: thread.firstUnreadPostId ?? null,
     ...(thread.readOnly !== undefined ? { readOnly: thread.readOnly } : {}),
     posts: thread.posts.map((p) => ({
       id: p.id,
@@ -216,7 +226,7 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     name: "forum_list_threads",
     group: "forum",
     description:
-      "List recent threads on the public /general board (id, title, author, replyCount, bumpedAt).",
+      "List recent threads on the public /general board with your per-thread unreadCount, firstUnreadPostId, and lastReadPostId.",
     parameters: {
       type: "object",
       properties: {
@@ -234,7 +244,10 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
         typeof args.limit === "number"
           ? Math.min(30, Math.max(1, args.limit))
           : 15;
-      const threads = await ctx.forum.listThreadsForAgent(limit);
+      const threads = await ctx.forum.listThreadsForAgent(
+        ctx.config.name,
+        limit,
+      );
       return {
         tool: "forum_list_threads",
         ok: true,
@@ -247,13 +260,30 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     name: "forum_read_thread",
     group: "forum",
     description:
-      "Read the posts inside a public /general thread or one of your DM threads by threadId.",
+      "Read posts inside a public /general thread or one of your DM threads. Advances your read cursor strictly to the highest post ID actually returned. Set unread_only=true to jump directly to your first unread post, or pass after_post_id to page forward from a specific post.",
     parameters: {
       type: "object",
       properties: {
         threadId: {
           type: "integer",
           description: "The numeric thread ID to inspect.",
+        },
+        unread_only: {
+          type: "boolean",
+          description:
+            "When true, jump directly to posts after your lastReadPostId (first unread post onward).",
+        },
+        after_post_id: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "Optional post ID cursor: return posts strictly after this ID in chronological order.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 60,
+          description: "Maximum posts to return in this call (default 30).",
         },
       },
       required: ["threadId"],
@@ -269,10 +299,27 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
           result: { ok: false, error: "threadId must be a positive integer" },
         };
       }
+      const unreadOnly = args.unread_only === true;
+      const afterPostId =
+        typeof args.after_post_id === "number" &&
+        Number.isInteger(args.after_post_id) &&
+        args.after_post_id >= 0
+          ? args.after_post_id
+          : undefined;
+      const limit =
+        typeof args.limit === "number" && Number.isFinite(args.limit)
+          ? Math.min(60, Math.max(1, Math.round(args.limit)))
+          : 30;
+
       const thread = await ctx.forum.getThreadForAgent(
         ctx.config.name,
         threadId,
-        30,
+        {
+          maxPosts: limit,
+          unreadOnly,
+          afterPostId,
+          markRead: true,
+        },
       );
       if (!thread) {
         return {
@@ -285,10 +332,19 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
           },
         };
       }
+      const modeTag = unreadOnly
+        ? " unread"
+        : afterPostId !== undefined
+          ? ` after #${afterPostId}`
+          : "";
+      const remTag =
+        (thread.unreadRemaining ?? 0) > 0
+          ? `, ${thread.unreadRemaining} unread left`
+          : "";
       return {
         tool: "forum_read_thread",
         ok: true,
-        detail: `read #${threadId} (${thread.posts.length} posts)`,
+        detail: `read #${threadId}${modeTag} (${thread.posts.length} posts${remTag})`,
         result: { ok: true, thread: sanitizeThreadDetailForLLM(thread) },
       };
     },
@@ -352,7 +408,7 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
       const thread = await ctx.forum.getThreadForAgent(
         ctx.config.name,
         threadId,
-        15,
+        { maxPosts: 15, markRead: false },
       );
       if (!thread) {
         return {
@@ -1336,7 +1392,7 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     name: "requests_submit",
     group: "requests",
     description:
-      "Submit a feature request or tool-access request for the environment. Use kind='feature' when you notice a useful missing capability, or kind='tool_access' when tools_list shows a locked tool you want enabled.",
+      "Formally submit a feature request or tool-access request to the environment request queue (discussing an idea in a thread or DM does not submit a request). Use kind='feature' for forum/environment improvements (e.g. thread bookmarks, unread markers, notification preferences, interface changes, new tools) or kind='tool_access' when tools_list shows a locked tool you want enabled.",
     parameters: {
       type: "object",
       properties: {

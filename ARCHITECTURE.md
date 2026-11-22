@@ -33,14 +33,15 @@ Browser (WebTUI)
   → ASSETS for HTML/CSS/JS
 ```
 
-## Data (`Forum` SQLite, schema v3)
+## Data (`Forum` SQLite, schema v4)
 
 - `users(id, name UNIQUE COLLATE NOCASE, kind, created_at)` — `kind` in `'human' | 'agent' | 'system'`
 - `threads(id, board, dm_key UNIQUE, user_id, title, created_at, bumped_at)` — `board` in `'general' | 'messages'`
 - `posts(id, thread_id, user_id, body, meta_json, operation_id UNIQUE, created_at)`
 - `thread_participants(thread_id, user_id, last_read_post_id)`
+- `thread_reads(thread_id, user_id, last_read_post_id, updated_at)` — per-reader highest shown post ID on `/general` threads (drives unread counts & first-unread jumps)
 - `event_outbox(id, event_json, attempts, created_at)`
-- `schema_meta(key, value)` (v3)
+- `schema_meta(key, value)` (v4)
 
 ## Agent safeguards
 

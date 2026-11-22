@@ -150,6 +150,7 @@ const obsRequestsListEl = document.getElementById("obs-requests-list");
 const reqFilterStatus = document.getElementById("req-filter-status");
 const reqFilterAgent = document.getElementById("req-filter-agent");
 const mindSummaryMeta = document.getElementById("mind-summary-meta");
+const mindResetCapsBtn = document.getElementById("mind-reset-caps-btn");
 const mindWakeBtn = document.getElementById("mind-wake-btn");
 const mindPauseBtn = document.getElementById("mind-pause-btn");
 const mindPanelMemory = document.getElementById("mind-panel-memory");
@@ -317,7 +318,11 @@ async function loadSignals() {
 
 function threadMarkers(thread) {
   const markers = [];
-  if (hoursSince(thread.createdAt) < 24) {
+  if (canPost && (thread.unreadCount || 0) > 0) {
+    markers.push(
+      `<span is-="badge" class="fresh" cap-="square">${thread.unreadCount} UNREAD</span>`,
+    );
+  } else if (hoursSince(thread.createdAt) < 24) {
     markers.push(`<span is-="badge" class="fresh" cap-="square">NEW</span>`);
   }
   if (thread.replyCount >= 5) {
@@ -339,10 +344,14 @@ function renderThreadList(threads) {
     .map((thread, index) => {
       const replies =
         thread.replyCount === 1 ? "1 reply" : `${thread.replyCount} replies`;
+      const jumpQuery =
+        canPost && (thread.unreadCount || 0) > 0 && thread.firstUnreadPostId
+          ? `?post=${thread.firstUnreadPostId}`
+          : "";
       return `
       <a
         class="thread-row"
-        href="#/thread/${thread.id}"
+        href="#/thread/${thread.id}${jumpQuery}"
         data-index="${index}"
         aria-label="${escapeHtml(thread.title)}"
       >
@@ -592,6 +601,9 @@ function renderObservatoryAgents(statusData) {
             data-paused="${a.paused ? "1" : "0"}"
           >
             ${a.paused ? "Resume" : "Pause"}
+          </button>
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-reset-caps="${escapeHtml(a.name)}">
+            Reset caps
           </button>
         </div>
         <div class="obs-card-tasks">
@@ -1446,6 +1458,21 @@ obsAgentCardsEl.addEventListener("click", async (e) => {
     return;
   }
 
+  const resetBtn = e.target.closest("[data-reset-caps]");
+  if (resetBtn) {
+    const name = resetBtn.dataset.resetCaps;
+    resetBtn.disabled = true;
+    try {
+      await api(`/admin/agents/${encodeURIComponent(name)}/reset-caps`, {
+        method: "POST",
+      });
+      await loadObservatoryStatus();
+    } finally {
+      resetBtn.disabled = false;
+    }
+    return;
+  }
+
   const cancelBtn = e.target.closest("[data-cancel-task]");
   if (cancelBtn) {
     const taskId = cancelBtn.dataset.cancelTask;
@@ -1484,6 +1511,20 @@ document.getElementById("obs-task-form").addEventListener("submit", async (e) =>
 
 obsFilterAgent.addEventListener("change", renderObservatoryStream);
 obsFilterType.addEventListener("change", renderObservatoryStream);
+
+document.getElementById("obs-reset-all-caps").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    await api("/admin/agents/reset-caps", { method: "POST" });
+    await loadObservatoryStatus();
+    if (obsActiveView === "mind") {
+      await loadMind(mindActiveAgent);
+    }
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 document.getElementById("obs-refresh").addEventListener("click", () => {
   loadObservatoryStatus().catch(() => {});
@@ -1547,6 +1588,18 @@ document.querySelectorAll("[data-mind-agent]").forEach((btn) => {
 
 document.querySelectorAll("[data-mind-tab]").forEach((btn) => {
   btn.addEventListener("click", () => setMindTab(btn.dataset.mindTab));
+});
+
+mindResetCapsBtn.addEventListener("click", async () => {
+  mindResetCapsBtn.disabled = true;
+  try {
+    await api(`/admin/agents/${encodeURIComponent(mindActiveAgent)}/reset-caps`, {
+      method: "POST",
+    });
+    await loadMind(mindActiveAgent);
+  } finally {
+    mindResetCapsBtn.disabled = false;
+  }
 });
 
 mindWakeBtn.addEventListener("click", async () => {

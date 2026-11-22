@@ -111,7 +111,31 @@ export class Forum extends DurableObject<ForumEnv> {
         this.migrateToMultiAgent();
         this.setSchemaVersion(3);
       });
+      version = 3;
     }
+
+    if (version < 4) {
+      this.ctx.storage.transactionSync(() => {
+        this.migrateToThreadReads();
+        this.setSchemaVersion(4);
+      });
+    }
+  }
+
+  private migrateToThreadReads() {
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS thread_reads (
+        thread_id INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        last_read_post_id INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (thread_id, user_id),
+        FOREIGN KEY (thread_id) REFERENCES threads(id),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_thread_reads_user
+        ON thread_reads(user_id, thread_id);
+    `);
   }
 
   private setSchemaVersion(version: number) {
@@ -839,8 +863,88 @@ export class Forum extends DurableObject<ForumEnv> {
     return row?.total ?? 0;
   }
 
-  listThreads(limit = 100): ThreadSummary[] {
+  private getLastReadPostId(
+    threadId: number,
+    viewerId: string,
+    board: BoardKind,
+  ): number {
+    if (board === "messages") {
+      const row = this.sql
+        .exec<{ last_read_post_id: number }>(
+          `SELECT last_read_post_id FROM thread_participants WHERE thread_id = ? AND user_id = ?`,
+          threadId,
+          viewerId,
+        )
+        .toArray()[0];
+      return row?.last_read_post_id ?? 0;
+    }
+
+    const row = this.sql
+      .exec<{ last_read_post_id: number }>(
+        `SELECT last_read_post_id FROM thread_reads WHERE thread_id = ? AND user_id = ?`,
+        threadId,
+        viewerId,
+      )
+      .toArray()[0];
+    return row?.last_read_post_id ?? 0;
+  }
+
+  private recordThreadRead(
+    threadId: number,
+    viewerId: string,
+    board: BoardKind,
+    upToPostId: number,
+  ): void {
+    if (upToPostId <= 0) return;
+    if (board === "messages") {
+      this.sql.exec(
+        `UPDATE thread_participants
+         SET last_read_post_id = MAX(last_read_post_id, ?)
+         WHERE thread_id = ? AND user_id = ?`,
+        upToPostId,
+        threadId,
+        viewerId,
+      );
+      return;
+    }
+
+    this.sql.exec(
+      `INSERT INTO thread_reads (thread_id, user_id, last_read_post_id, updated_at)
+       VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(thread_id, user_id) DO UPDATE SET
+         last_read_post_id = MAX(thread_reads.last_read_post_id, excluded.last_read_post_id),
+         updated_at = datetime('now')`,
+      threadId,
+      viewerId,
+      upToPostId,
+    );
+  }
+
+  listThreads(limit = 100, viewerId?: string | null): ThreadSummary[] {
     const safeLimit = Math.max(1, Math.min(limit, 100));
+    if (!viewerId) {
+      return this.sql
+        .exec<ThreadSummary>(
+          `SELECT
+             t.id AS id,
+             t.board AS board,
+             t.title AS title,
+             t.user_id AS authorId,
+             u.name AS authorName,
+             u.kind AS authorKind,
+             t.created_at AS createdAt,
+             t.bumped_at AS bumpedAt,
+             MAX(0, (SELECT COUNT(*) - 1 FROM posts p WHERE p.thread_id = t.id)) AS replyCount
+           FROM threads t
+           JOIN users u ON u.id = t.user_id
+           WHERE t.board = 'general'
+           ORDER BY t.bumped_at DESC, t.id DESC
+           LIMIT ?`,
+          safeLimit,
+        )
+        .toArray();
+    }
+
     return this.sql
       .exec<ThreadSummary>(
         `SELECT
@@ -852,12 +956,25 @@ export class Forum extends DurableObject<ForumEnv> {
            u.kind AS authorKind,
            t.created_at AS createdAt,
            t.bumped_at AS bumpedAt,
-           MAX(0, (SELECT COUNT(*) - 1 FROM posts p WHERE p.thread_id = t.id)) AS replyCount
+           MAX(0, (SELECT COUNT(*) - 1 FROM posts p WHERE p.thread_id = t.id)) AS replyCount,
+           COALESCE(tr.last_read_post_id, 0) AS lastReadPostId,
+           (SELECT COUNT(*) FROM posts p
+            WHERE p.thread_id = t.id
+              AND p.id > COALESCE(tr.last_read_post_id, 0)
+              AND p.user_id != ?) AS unreadCount,
+           (SELECT MIN(p.id) FROM posts p
+            WHERE p.thread_id = t.id
+              AND p.id > COALESCE(tr.last_read_post_id, 0)
+              AND p.user_id != ?) AS firstUnreadPostId
          FROM threads t
          JOIN users u ON u.id = t.user_id
+         LEFT JOIN thread_reads tr ON tr.thread_id = t.id AND tr.user_id = ?
          WHERE t.board = 'general'
          ORDER BY t.bumped_at DESC, t.id DESC
          LIMIT ?`,
+        viewerId,
+        viewerId,
+        viewerId,
         safeLimit,
       )
       .toArray();
@@ -936,7 +1053,12 @@ export class Forum extends DurableObject<ForumEnv> {
   getThread(
     threadId: number,
     viewerId: string,
-    opts?: { markRead?: boolean; maxPosts?: number },
+    opts?: {
+      markRead?: boolean;
+      maxPosts?: number;
+      unreadOnly?: boolean;
+      afterPostId?: number;
+    },
   ): ThreadDetail | null {
     const thread = this.sql
       .exec<ThreadSummary>(
@@ -976,32 +1098,69 @@ export class Forum extends DurableObject<ForumEnv> {
       }
     }
 
-    const postRows = opts?.maxPosts
-      ? this.sql
-          .exec<PostRow>(
-            `SELECT * FROM (
-               SELECT
-                 p.id AS id,
-                 p.thread_id AS threadId,
-                 p.body AS body,
-                 p.user_id AS authorId,
-                 u.name AS authorName,
-                 u.kind AS authorKind,
-                 p.created_at AS createdAt,
-                 p.meta_json AS metaJson
-               FROM posts p
-               JOIN users u ON u.id = p.user_id
-               WHERE p.thread_id = ?
-               ORDER BY p.id DESC
-               LIMIT ?
-             ) ORDER BY id ASC`,
-            threadId,
-            Math.max(1, Math.min(opts.maxPosts, 200)),
-          )
-          .toArray()
-      : this.sql
-          .exec<PostRow>(
-            `SELECT
+    const isGuest = viewerId === "__guest__";
+    const lastReadBefore = isGuest
+      ? 0
+      : this.getLastReadPostId(threadId, viewerId, thread.board);
+
+    const limit = opts?.maxPosts
+      ? Math.max(1, Math.min(opts.maxPosts, 200))
+      : 200;
+
+    let postRows: PostRow[];
+    if (opts?.unreadOnly) {
+      postRows = this.sql
+        .exec<PostRow>(
+          `SELECT
+             p.id AS id,
+             p.thread_id AS threadId,
+             p.body AS body,
+             p.user_id AS authorId,
+             u.name AS authorName,
+             u.kind AS authorKind,
+             p.created_at AS createdAt,
+             p.meta_json AS metaJson
+           FROM posts p
+           JOIN users u ON u.id = p.user_id
+           WHERE p.thread_id = ? AND p.id > ?
+           ORDER BY p.id ASC
+           LIMIT ?`,
+          threadId,
+          lastReadBefore,
+          limit,
+        )
+        .toArray();
+    } else if (
+      typeof opts?.afterPostId === "number" &&
+      Number.isInteger(opts.afterPostId) &&
+      opts.afterPostId >= 0
+    ) {
+      postRows = this.sql
+        .exec<PostRow>(
+          `SELECT
+             p.id AS id,
+             p.thread_id AS threadId,
+             p.body AS body,
+             p.user_id AS authorId,
+             u.name AS authorName,
+             u.kind AS authorKind,
+             p.created_at AS createdAt,
+             p.meta_json AS metaJson
+           FROM posts p
+           JOIN users u ON u.id = p.user_id
+           WHERE p.thread_id = ? AND p.id > ?
+           ORDER BY p.id ASC
+           LIMIT ?`,
+          threadId,
+          opts.afterPostId,
+          limit,
+        )
+        .toArray();
+    } else if (opts?.maxPosts) {
+      postRows = this.sql
+        .exec<PostRow>(
+          `SELECT * FROM (
+             SELECT
                p.id AS id,
                p.thread_id AS threadId,
                p.body AS body,
@@ -1013,28 +1172,77 @@ export class Forum extends DurableObject<ForumEnv> {
              FROM posts p
              JOIN users u ON u.id = p.user_id
              WHERE p.thread_id = ?
-             ORDER BY p.id ASC`,
-            threadId,
-          )
-          .toArray();
+             ORDER BY p.id DESC
+             LIMIT ?
+           ) ORDER BY id ASC`,
+          threadId,
+          limit,
+        )
+        .toArray();
+    } else {
+      postRows = this.sql
+        .exec<PostRow>(
+          `SELECT
+             p.id AS id,
+             p.thread_id AS threadId,
+             p.body AS body,
+             p.user_id AS authorId,
+             u.name AS authorName,
+             u.kind AS authorKind,
+             p.created_at AS createdAt,
+             p.meta_json AS metaJson
+           FROM posts p
+           JOIN users u ON u.id = p.user_id
+           WHERE p.thread_id = ?
+           ORDER BY p.id ASC`,
+          threadId,
+        )
+        .toArray();
+    }
 
     const posts = postRows.map(mapPostRow);
+    const maxShownPostId = posts.length > 0 ? posts[posts.length - 1]!.id : 0;
 
-    if (opts?.markRead && thread.board === "messages" && posts.length > 0) {
-      const latestId = posts[posts.length - 1]!.id;
-      this.sql.exec(
-        `UPDATE thread_participants
-         SET last_read_post_id = MAX(last_read_post_id, ?)
-         WHERE thread_id = ? AND user_id = ?`,
-        latestId,
-        threadId,
-        viewerId,
-      );
+    let lastReadAfter = lastReadBefore;
+    if (opts?.markRead && !isGuest && maxShownPostId > 0) {
+      // Strictly track the highest post ID actually shown to this reader
+      this.recordThreadRead(threadId, viewerId, thread.board, maxShownPostId);
+      lastReadAfter = Math.max(lastReadBefore, maxShownPostId);
+    }
+
+    let unreadRemaining: number | undefined;
+    let firstUnreadPostId: number | null | undefined;
+    if (!isGuest) {
+      const stats = this.sql
+        .exec<{ unreadCount: number; firstUnread: number | null }>(
+          `SELECT
+             COUNT(*) AS unreadCount,
+             MIN(p.id) AS firstUnread
+           FROM posts p
+           WHERE p.thread_id = ?
+             AND p.id > ?
+             AND p.user_id != ?`,
+          threadId,
+          lastReadAfter,
+          viewerId,
+        )
+        .one();
+      unreadRemaining = stats.unreadCount;
+      firstUnreadPostId = stats.firstUnread;
     }
 
     return {
       ...thread,
       posts,
+      ...(!isGuest
+        ? {
+            lastReadPostIdBefore: lastReadBefore,
+            lastReadPostId: lastReadAfter,
+            unreadCount: unreadRemaining,
+            unreadRemaining,
+            firstUnreadPostId,
+          }
+        : {}),
       ...(counterparty !== undefined ? { counterparty } : {}),
       ...(readOnly !== undefined ? { readOnly } : {}),
     };
@@ -1089,6 +1297,9 @@ export class Forum extends DurableObject<ForumEnv> {
           threadId,
         )
         .one();
+
+      // Mark the OP as read for the thread creator
+      this.recordThreadRead(threadId, author.id, "general", postRow.id);
 
       shouldFlush = this.postProcessPostInTx({
         board: "general",
@@ -1323,19 +1534,41 @@ export class Forum extends DurableObject<ForumEnv> {
     }
   }
 
-  async listThreadsForAgent(limit = 20): Promise<ThreadSummary[]> {
-    return this.listThreads(limit);
+  async listThreadsForAgent(
+    agentName: string,
+    limit = 20,
+  ): Promise<ThreadSummary[]> {
+    return this.listThreads(limit, agentUserId(agentName));
   }
 
   async getThreadForAgent(
     agentName: string,
     threadId: number,
-    maxPosts = 30,
+    opts?: {
+      maxPosts?: number;
+      markRead?: boolean;
+      unreadOnly?: boolean;
+      afterPostId?: number;
+    },
   ): Promise<ThreadDetail | null> {
     return this.getThread(threadId, agentUserId(agentName), {
-      markRead: false,
-      maxPosts,
+      markRead: opts?.markRead ?? false,
+      maxPosts: opts?.maxPosts ?? 30,
+      unreadOnly: opts?.unreadOnly,
+      afterPostId: opts?.afterPostId,
     });
+  }
+
+  async markThreadReadForAgent(
+    agentName: string,
+    threadId: number,
+    upToPostId: number,
+  ): Promise<void> {
+    const thread = this.sql
+      .exec<{ board: BoardKind }>(`SELECT board FROM threads WHERE id = ?`, threadId)
+      .toArray()[0];
+    if (!thread) return;
+    this.recordThreadRead(threadId, agentUserId(agentName), thread.board, upToPostId);
   }
 
   async listMessagesForAgent(agentName: string): Promise<MessageSummary[]> {
@@ -1484,9 +1717,12 @@ export class Forum extends DurableObject<ForumEnv> {
 
     try {
       if (request.method === "GET" && url.pathname === "/threads") {
+        if (!isReadOnly) {
+          ensureActor();
+        }
         return Response.json({
           board: "general",
-          threads: this.listThreads(),
+          threads: this.listThreads(100, isReadOnly ? null : userId),
         });
       }
 

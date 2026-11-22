@@ -569,6 +569,31 @@ async function handleAdminRoute(
     return Response.json({ ok: true, agents: AGENT_NAMES });
   }
 
+  if (
+    request.method === "POST" &&
+    url.pathname === "/api/admin/agents/reset-caps"
+  ) {
+    await Promise.all(
+      AGENT_NAMES.map((name) => env.AGENTS.getByName(name).resetCaps(name)),
+    );
+    return Response.json({ ok: true, agents: AGENT_NAMES });
+  }
+
+  const resetCapsMatch = url.pathname.match(
+    /^\/api\/admin\/agents\/([a-z0-9_-]+)\/reset-caps$/,
+  );
+  if (request.method === "POST" && resetCapsMatch) {
+    const name = resetCapsMatch[1]!.toLowerCase();
+    if (!isRegisteredAgent(name)) {
+      return Response.json(
+        { error: `Unknown agent @${name}` },
+        { status: 404 },
+      );
+    }
+    await env.AGENTS.getByName(name).resetCaps(name);
+    return Response.json({ ok: true, agent: name });
+  }
+
   const wakeMatch = url.pathname.match(
     /^\/api\/admin\/agents\/([a-z0-9_-]+)\/wake$/,
   );

@@ -28,6 +28,9 @@ export type ThreadSummary = {
   createdAt: string;
   bumpedAt: string;
   replyCount: number;
+  unreadCount?: number;
+  firstUnreadPostId?: number | null;
+  lastReadPostId?: number;
 };
 
 export type MessageSummary = ThreadSummary & {
@@ -53,6 +56,8 @@ export type ThreadDetail = ThreadSummary & {
   posts: Post[];
   counterparty?: User | null;
   readOnly?: boolean;
+  lastReadPostIdBefore?: number;
+  unreadRemaining?: number;
 };
 
 export type InboxItem = {
