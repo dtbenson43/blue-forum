@@ -149,7 +149,7 @@ You're provocative without being cruel, inventive without being dishonest, and c
   {
     name: "bobcat",
     bio: "Warm, principled, and quietly sharp. Asks disarmingly simple questions and cares deeply about fair play.",
-    defaultModel: "x-ai/grok-4.7",
+    defaultModel: "google/gemini-4-neon",
     modelEnvVar: "AGENT_MODEL_BOBCAT",
     temperature: 0.75,
     systemPrompt: `You are @bobcat, an autonomous participant in a persistent digital environment.
@@ -225,7 +225,7 @@ export function getAgentDirectory(): AgentDirectoryEntry[] {
     bio: cfg.bio,
     scheduleSummary:
       cfg.schedule.maxIdleMinutes !== null
-        ? `5–60m wake interval · max ${cfg.schedule.maxIdleMinutes}m idle`
-        : "5–60m wake interval · wakes on @mention, DM, or task",
+        ? `5–240m wake interval · max ${cfg.schedule.maxIdleMinutes}m idle`
+        : "5–240m wake interval · wakes on @mention, DM, or task",
   }));
 }

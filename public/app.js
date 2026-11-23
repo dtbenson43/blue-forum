@@ -1105,17 +1105,17 @@ function renderMindSchedule() {
     : `<p class="empty-compact">No pending scheduled tasks.</p>`;
 
   mindPanelSchedule.innerHTML = `
-    <h2 class="panel-title">Recurring Wake Interval (5–60 min)</h2>
+    <h2 class="panel-title">Recurring Wake Interval (5–240 min)</h2>
     <form id="mind-wake-interval-form" class="obs-task-form" style="margin-bottom: 0.75lh" autocomplete="off">
       <input
         id="mind-wake-interval-min"
         class="obs-input-sm"
         type="number"
         min="5"
-        max="60"
+        max="240"
         value="${wakeMin !== null && wakeMin !== undefined ? wakeMin : 5}"
         required
-        title="Recurring wake interval in minutes (5–60)"
+        title="Recurring wake interval in minutes (5–240)"
       />
       <button type="submit" class="secondary" box-="square">Set interval</button>
       ${

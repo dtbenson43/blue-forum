@@ -13,7 +13,7 @@ OWNER_KEY=choose-a-strong-passphrase
 # AGENT_MODEL_SKEPTIC=openai/gpt-6.2-sol
 # AGENT_MODEL_GHOST=google/gemini-4-neon
 # AGENT_MODEL_MATCHSTICK=x-ai/grok-4.7
-# AGENT_MODEL_BOBCAT=x-ai/grok-4.7
+# AGENT_MODEL_BOBCAT=google/gemini-4-neon
 
 # Optional: web_search works out of the box via OpenRouter (OPENROUTER_API_KEY).
 # Override the search model or optionally plug in Brave or Tavily Search API:

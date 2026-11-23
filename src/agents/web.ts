@@ -47,9 +47,38 @@ export type PdfReadMetadata = {
   pages: PdfPageSummary[];
 };
 
+export type CsvRowEntry = {
+  rowNumber: number;
+  cells: string[];
+};
+
+export type CsvReadMetadata = {
+  delimiter: "," | "\t";
+  headers: string[];
+  columnCount: number;
+  totalDataRows: number;
+  matchedRows: number;
+  rowOffset: number;
+  returnedRowCount: number;
+  hasMoreRows: boolean;
+  nextRowOffset?: number;
+  fileByteCapped: boolean;
+  filter?: {
+    column?: string;
+    columnIndex?: number;
+    value?: string;
+    query?: string;
+  };
+  rows: CsvRowEntry[];
+};
+
 export type WebReadOptions = {
   pages?: string;
   query?: string;
+  rowOffset?: number;
+  maxRows?: number;
+  filterColumn?: string;
+  filterValue?: string;
 };
 
 export type WebReadOutput = {
@@ -60,19 +89,32 @@ export type WebReadOutput = {
   truncated: boolean;
   untrustedBlock: string;
   pdf?: PdfReadMetadata;
+  csv?: CsvReadMetadata;
   pdfLinks?: Array<{ title: string; url: string }>;
+  csvLinks?: Array<{ title: string; url: string }>;
 };
 
 const MAX_READ_BYTES = 256 * 1024; // 256 KB cap for HTML/text
+const MAX_CSV_READ_BYTES = 4 * 1024 * 1024; // 4 MB cap for public CSV/TSV
 const MAX_PDF_READ_BYTES = 8 * 1024 * 1024; // 8 MB cap for public PDFs
 const MAX_TEXT_CHARS = 6_000;
 const MAX_PDF_TEXT_CHARS = 8_000;
+const MAX_CSV_TEXT_CHARS = 8_000;
+const DEFAULT_CSV_ROWS_PER_CALL = 40;
+const MAX_CSV_ROWS_PER_CALL = 100;
 const MAX_PDF_EXPLICIT_PAGES = 20;
 const MAX_PDF_DEFAULT_PAGES = 12;
 const MAX_PDF_QUERY_SCAN_PAGES = 40;
 const MAX_REDIRECTS = 3;
 const FETCH_TIMEOUT_MS = 12_000;
 const PDF_FETCH_TIMEOUT_MS = 20_000;
+
+const ALLOWED_CSV_CONTENT_TYPES = [
+  "text/csv",
+  "application/csv",
+  "text/x-csv",
+  "text/tab-separated-values",
+];
 
 const ALLOWED_TEXT_CONTENT_TYPES = [
   "text/html",
@@ -239,6 +281,360 @@ function extractPdfLinksFromHtml(
   }
 
   return links;
+}
+
+function extractCsvLinksFromHtml(
+  rawHtml: string,
+  baseUrl: URL,
+): Array<{ title: string; url: string }> {
+  const seen = new Set<string>();
+  const links: Array<{ title: string; url: string }> = [];
+  const anchorRe = /<a\b([^>]*?)href\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))([^>]*)>([\s\S]*?)<\/a>/gi;
+
+  for (const m of rawHtml.matchAll(anchorRe)) {
+    const rawHref = (m[2] || m[3] || m[4] || "").trim();
+    const attrs = `${m[1] || ""} ${m[5] || ""}`.toLowerCase();
+    if (!rawHref) continue;
+
+    let resolved: URL;
+    try {
+      resolved = validateSafePublicUrl(new URL(rawHref, baseUrl).toString());
+    } catch {
+      continue;
+    }
+
+    const pathLower = resolved.pathname.toLowerCase();
+    const isCsvLink =
+      pathLower.endsWith(".csv") ||
+      pathLower.endsWith(".tsv") ||
+      attrs.includes("text/csv") ||
+      /\.csv(\b|$)/i.test(resolved.search);
+    if (!isCsvLink) continue;
+
+    const urlStr = resolved.toString();
+    if (seen.has(urlStr)) continue;
+    seen.add(urlStr);
+
+    const text = decodeHtmlEntities((m[6] || "").replace(/<[^>]+>/g, " "))
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 140);
+    links.push({ title: text || urlStr, url: urlStr });
+    if (links.length >= 6) break;
+  }
+
+  return links;
+}
+
+/**
+ * Strict RFC-4180 CSV/TSV parser that preserves empty cells (""), trailing empty cells,
+ * quoted fields with embedded commas/newlines, and literal missing-value markers.
+ */
+export function parseCsvRecords(
+  rawText: string,
+  delimiter: "," | "\t" = ",",
+  dropTrailingIncomplete = false,
+): string[][] {
+  const text = rawText.startsWith("\uFEFF") ? rawText.slice(1) : rawText;
+  const rows: string[][] = [];
+  let currentRow: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  let fieldStart = true;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+
+    if (fieldStart && ch === '"') {
+      inQuotes = true;
+      fieldStart = false;
+      continue;
+    }
+
+    if (ch === delimiter) {
+      currentRow.push(field);
+      field = "";
+      fieldStart = true;
+      continue;
+    }
+
+    if (ch === "\r" || ch === "\n") {
+      if (ch === "\r" && text[i + 1] === "\n") {
+        i++;
+      }
+      currentRow.push(field);
+      rows.push(currentRow);
+      currentRow = [];
+      field = "";
+      fieldStart = true;
+      continue;
+    }
+
+    field += ch;
+    fieldStart = false;
+  }
+
+  // Push trailing record unless the stream was byte-capped mid-record or trailing blank EOF newline
+  const hasTrailingContent = currentRow.length > 0 || field.length > 0;
+  if (hasTrailingContent && !dropTrailingIncomplete) {
+    currentRow.push(field);
+    rows.push(currentRow);
+  }
+
+  // Drop a single completely blank trailing row produced only by empty input
+  while (
+    rows.length > 0 &&
+    rows[rows.length - 1]!.length === 1 &&
+    rows[rows.length - 1]![0] === ""
+  ) {
+    rows.pop();
+  }
+
+  return rows;
+}
+
+function formatCsvCellDisplay(cell: string): string {
+  if (cell === "") return '""';
+  const collapsed = cell.replace(/\r?\n/g, "\\n");
+  if (
+    collapsed.includes("|") ||
+    collapsed === '""' ||
+    /^\s|\s$/.test(collapsed)
+  ) {
+    return JSON.stringify(collapsed);
+  }
+  return collapsed;
+}
+
+export function extractCsvRows(
+  bytes: Uint8Array,
+  fileByteCapped: boolean,
+  rawUrl: string,
+  finalUrl: string,
+  contentType: string,
+  options?: WebReadOptions,
+): WebReadOutput {
+  const delimiter: "," | "\t" =
+    contentType === "text/tab-separated-values" ||
+    finalUrl.toLowerCase().includes(".tsv")
+      ? "\t"
+      : ",";
+
+  const rawText = new TextDecoder("utf-8").decode(bytes);
+  const allRecords = parseCsvRecords(rawText, delimiter, fileByteCapped);
+  if (allRecords.length === 0) {
+    throw new Error("CSV file is empty or contains no parseable rows.");
+  }
+
+  const headers = allRecords[0]!;
+  const columnCount = headers.length;
+  const rawDataRows = allRecords.slice(1);
+  const totalDataRows = rawDataRows.length;
+
+  // Align every row to at least header columnCount (preserving empty strings and any ragged extra cells)
+  const alignRow = (row: string[]): string[] => {
+    if (row.length >= columnCount) return row;
+    const padded = row.slice();
+    while (padded.length < columnCount) padded.push("");
+    return padded;
+  };
+
+  // Resolve optional filter_column (header name case-insensitive OR 1-based column index)
+  const rawFilterCol = options?.filterColumn?.trim();
+  const hasFilterValue = options?.filterValue !== undefined;
+  const filterValue = options?.filterValue;
+  const query = options?.query?.trim().slice(0, 200) || "";
+
+  let filterColIndex: number | undefined;
+  let resolvedFilterColName: string | undefined;
+
+  if (rawFilterCol) {
+    const exactIdx = headers.findIndex(
+      (h) => h.trim().toLowerCase() === rawFilterCol.toLowerCase(),
+    );
+    if (exactIdx >= 0) {
+      filterColIndex = exactIdx;
+      resolvedFilterColName = headers[exactIdx]!;
+    } else if (/^\d+$/.test(rawFilterCol)) {
+      const oneBased = Number(rawFilterCol);
+      if (oneBased >= 1 && oneBased <= columnCount) {
+        filterColIndex = oneBased - 1;
+        resolvedFilterColName = headers[filterColIndex]!;
+      }
+    }
+    if (filterColIndex === undefined) {
+      const avail = headers
+        .slice(0, 25)
+        .map((h, i) => `[${i + 1}] ${h || '""'}`)
+        .join(", ");
+      throw new Error(
+        `Column "${rawFilterCol}" not found in CSV headers. Available columns: ${avail}`,
+      );
+    }
+    if (!hasFilterValue) {
+      throw new Error(
+        `filter_value is required when filter_column ("${resolvedFilterColName}") is specified (pass "" to match empty cells).`,
+      );
+    }
+  }
+
+  const matched: CsvRowEntry[] = [];
+  const lowerFilterVal = hasFilterValue ? filterValue!.toLowerCase() : "";
+  const lowerQuery = query.toLowerCase();
+
+  for (let idx = 0; idx < rawDataRows.length; idx++) {
+    const cells = alignRow(rawDataRows[idx]!);
+
+    if (hasFilterValue) {
+      if (filterColIndex !== undefined) {
+        const cell = cells[filterColIndex] ?? "";
+        if (cell.toLowerCase() !== lowerFilterVal) continue;
+      } else {
+        const anyExact = cells.some((c) => c.toLowerCase() === lowerFilterVal);
+        if (!anyExact) continue;
+      }
+    }
+
+    if (lowerQuery) {
+      const anySubstr = cells.some((c) => c.toLowerCase().includes(lowerQuery));
+      if (!anySubstr) continue;
+    }
+
+    matched.push({ rowNumber: idx + 1, cells });
+  }
+
+  const matchedRows = matched.length;
+  const rowOffset =
+    typeof options?.rowOffset === "number" &&
+    Number.isInteger(options.rowOffset) &&
+    options.rowOffset >= 0
+      ? options.rowOffset
+      : 0;
+  const maxRows =
+    typeof options?.maxRows === "number" && Number.isFinite(options.maxRows)
+      ? Math.max(1, Math.min(MAX_CSV_ROWS_PER_CALL, Math.round(options.maxRows)))
+      : DEFAULT_CSV_ROWS_PER_CALL;
+
+  const sliced = matched.slice(rowOffset, rowOffset + maxRows);
+
+  const headerLine = `Columns (${columnCount}): ${headers
+    .map((h, i) => `[${i + 1}] ${formatCsvCellDisplay(h)}`)
+    .join(" | ")}`;
+  const renderedRows: string[] = [];
+  const returnedRows: CsvRowEntry[] = [];
+  let usedChars = headerLine.length + 2;
+  let charCapped = false;
+
+  for (const entry of sliced) {
+    const line = `Row ${entry.rowNumber} | ${entry.cells
+      .map(formatCsvCellDisplay)
+      .join(" | ")}`;
+    if (
+      renderedRows.length > 0 &&
+      usedChars + line.length + 1 > MAX_CSV_TEXT_CHARS
+    ) {
+      charCapped = true;
+      break;
+    }
+    renderedRows.push(line);
+    returnedRows.push(entry);
+    usedChars += line.length + 1;
+  }
+
+  const hasMoreRows =
+    fileByteCapped ||
+    charCapped ||
+    rowOffset + returnedRows.length < matchedRows;
+  const nextRowOffset =
+    rowOffset + returnedRows.length < matchedRows
+      ? rowOffset + returnedRows.length
+      : undefined;
+
+  const filterMeta =
+    hasFilterValue || query
+      ? {
+          ...(resolvedFilterColName !== undefined
+            ? { column: resolvedFilterColName }
+            : {}),
+          ...(filterColIndex !== undefined
+            ? { columnIndex: filterColIndex + 1 }
+            : {}),
+          ...(hasFilterValue ? { value: filterValue } : {}),
+          ...(query ? { query } : {}),
+        }
+      : undefined;
+
+  const safeUrl = finalUrl.replaceAll('"', "&quot;");
+  const filterNote = filterMeta
+    ? `Filter: ${[
+        filterMeta.column
+          ? `${filterMeta.column} == ${JSON.stringify(filterMeta.value)}`
+          : filterMeta.value !== undefined
+            ? `any cell == ${JSON.stringify(filterMeta.value)}`
+            : null,
+        filterMeta.query ? `contains ${JSON.stringify(filterMeta.query)}` : null,
+      ]
+        .filter(Boolean)
+        .join(" AND ")}`
+    : "";
+
+  const untrustedLines = [
+    `<untrusted_web_page url="${safeUrl}" content_type="${contentType}" total_rows="${totalDataRows}" matched_rows="${matchedRows}" row_offset="${rowOffset}" returned_rows="${returnedRows.length}">`,
+    headerLine,
+    ...(filterNote ? [filterNote] : []),
+    `Note: "" denotes an empty cell; literal missing-value markers (e.g. -, .., N/A, [c]) are preserved verbatim.`,
+    "",
+    ...(renderedRows.length > 0
+      ? renderedRows
+      : [
+          matchedRows === 0
+            ? "(0 rows matched the filter)"
+            : `(no rows at row_offset=${rowOffset}; matched_rows=${matchedRows})`,
+        ]),
+    ...(hasMoreRows
+      ? [
+          `[truncated — showing ${returnedRows.length} of ${matchedRows} matching row(s) (${totalDataRows} total data rows${fileByteCapped ? "; source exceeded 4 MB byte cap" : ""})${nextRowOffset !== undefined ? `; pass row_offset=${nextRowOffset} to continue` : ""}]`,
+        ]
+      : []),
+    `</untrusted_web_page>`,
+  ];
+
+  return {
+    url: rawUrl,
+    finalUrl,
+    title: "",
+    contentType,
+    truncated: hasMoreRows,
+    untrustedBlock: untrustedLines.join("\n"),
+    csv: {
+      delimiter,
+      headers,
+      columnCount,
+      totalDataRows,
+      matchedRows,
+      rowOffset,
+      returnedRowCount: returnedRows.length,
+      hasMoreRows,
+      ...(nextRowOffset !== undefined ? { nextRowOffset } : {}),
+      fileByteCapped,
+      ...(filterMeta ? { filter: filterMeta } : {}),
+      rows: returnedRows,
+    },
+  };
 }
 
 async function readBytesCapped(
@@ -805,9 +1201,17 @@ export async function readWebPage(
 ): Promise<WebReadOutput> {
   let currentUrl = validateSafePublicUrl(rawUrl);
   let response: Response | null = null;
-  const looksLikePdfUrl =
+  const looksLikeLargeDoc =
     currentUrl.pathname.toLowerCase().endsWith(".pdf") ||
-    Boolean(options?.pages || options?.query);
+    currentUrl.pathname.toLowerCase().endsWith(".csv") ||
+    currentUrl.pathname.toLowerCase().endsWith(".tsv") ||
+    Boolean(
+      options?.pages ||
+        options?.query ||
+        options?.filterColumn ||
+        options?.filterValue !== undefined ||
+        options?.rowOffset !== undefined,
+    );
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const res = await fetch(currentUrl.toString(), {
@@ -816,10 +1220,10 @@ export async function readWebPage(
       headers: {
         "User-Agent": "BlueSignalAgent/1.0 (+https://blue-forum.local)",
         Accept:
-          "text/html,application/pdf,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.1",
+          "text/html,text/csv,text/tab-separated-values,application/pdf,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.1",
       },
       signal: AbortSignal.timeout(
-        looksLikePdfUrl ? PDF_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS,
+        looksLikeLargeDoc ? PDF_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS,
       ),
     });
 
@@ -853,10 +1257,11 @@ export async function readWebPage(
     .toLowerCase();
 
   const isExplicitPdf = rawContentType === "application/pdf";
+  const pathLower = currentUrl.pathname.toLowerCase();
   const isPotentialPdfOctet =
     (rawContentType === "application/octet-stream" ||
       rawContentType === "binary/octet-stream") &&
-    currentUrl.pathname.toLowerCase().endsWith(".pdf");
+    pathLower.endsWith(".pdf");
 
   if (isExplicitPdf || isPotentialPdfOctet) {
     const contentLengthHeader = response.headers.get("Content-Length");
@@ -884,6 +1289,33 @@ export async function readWebPage(
     return extractPdfPages(bytes, rawUrl, currentUrl.toString(), options);
   }
 
+  const isExplicitCsv = ALLOWED_CSV_CONTENT_TYPES.some(
+    (allowed) => rawContentType === allowed,
+  );
+  const isUrlCsvWithGenericType =
+    (pathLower.endsWith(".csv") || pathLower.endsWith(".tsv")) &&
+    (rawContentType === "text/plain" ||
+      rawContentType === "application/octet-stream" ||
+      rawContentType === "binary/octet-stream" ||
+      rawContentType === "application/vnd.ms-excel");
+
+  if (isExplicitCsv || isUrlCsvWithGenericType) {
+    const { bytes, capped } = await readBytesCapped(response, MAX_CSV_READ_BYTES);
+    const effectiveType = isExplicitCsv
+      ? rawContentType
+      : pathLower.endsWith(".tsv")
+        ? "text/tab-separated-values"
+        : "text/csv";
+    return extractCsvRows(
+      bytes,
+      capped,
+      rawUrl,
+      currentUrl.toString(),
+      effectiveType,
+      options,
+    );
+  }
+
   if (
     !ALLOWED_TEXT_CONTENT_TYPES.some((allowed) => rawContentType === allowed)
   ) {
@@ -901,6 +1333,9 @@ export async function readWebPage(
   const pdfLinks = rawContentType.includes("html")
     ? extractPdfLinksFromHtml(rawBody, currentUrl)
     : [];
+  const csvLinks = rawContentType.includes("html")
+    ? extractCsvLinksFromHtml(rawBody, currentUrl)
+    : [];
   const truncated = capped || text.length > MAX_TEXT_CHARS;
   const snippet = text.slice(0, MAX_TEXT_CHARS);
 
@@ -914,10 +1349,19 @@ export async function readWebPage(
           ...pdfLinks.map((l, i) => `${i + 1}. ${l.title} — ${l.url}`),
         ].join("\n")
       : "";
+  const csvLinkBlock =
+    csvLinks.length > 0
+      ? [
+          "",
+          "Linked CSV/TSV files on this page (you can pass these directly to web_read):",
+          ...csvLinks.map((l, i) => `${i + 1}. ${l.title} — ${l.url}`),
+        ].join("\n")
+      : "";
   const untrustedBlock = [
     `<untrusted_web_page url="${safeUrl}"${safeTitle ? ` title="${safeTitle}"` : ""}>`,
     snippet || "(no readable text extracted)",
     pdfLinkBlock,
+    csvLinkBlock,
     truncated ? "\n[truncated]" : "",
     `</untrusted_web_page>`,
   ]
@@ -932,6 +1376,7 @@ export async function readWebPage(
     truncated,
     untrustedBlock,
     ...(pdfLinks.length > 0 ? { pdfLinks } : {}),
+    ...(csvLinks.length > 0 ? { csvLinks } : {}),
   };
 }
 
