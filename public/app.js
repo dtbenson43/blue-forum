@@ -59,7 +59,7 @@ function escapeHtml(value) {
 function formatPostBody(raw) {
   let html = escapeHtml(raw);
   html = html.replace(
-    /#\/thread\/(\d+)(\?post=(\d+))?/g,
+    /#\/?thread\/(\d+)(\?post=(\d+))?/g,
     '<a class="inline-ref" href="#/thread/$1$2">#/thread/$1$2</a>',
   );
   html = html.replace(
@@ -590,10 +590,12 @@ function renderThreadDetail(thread, focusPostId) {
   const posts = thread.posts
     .map((post, index) => {
       const isTarget = focusPostId !== null && post.id === focusPostId;
-      const prefix =
-        activeThreadBoard === "general" && index === 0
-          ? `OP · #${post.id} · `
-          : `#${post.id} · `;
+      const postRef = `#/thread/${thread.id}?post=${post.id}`;
+      const opTag = activeThreadBoard === "general" && index === 0 ? "OP · " : "";
+      const copyBtn =
+        activeThreadBoard === "general"
+          ? `<button type="button" class="post-copy-ref" data-copy-ref="${escapeHtml(postRef)}" title="Copy ${escapeHtml(postRef)}">copy ref</button>`
+          : "";
       return `
       <article
         class="post${isTarget ? " is-target" : ""}"
@@ -601,8 +603,8 @@ function renderThreadDetail(thread, focusPostId) {
         data-post-id="${post.id}"
       >
         <header class="post-header">
-          ${prefix}<strong>@${escapeHtml(post.authorName)}</strong>
-          · <time datetime="${escapeHtml(post.createdAt)}">${escapeHtml(formatTime(post.createdAt))}</time>
+          <span>${opTag}<a class="post-permalink" href="${escapeHtml(postRef)}" title="${escapeHtml(postRef)}">#${post.id}</a> · <strong>@${escapeHtml(post.authorName)}</strong> · <time datetime="${escapeHtml(post.createdAt)}">${escapeHtml(formatTime(post.createdAt))}</time></span>
+          ${copyBtn}
         </header>
         <p class="post-body">${formatPostBody(post.body)}</p>
       </article>`;
@@ -2141,6 +2143,26 @@ document.getElementById("refresh-thread").addEventListener("click", () => {
   loadThread(activeThreadId).catch((err) => {
     threadDetailEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
   });
+});
+
+threadDetailEl.addEventListener("click", async (e) => {
+  const copyBtn = e.target.closest("[data-copy-ref]");
+  if (!copyBtn) return;
+  const ref = copyBtn.dataset.copyRef;
+  if (!ref) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(ref);
+    }
+    copyBtn.textContent = "copied";
+    copyBtn.classList.add("is-copied");
+    setTimeout(() => {
+      copyBtn.textContent = "copy ref";
+      copyBtn.classList.remove("is-copied");
+    }, 1500);
+  } catch {
+    // ignore clipboard restrictions
+  }
 });
 
 backBoardBtn.addEventListener("click", () => {

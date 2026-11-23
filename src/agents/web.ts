@@ -1,3 +1,5 @@
+import { getDocumentProxy, getMeta, getResolvedPDFJS } from "unpdf";
+
 export type WebSearchResultItem = {
   title: string;
   url: string;
@@ -15,6 +17,41 @@ export type WebSearchOutput = {
   untrustedBlock: string;
 };
 
+export type PdfPageStatus =
+  | "text"
+  | "matched"
+  | "no_match"
+  | "image_only"
+  | "blank";
+
+export type PdfPageSummary = {
+  page: number;
+  status: PdfPageStatus;
+  charCount: number;
+  imageCount?: number;
+  matchType?: "exact_phrase" | "all_words";
+  truncated?: boolean;
+};
+
+export type PdfReadMetadata = {
+  totalPages: number;
+  inspectedPages: number[];
+  returnedPages: number[];
+  imageOnlyPages: number[];
+  blankPages: number[];
+  noMatchPages: number[];
+  matchedPages?: number[];
+  query?: string;
+  hasMorePages: boolean;
+  nextPage?: number;
+  pages: PdfPageSummary[];
+};
+
+export type WebReadOptions = {
+  pages?: string;
+  query?: string;
+};
+
 export type WebReadOutput = {
   url: string;
   finalUrl: string;
@@ -22,14 +59,22 @@ export type WebReadOutput = {
   contentType: string;
   truncated: boolean;
   untrustedBlock: string;
+  pdf?: PdfReadMetadata;
+  pdfLinks?: Array<{ title: string; url: string }>;
 };
 
-const MAX_READ_BYTES = 256 * 1024; // 256 KB raw download cap
+const MAX_READ_BYTES = 256 * 1024; // 256 KB cap for HTML/text
+const MAX_PDF_READ_BYTES = 8 * 1024 * 1024; // 8 MB cap for public PDFs
 const MAX_TEXT_CHARS = 6_000;
+const MAX_PDF_TEXT_CHARS = 8_000;
+const MAX_PDF_EXPLICIT_PAGES = 20;
+const MAX_PDF_DEFAULT_PAGES = 12;
+const MAX_PDF_QUERY_SCAN_PAGES = 40;
 const MAX_REDIRECTS = 3;
-const FETCH_TIMEOUT_MS = 10_000;
+const FETCH_TIMEOUT_MS = 12_000;
+const PDF_FETCH_TIMEOUT_MS = 20_000;
 
-const ALLOWED_CONTENT_TYPES = [
+const ALLOWED_TEXT_CONTENT_TYPES = [
   "text/html",
   "text/plain",
   "text/markdown",
@@ -154,11 +199,53 @@ function extractReadableText(
   return { title, text: decoded };
 }
 
-async function readBodyCapped(
+function extractPdfLinksFromHtml(
+  rawHtml: string,
+  baseUrl: URL,
+): Array<{ title: string; url: string }> {
+  const seen = new Set<string>();
+  const links: Array<{ title: string; url: string }> = [];
+  const anchorRe = /<a\b([^>]*?)href\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))([^>]*)>([\s\S]*?)<\/a>/gi;
+
+  for (const m of rawHtml.matchAll(anchorRe)) {
+    const rawHref = (m[2] || m[3] || m[4] || "").trim();
+    const attrs = `${m[1] || ""} ${m[5] || ""}`.toLowerCase();
+    if (!rawHref) continue;
+
+    let resolved: URL;
+    try {
+      resolved = validateSafePublicUrl(new URL(rawHref, baseUrl).toString());
+    } catch {
+      continue;
+    }
+
+    const pathLower = resolved.pathname.toLowerCase();
+    const isPdfLink =
+      pathLower.endsWith(".pdf") ||
+      attrs.includes("application/pdf") ||
+      /\.pdf(\b|$)/i.test(resolved.search);
+    if (!isPdfLink) continue;
+
+    const urlStr = resolved.toString();
+    if (seen.has(urlStr)) continue;
+    seen.add(urlStr);
+
+    const text = decodeHtmlEntities((m[6] || "").replace(/<[^>]+>/g, " "))
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 140);
+    links.push({ title: text || urlStr, url: urlStr });
+    if (links.length >= 6) break;
+  }
+
+  return links;
+}
+
+async function readBytesCapped(
   response: Response,
   maxBytes: number,
-): Promise<{ text: string; capped: boolean }> {
-  if (!response.body) return { text: "", capped: false };
+): Promise<{ bytes: Uint8Array; capped: boolean }> {
+  if (!response.body) return { bytes: new Uint8Array(0), capped: false };
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -194,16 +281,533 @@ async function readBodyCapped(
     offset += chunk.byteLength;
   }
 
-  return { text: new TextDecoder("utf-8").decode(merged), capped };
+  return { bytes: merged, capped };
+}
+
+function hasPdfMagicHeader(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 5) return false;
+  // Allow tiny leading whitespace/BOM before %PDF-
+  const limit = Math.min(bytes.byteLength - 5, 32);
+  for (let i = 0; i <= limit; i++) {
+    if (
+      bytes[i] === 0x25 && // %
+      bytes[i + 1] === 0x50 && // P
+      bytes[i + 2] === 0x44 && // D
+      bytes[i + 3] === 0x46 && // F
+      bytes[i + 4] === 0x2d // -
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function parsePdfPageRange(
+  spec: string | undefined,
+  totalPages: number,
+  maxPages: number,
+): { pages: number[]; truncatedSpec: boolean } {
+  if (totalPages <= 0) {
+    return { pages: [], truncatedSpec: false };
+  }
+
+  const clean = (spec || "").trim();
+  if (!clean) {
+    const count = Math.min(totalPages, maxPages);
+    const pages: number[] = [];
+    for (let p = 1; p <= count; p++) pages.push(p);
+    return { pages, truncatedSpec: totalPages > count };
+  }
+
+  const pageSet = new Set<number>();
+  const parts = clean.split(",").map((s) => s.trim()).filter(Boolean);
+  if (parts.length === 0) {
+    throw new Error(
+      "Invalid pages range. Use formats like '1-5', '3', or '1,4-6'.",
+    );
+  }
+
+  for (const part of parts) {
+    const rangeMatch = part.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1]);
+      const end = Number(rangeMatch[2]);
+      if (
+        !Number.isInteger(start) ||
+        !Number.isInteger(end) ||
+        start < 1 ||
+        end < start
+      ) {
+        throw new Error(
+          `Invalid page range '${part}'. Start must be >= 1 and <= end.`,
+        );
+      }
+      const cappedEnd = Math.min(end, totalPages);
+      for (let p = start; p <= cappedEnd; p++) {
+        pageSet.add(p);
+        if (pageSet.size > maxPages + 1) break;
+      }
+      continue;
+    }
+
+    if (/^\d+$/.test(part)) {
+      const p = Number(part);
+      if (p < 1) {
+        throw new Error(`Invalid page number '${part}'. Pages are 1-based.`);
+      }
+      if (p <= totalPages) {
+        pageSet.add(p);
+      }
+      continue;
+    }
+
+    throw new Error(
+      `Invalid pages range '${part}'. Use formats like '1-5', '3', or '1,4-6'.`,
+    );
+  }
+
+  const sorted = Array.from(pageSet).sort((a, b) => a - b);
+  if (sorted.length === 0) {
+    throw new Error(
+      `Requested pages '${clean}' are out of range (PDF has ${totalPages} page${totalPages === 1 ? "" : "s"}).`,
+    );
+  }
+
+  const truncatedSpec = sorted.length > maxPages;
+  return {
+    pages: truncatedSpec ? sorted.slice(0, maxPages) : sorted,
+    truncatedSpec,
+  };
+}
+
+type PdfTextToken = {
+  str: string;
+  x: number;
+  y: number;
+  width: number;
+  fontSize: number;
+};
+
+/**
+ * Reconstruct readable line- and table-preserving text from PDF.js TextContent items.
+ * Groups items into visual rows by Y coordinate and inserts column separators (" | ")
+ * when horizontal gaps indicate tabular columns.
+ */
+function formatPdfPageText(items: ReadonlyArray<unknown>): string {
+  const tokens: PdfTextToken[] = [];
+
+  for (const raw of items) {
+    if (!raw || typeof raw !== "object" || !("str" in raw)) continue;
+    const item = raw as {
+      str?: unknown;
+      transform?: unknown;
+      width?: unknown;
+      height?: unknown;
+    };
+    if (typeof item.str !== "string" || !item.str.trim()) continue;
+    const tr = Array.isArray(item.transform) ? item.transform : [10, 0, 0, 10, 0, 0];
+    const a = Number(tr[0]) || 0;
+    const b = Number(tr[1]) || 0;
+    const d = Number(tr[3]) || 0;
+    const x = Number(tr[4]) || 0;
+    const y = Number(tr[5]) || 0;
+    const height = typeof item.height === "number" && item.height > 0 ? item.height : 0;
+    const fontSize = Math.hypot(a, b) || Math.abs(d) || height || 10;
+    const width =
+      typeof item.width === "number" && Number.isFinite(item.width) && item.width >= 0
+        ? item.width
+        : item.str.length * fontSize * 0.5;
+
+    tokens.push({ str: item.str, x, y, width, fontSize });
+  }
+
+  if (tokens.length === 0) return "";
+
+  // Sort top-to-bottom (PDF Y increases upward), then left-to-right
+  tokens.sort((a, b) => b.y - a.y || a.x - b.x);
+
+  type VisualRow = {
+    y: number;
+    fontSize: number;
+    items: PdfTextToken[];
+  };
+  const rows: VisualRow[] = [];
+
+  for (const tok of tokens) {
+    const lastRow = rows[rows.length - 1];
+    const tol = lastRow ? Math.max(2.5, lastRow.fontSize * 0.45) : 0;
+    if (lastRow && Math.abs(tok.y - lastRow.y) <= tol) {
+      lastRow.items.push(tok);
+    } else {
+      rows.push({ y: tok.y, fontSize: tok.fontSize, items: [tok] });
+    }
+  }
+
+  const lines: string[] = [];
+  let prevRow: VisualRow | null = null;
+
+  for (const row of rows) {
+    row.items.sort((a, b) => a.x - b.x);
+    let line = "";
+    let prev: PdfTextToken | null = null;
+
+    for (const item of row.items) {
+      if (!prev) {
+        line = item.str;
+        prev = item;
+        continue;
+      }
+
+      const gap = item.x - (prev.x + prev.width);
+      const colGap = Math.max(12, row.fontSize * 1.45);
+      const wordGap = Math.max(1.2, row.fontSize * 0.18);
+
+      if (gap > colGap && line.trim().length > 0 && item.str.trim().length > 0) {
+        line = `${line.trimEnd()}  |  ${item.str.trimStart()}`;
+      } else if (
+        gap > wordGap &&
+        !/\s$/.test(line) &&
+        !/^\s/.test(item.str)
+      ) {
+        line += ` ${item.str}`;
+      } else {
+        line += item.str;
+      }
+      prev = item;
+    }
+
+    const cleaned = line.replace(/[ \t]+$/g, "").replace(/^[ \t]+/, "");
+    if (!cleaned) continue;
+
+    if (prevRow) {
+      const yDelta = prevRow.y - row.y;
+      if (yDelta > Math.max(row.fontSize, prevRow.fontSize) * 1.95 && lines.length > 0) {
+        lines.push("");
+      }
+    }
+    lines.push(cleaned);
+    prevRow = row;
+  }
+
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function matchPdfPageQuery(
+  text: string,
+  query: string,
+): "exact_phrase" | "all_words" | null {
+  const lower = text.toLowerCase();
+  const clean = query.trim().toLowerCase();
+  if (!clean) return null;
+  if (lower.includes(clean)) return "exact_phrase";
+
+  const words = Array.from(
+    new Set(
+      clean
+        .split(/\s+/)
+        .map((w) => w.replace(/^[^a-z0-9%£$€._-]+|[^a-z0-9%£$€._-]+$/gi, ""))
+        .filter((w) => w.length >= 2),
+    ),
+  );
+  if (words.length >= 2 && words.every((w) => lower.includes(w))) {
+    return "all_words";
+  }
+  return null;
+}
+
+export async function extractPdfPages(
+  bytes: Uint8Array,
+  rawUrl: string,
+  finalUrl: string,
+  options?: WebReadOptions,
+): Promise<WebReadOutput> {
+  // Pass a fresh standalone Uint8Array copy so PDF.js's worker transfer never detaches a caller buffer.
+  const pdf = await getDocumentProxy(new Uint8Array(bytes));
+  try {
+    const totalPages = pdf.numPages;
+    const { OPS } = await getResolvedPDFJS();
+    let title = "";
+    try {
+      const meta = await getMeta(pdf);
+      if (typeof meta.info?.Title === "string") {
+        title = meta.info.Title.trim().slice(0, 160);
+      }
+    } catch {
+      // non-fatal metadata omission
+    }
+
+    const query = options?.query?.trim().slice(0, 200) || "";
+    const maxPagesToInspect = options?.pages?.trim()
+      ? query
+        ? MAX_PDF_QUERY_SCAN_PAGES
+        : MAX_PDF_EXPLICIT_PAGES
+      : query
+        ? MAX_PDF_QUERY_SCAN_PAGES
+        : MAX_PDF_DEFAULT_PAGES;
+
+    const { pages: pagesToInspect, truncatedSpec } = parsePdfPageRange(
+      options?.pages,
+      totalPages,
+      maxPagesToInspect,
+    );
+
+    const summaries: PdfPageSummary[] = [];
+    const imageOnlyPages: number[] = [];
+    const blankPages: number[] = [];
+    const noMatchPages: number[] = [];
+    const matchedPages: number[] = [];
+    const returnedPages: number[] = [];
+    const blocks: string[] = [];
+
+    let usedChars = 0;
+    let charCapped = false;
+    let lastInspectedPage = 0;
+
+    for (const pageNum of pagesToInspect) {
+      lastInspectedPage = pageNum;
+      const page = await pdf.getPage(pageNum);
+      let pageText = "";
+      let imageCount = 0;
+
+      try {
+        const textContent = await page.getTextContent();
+        pageText = formatPdfPageText(textContent.items);
+        const nonWsChars = pageText.replace(/\s+/g, "").length;
+
+        // Inspect operator list only when selectable text is absent or minimal
+        if (nonWsChars < 12) {
+          const opList = await page.getOperatorList();
+          for (const fn of opList.fnArray) {
+            if (
+              fn === OPS.paintImageXObject ||
+              fn === OPS.paintInlineImageXObject ||
+              fn === OPS.paintImageMaskXObject ||
+              fn === OPS.paintImageXObjectRepeat
+            ) {
+              imageCount++;
+            }
+          }
+        }
+      } finally {
+        page.cleanup();
+      }
+
+      const nonWsChars = pageText.replace(/\s+/g, "").length;
+
+      if (nonWsChars === 0 && imageCount === 0) {
+        blankPages.push(pageNum);
+        summaries.push({ page: pageNum, status: "blank", charCount: 0 });
+        if (!query && !charCapped) {
+          const block = `--- Page ${pageNum} / ${totalPages} ---\n[blank page: no text or images]`;
+          blocks.push(block);
+          returnedPages.push(pageNum);
+          usedChars += block.length;
+        }
+        continue;
+      }
+
+      if (nonWsChars < 12 && imageCount > 0) {
+        imageOnlyPages.push(pageNum);
+        summaries.push({
+          page: pageNum,
+          status: "image_only",
+          charCount: nonWsChars,
+          imageCount,
+        });
+        if (!query && !charCapped) {
+          const residual = pageText ? ` (minimal text: "${pageText}")` : "";
+          const block = `--- Page ${pageNum} / ${totalPages} ---\n[image-only page: no selectable text layer; ${imageCount} image(s) detected${residual}]`;
+          blocks.push(block);
+          returnedPages.push(pageNum);
+          usedChars += block.length;
+        }
+        continue;
+      }
+
+      // Page has selectable text
+      if (query) {
+        const matchType = matchPdfPageQuery(pageText, query);
+        if (!matchType) {
+          noMatchPages.push(pageNum);
+          summaries.push({
+            page: pageNum,
+            status: "no_match",
+            charCount: pageText.length,
+          });
+          continue;
+        }
+
+        matchedPages.push(pageNum);
+        if (charCapped) {
+          summaries.push({
+            page: pageNum,
+            status: "matched",
+            charCount: pageText.length,
+            matchType,
+            truncated: true,
+          });
+          continue;
+        }
+
+        const header = `--- Page ${pageNum} / ${totalPages} (matched: ${matchType}) ---\n`;
+        const remaining = MAX_PDF_TEXT_CHARS - usedChars - header.length;
+        if (remaining < 120) {
+          charCapped = true;
+          summaries.push({
+            page: pageNum,
+            status: "matched",
+            charCount: pageText.length,
+            matchType,
+            truncated: true,
+          });
+          continue;
+        }
+
+        const pageTruncated = pageText.length > remaining;
+        const body = pageTruncated
+          ? `${pageText.slice(0, remaining)}\n[page ${pageNum} truncated]`
+          : pageText;
+        blocks.push(`${header}${body}`);
+        returnedPages.push(pageNum);
+        usedChars += header.length + body.length;
+        if (pageTruncated) charCapped = true;
+        summaries.push({
+          page: pageNum,
+          status: "matched",
+          charCount: pageText.length,
+          matchType,
+          ...(pageTruncated ? { truncated: true } : {}),
+        });
+      } else {
+        if (charCapped) {
+          summaries.push({
+            page: pageNum,
+            status: "text",
+            charCount: pageText.length,
+            truncated: true,
+          });
+          continue;
+        }
+
+        const header = `--- Page ${pageNum} / ${totalPages} ---\n`;
+        const remaining = MAX_PDF_TEXT_CHARS - usedChars - header.length;
+        if (remaining < 120) {
+          charCapped = true;
+          summaries.push({
+            page: pageNum,
+            status: "text",
+            charCount: pageText.length,
+            truncated: true,
+          });
+          continue;
+        }
+
+        const pageTruncated = pageText.length > remaining;
+        const body = pageTruncated
+          ? `${pageText.slice(0, remaining)}\n[page ${pageNum} truncated]`
+          : pageText;
+        blocks.push(`${header}${body}`);
+        returnedPages.push(pageNum);
+        usedChars += header.length + body.length;
+        if (pageTruncated) charCapped = true;
+        summaries.push({
+          page: pageNum,
+          status: "text",
+          charCount: pageText.length,
+          ...(pageTruncated ? { truncated: true } : {}),
+        });
+      }
+    }
+
+    const lastReturned =
+      returnedPages.length > 0 ? returnedPages[returnedPages.length - 1]! : 0;
+    const hasMorePages =
+      charCapped || truncatedSpec || lastInspectedPage < totalPages;
+    const nextPage =
+      charCapped && lastReturned > 0 && lastReturned < totalPages
+        ? lastReturned + 1
+        : lastInspectedPage < totalPages
+          ? lastInspectedPage + 1
+          : undefined;
+
+    const statusNotes: string[] = [];
+    if (query && matchedPages.length === 0) {
+      statusNotes.push(
+        `No text pages matched "${query}" within inspected pages (${pagesToInspect[0]}–${pagesToInspect[pagesToInspect.length - 1]} of ${totalPages}).`,
+      );
+      if (noMatchPages.length > 0) {
+        statusNotes.push(
+          `Text pages without match (${noMatchPages.length}): ${noMatchPages.join(", ")}.`,
+        );
+      }
+      if (imageOnlyPages.length > 0) {
+        statusNotes.push(
+          `Image-only pages with no selectable text layer (${imageOnlyPages.length}): ${imageOnlyPages.join(", ")}.`,
+        );
+      }
+      if (blankPages.length > 0) {
+        statusNotes.push(`Blank pages (${blankPages.length}): ${blankPages.join(", ")}.`);
+      }
+    } else if (imageOnlyPages.length > 0 && query) {
+      statusNotes.push(
+        `Note: image-only pages without selectable text could not be searched: ${imageOnlyPages.join(", ")}.`,
+      );
+    }
+
+    const safeUrl = finalUrl.replaceAll('"', "&quot;");
+    const safeTitle = title.replaceAll('"', "&quot;");
+    const returnedAttr =
+      returnedPages.length > 0 ? returnedPages.join(",") : "none";
+    const untrustedLines = [
+      `<untrusted_web_page url="${safeUrl}"${safeTitle ? ` title="${safeTitle}"` : ""} content_type="application/pdf" total_pages="${totalPages}" pages_returned="${returnedAttr}">`,
+      ...(blocks.length > 0 ? [blocks.join("\n\n")] : []),
+      ...(statusNotes.length > 0 ? [statusNotes.join("\n")] : []),
+      ...(hasMorePages
+        ? [
+            `[truncated — total_pages=${totalPages}${nextPage ? `; call web_read with pages="${nextPage}-${Math.min(totalPages, nextPage + 7)}" to inspect further` : ""}]`,
+          ]
+        : []),
+      `</untrusted_web_page>`,
+    ];
+
+    return {
+      url: rawUrl,
+      finalUrl,
+      title,
+      contentType: "application/pdf",
+      truncated: hasMorePages,
+      untrustedBlock: untrustedLines.join("\n"),
+      pdf: {
+        totalPages,
+        inspectedPages: pagesToInspect,
+        returnedPages,
+        imageOnlyPages,
+        blankPages,
+        noMatchPages,
+        ...(query ? { matchedPages, query } : {}),
+        hasMorePages,
+        ...(nextPage !== undefined ? { nextPage } : {}),
+        pages: summaries,
+      },
+    };
+  } finally {
+    await pdf.loadingTask.destroy();
+  }
 }
 
 /**
- * Hardened public HTTPS page reader with SSRF protection, manual redirect validation,
- * byte/time caps, and untrusted-data XML delimiters.
+ * Hardened public HTTPS page & PDF reader with SSRF protection, manual redirect validation,
+ * byte/time caps, page-labelled PDF extraction, and untrusted-data XML delimiters.
  */
-export async function readWebPage(rawUrl: string): Promise<WebReadOutput> {
+export async function readWebPage(
+  rawUrl: string,
+  options?: WebReadOptions,
+): Promise<WebReadOutput> {
   let currentUrl = validateSafePublicUrl(rawUrl);
   let response: Response | null = null;
+  const looksLikePdfUrl =
+    currentUrl.pathname.toLowerCase().endsWith(".pdf") ||
+    Boolean(options?.pages || options?.query);
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const res = await fetch(currentUrl.toString(), {
@@ -211,9 +815,12 @@ export async function readWebPage(rawUrl: string): Promise<WebReadOutput> {
       redirect: "manual",
       headers: {
         "User-Agent": "BlueSignalAgent/1.0 (+https://blue-forum.local)",
-        Accept: "text/html,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.1",
+        Accept:
+          "text/html,application/pdf,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.1",
       },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      signal: AbortSignal.timeout(
+        looksLikePdfUrl ? PDF_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS,
+      ),
     });
 
     if (res.status >= 300 && res.status < 400) {
@@ -245,20 +852,72 @@ export async function readWebPage(rawUrl: string): Promise<WebReadOutput> {
     .trim()
     .toLowerCase();
 
-  if (!ALLOWED_CONTENT_TYPES.some((allowed) => rawContentType === allowed)) {
+  const isExplicitPdf = rawContentType === "application/pdf";
+  const isPotentialPdfOctet =
+    (rawContentType === "application/octet-stream" ||
+      rawContentType === "binary/octet-stream") &&
+    currentUrl.pathname.toLowerCase().endsWith(".pdf");
+
+  if (isExplicitPdf || isPotentialPdfOctet) {
+    const contentLengthHeader = response.headers.get("Content-Length");
+    if (contentLengthHeader && /^\d+$/.test(contentLengthHeader)) {
+      const reportedBytes = Number(contentLengthHeader);
+      if (reportedBytes > MAX_PDF_READ_BYTES) {
+        const mb = (reportedBytes / (1024 * 1024)).toFixed(1);
+        throw new Error(
+          `PDF exceeds maximum allowed size (${MAX_PDF_READ_BYTES / (1024 * 1024)} MB; server reported ${mb} MB).`,
+        );
+      }
+    }
+
+    const { bytes, capped } = await readBytesCapped(response, MAX_PDF_READ_BYTES);
+    if (capped) {
+      throw new Error(
+        `PDF exceeds maximum allowed size (${MAX_PDF_READ_BYTES / (1024 * 1024)} MB).`,
+      );
+    }
+    if (!hasPdfMagicHeader(bytes)) {
+      throw new Error(
+        "Response declared PDF/binary content but does not contain a valid %PDF header.",
+      );
+    }
+    return extractPdfPages(bytes, rawUrl, currentUrl.toString(), options);
+  }
+
+  if (
+    !ALLOWED_TEXT_CONTENT_TYPES.some((allowed) => rawContentType === allowed)
+  ) {
     throw new Error(`Unsupported Content-Type: ${rawContentType}`);
   }
 
-  const { text: rawBody, capped } = await readBodyCapped(response, MAX_READ_BYTES);
+  const { bytes, capped } = await readBytesCapped(response, MAX_READ_BYTES);
+  // Some misconfigured servers serve PDFs with text/plain header; catch via %PDF- magic bytes
+  if (!capped && hasPdfMagicHeader(bytes)) {
+    return extractPdfPages(bytes, rawUrl, currentUrl.toString(), options);
+  }
+
+  const rawBody = new TextDecoder("utf-8").decode(bytes);
   const { title, text } = extractReadableText(rawBody, rawContentType);
+  const pdfLinks = rawContentType.includes("html")
+    ? extractPdfLinksFromHtml(rawBody, currentUrl)
+    : [];
   const truncated = capped || text.length > MAX_TEXT_CHARS;
   const snippet = text.slice(0, MAX_TEXT_CHARS);
 
   const safeUrl = currentUrl.toString().replaceAll('"', "&quot;");
   const safeTitle = title.replaceAll('"', "&quot;");
+  const pdfLinkBlock =
+    pdfLinks.length > 0
+      ? [
+          "",
+          "Linked PDFs on this page (you can pass these directly to web_read):",
+          ...pdfLinks.map((l, i) => `${i + 1}. ${l.title} — ${l.url}`),
+        ].join("\n")
+      : "";
   const untrustedBlock = [
     `<untrusted_web_page url="${safeUrl}"${safeTitle ? ` title="${safeTitle}"` : ""}>`,
     snippet || "(no readable text extracted)",
+    pdfLinkBlock,
     truncated ? "\n[truncated]" : "",
     `</untrusted_web_page>`,
   ]
@@ -272,6 +931,7 @@ export async function readWebPage(rawUrl: string): Promise<WebReadOutput> {
     contentType: rawContentType,
     truncated,
     untrustedBlock,
+    ...(pdfLinks.length > 0 ? { pdfLinks } : {}),
   };
 }
 

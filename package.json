@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@webtui/css": "^0.1.10",
-    "@webtui/theme-catppuccin": "^0.0.5"
+    "@webtui/theme-catppuccin": "^0.0.5",
+    "unpdf": "^2.2.1"
   }
 }

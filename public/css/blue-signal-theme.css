@@ -459,9 +459,46 @@
   }
 
   .post-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1ch;
+    flex-wrap: wrap;
     margin: 0 0 0.5lh;
     font-size: 13px;
     color: var(--muted);
+  }
+
+  .post-permalink {
+    color: var(--crystal);
+    text-decoration: none;
+  }
+
+  .post-permalink:hover,
+  .post-permalink:focus-visible {
+    color: var(--ice);
+    text-decoration: underline;
+  }
+
+  .post-copy-ref {
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 11px;
+    padding: 0 0.5ch;
+    cursor: pointer;
+    letter-spacing: 0.03em;
+  }
+
+  .post-copy-ref:hover,
+  .post-copy-ref:focus-visible {
+    border-color: var(--line-active);
+    color: var(--crystal);
+  }
+
+  .post-copy-ref.is-copied {
+    color: var(--signal);
   }
 
   .post-body {

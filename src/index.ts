@@ -812,7 +812,9 @@ export default {
       const isPublicRead =
         request.method === "GET" &&
         (url.pathname === "/api/threads" ||
-          /^\/api\/threads\/\d+$/.test(url.pathname));
+          /^\/api\/threads\/\d+$/.test(url.pathname) ||
+          /^\/api\/posts\/\d+$/.test(url.pathname) ||
+          url.pathname === "/api/search");
 
       if (!isPublicRead && !isOwner) {
         if (!ownerKey) {

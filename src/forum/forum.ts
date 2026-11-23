@@ -7,6 +7,9 @@ import type {
   PersonaSummary,
   Post,
   PostMeta,
+  PostReferenceDetail,
+  PostSearchHit,
+  PostSearchResult,
   ThreadDetail,
   ThreadSummary,
   User,
@@ -15,6 +18,7 @@ import type {
 import {
   agentUserId,
   extractMentions,
+  formatPostRef,
   isValidHandle,
   makeDmKey,
   normalizeHandle,
@@ -1808,6 +1812,299 @@ export class Forum extends DurableObject<ForumEnv> {
     );
   }
 
+  // ——— Direct post lookup & quote/phrase search ———
+
+  private buildSearchExcerpt(body: string, needle: string): string {
+    const collapsed = body.replace(/\s+/g, " ").trim();
+    if (collapsed.length <= 260) return collapsed;
+    const lower = collapsed.toLowerCase();
+    let idx = lower.indexOf(needle.toLowerCase());
+    if (idx < 0) {
+      const firstWord = needle
+        .toLowerCase()
+        .split(/\s+/)
+        .find((w) => w.length >= 2);
+      if (firstWord) idx = lower.indexOf(firstWord);
+    }
+    if (idx < 0) {
+      return `${collapsed.slice(0, 250)}…`;
+    }
+    const start = Math.max(0, idx - 80);
+    const end = Math.min(collapsed.length, start + 260);
+    const prefix = start > 0 ? "…" : "";
+    const suffix = end < collapsed.length ? "…" : "";
+    return `${prefix}${collapsed.slice(start, end)}${suffix}`;
+  }
+
+  getPost(
+    postId: number,
+    viewerId: string,
+    opts?: { expectedThreadId?: number | null; contextWindow?: number },
+  ): PostReferenceDetail | null {
+    if (!Number.isInteger(postId) || postId <= 0) return null;
+
+    const row = this.sql
+      .exec<
+        PostRow & {
+          threadTitle: string;
+          board: BoardKind;
+        }
+      >(
+        `SELECT
+           p.id AS id,
+           p.thread_id AS threadId,
+           p.body AS body,
+           p.user_id AS authorId,
+           u.name AS authorName,
+           u.kind AS authorKind,
+           p.created_at AS createdAt,
+           p.meta_json AS metaJson,
+           t.title AS threadTitle,
+           t.board AS board
+         FROM posts p
+         JOIN threads t ON t.id = p.thread_id
+         JOIN users u ON u.id = p.user_id
+         WHERE p.id = ?
+         LIMIT 1`,
+        postId,
+      )
+      .toArray()[0];
+
+    if (!row) return null;
+
+    if (row.board === "messages") {
+      if (viewerId === "__guest__" || !this.isParticipant(row.threadId, viewerId)) {
+        return null;
+      }
+    }
+
+    const windowSize = Math.max(0, Math.min(3, Math.round(opts?.contextWindow ?? 0)));
+    let contextBefore: Post[] = [];
+    let contextAfter: Post[] = [];
+
+    if (windowSize > 0) {
+      const beforeRows = this.sql
+        .exec<PostRow>(
+          `SELECT * FROM (
+             SELECT
+               p.id AS id,
+               p.thread_id AS threadId,
+               p.body AS body,
+               p.user_id AS authorId,
+               u.name AS authorName,
+               u.kind AS authorKind,
+               p.created_at AS createdAt,
+               p.meta_json AS metaJson
+             FROM posts p
+             JOIN users u ON u.id = p.user_id
+             WHERE p.thread_id = ? AND p.id < ?
+             ORDER BY p.id DESC
+             LIMIT ?
+           ) ORDER BY id ASC`,
+          row.threadId,
+          row.id,
+          windowSize,
+        )
+        .toArray();
+      contextBefore = beforeRows.map(mapPostRow);
+
+      const afterRows = this.sql
+        .exec<PostRow>(
+          `SELECT
+             p.id AS id,
+             p.thread_id AS threadId,
+             p.body AS body,
+             p.user_id AS authorId,
+             u.name AS authorName,
+             u.kind AS authorKind,
+             p.created_at AS createdAt,
+             p.meta_json AS metaJson
+           FROM posts p
+           JOIN users u ON u.id = p.user_id
+           WHERE p.thread_id = ? AND p.id > ?
+           ORDER BY p.id ASC
+           LIMIT ?`,
+          row.threadId,
+          row.id,
+          windowSize,
+        )
+        .toArray();
+      contextAfter = afterRows.map(mapPostRow);
+    }
+
+    const expected = opts?.expectedThreadId ?? null;
+    const requestedThreadMismatch = Boolean(
+      expected !== null && expected > 0 && expected !== row.threadId,
+    );
+
+    return {
+      post: mapPostRow(row),
+      ref: formatPostRef(row.threadId, row.id),
+      threadId: row.threadId,
+      threadTitle: row.threadTitle,
+      board: row.board,
+      requestedThreadMismatch,
+      contextBefore,
+      contextAfter,
+    };
+  }
+
+  searchPosts(
+    viewerId: string,
+    params: {
+      query: string;
+      threadId?: number;
+      author?: string;
+      exact?: boolean;
+      limit?: number;
+    },
+  ): PostSearchResult {
+    const query = params.query.trim().slice(0, 200);
+    if (query.length < 2) {
+      return { query, matchMode: "exact_phrase", hits: [] };
+    }
+
+    const limit = Math.max(1, Math.min(25, Math.round(params.limit ?? 10)));
+    const threadId =
+      typeof params.threadId === "number" &&
+      Number.isInteger(params.threadId) &&
+      params.threadId > 0
+        ? params.threadId
+        : null;
+    const author = params.author
+      ? normalizeHandle(params.author)
+      : "";
+
+    // Enforce privacy: search public /general threads, OR an explicit DM thread if viewer is a participant.
+    let allowDmThread = false;
+    if (threadId !== null) {
+      const tRow = this.sql
+        .exec<{ board: BoardKind }>(`SELECT board FROM threads WHERE id = ?`, threadId)
+        .toArray()[0];
+      if (!tRow) {
+        return { query, matchMode: "exact_phrase", hits: [] };
+      }
+      if (tRow.board === "messages") {
+        if (viewerId === "__guest__" || !this.isParticipant(threadId, viewerId)) {
+          return { query, matchMode: "exact_phrase", hits: [] };
+        }
+        allowDmThread = true;
+      }
+    }
+
+    const runQuery = (terms: string[]): PostSearchHit[] => {
+      const clauses: string[] = [];
+      const bindings: Array<string | number> = [];
+
+      if (threadId !== null) {
+        clauses.push(`p.thread_id = ?`);
+        bindings.push(threadId);
+        if (!allowDmThread) {
+          clauses.push(`t.board = 'general'`);
+        }
+      } else {
+        clauses.push(`t.board = 'general'`);
+      }
+
+      if (author) {
+        clauses.push(`LOWER(u.name) = ?`);
+        bindings.push(author);
+      }
+
+      for (const term of terms) {
+        clauses.push(`INSTR(LOWER(p.body), LOWER(?)) > 0`);
+        bindings.push(term);
+      }
+
+      bindings.push(limit);
+
+      const rows = this.sql
+        .exec<{
+          postId: number;
+          threadId: number;
+          threadTitle: string;
+          board: BoardKind;
+          authorName: string;
+          createdAt: string;
+          body: string;
+        }>(
+          `SELECT
+             p.id AS postId,
+             p.thread_id AS threadId,
+             t.title AS threadTitle,
+             t.board AS board,
+             u.name AS authorName,
+             p.created_at AS createdAt,
+             p.body AS body
+           FROM posts p
+           JOIN threads t ON t.id = p.thread_id
+           JOIN users u ON u.id = p.user_id
+           WHERE ${clauses.join(" AND ")}
+           ORDER BY p.id DESC
+           LIMIT ?`,
+          ...bindings,
+        )
+        .toArray();
+
+      return rows.map((r) => ({
+        postId: r.postId,
+        threadId: r.threadId,
+        threadTitle: r.threadTitle,
+        board: r.board,
+        authorName: r.authorName,
+        createdAt: r.createdAt,
+        ref: formatPostRef(r.threadId, r.postId),
+        excerpt: this.buildSearchExcerpt(r.body, query),
+        body: r.body.length > 1200 ? `${r.body.slice(0, 1200)}…` : r.body,
+      }));
+    };
+
+    const exactHits = runQuery([query]);
+    if (exactHits.length > 0 || params.exact) {
+      return { query, matchMode: "exact_phrase", hits: exactHits };
+    }
+
+    const tokens = Array.from(
+      new Set(
+        query
+          .toLowerCase()
+          .split(/\s+/)
+          .map((w) => w.replace(/^[^a-z0-9@#_-]+|[^a-z0-9@#_-]+$/gi, ""))
+          .filter((w) => w.length >= 2),
+      ),
+    ).slice(0, 6);
+
+    if (tokens.length >= 2) {
+      const wordHits = runQuery(tokens);
+      if (wordHits.length > 0) {
+        return { query, matchMode: "all_words", hits: wordHits };
+      }
+    }
+
+    return { query, matchMode: "exact_phrase", hits: [] };
+  }
+
+  async getPostForAgent(
+    agentName: string,
+    postId: number,
+    opts?: { expectedThreadId?: number | null; contextWindow?: number },
+  ): Promise<PostReferenceDetail | null> {
+    return this.getPost(postId, agentUserId(agentName), opts);
+  }
+
+  async searchPostsForAgent(
+    agentName: string,
+    params: {
+      query: string;
+      threadId?: number;
+      author?: string;
+      exact?: boolean;
+      limit?: number;
+    },
+  ): Promise<PostSearchResult> {
+    return this.searchPosts(agentUserId(agentName), params);
+  }
+
   // ——— HTTP handler for browser /api/* requests ———
 
   override async fetch(request: Request): Promise<Response> {
@@ -1854,6 +2151,50 @@ export class Forum extends DurableObject<ForumEnv> {
           unreadMessages: actor ? this.countUnreadMessages(actor.id) : 0,
           ...(actor ? { personas: this.listPersonas(ownerHandle) } : {}),
         });
+      }
+
+      const postMatch = url.pathname.match(/^\/posts\/(\d+)$/);
+      if (request.method === "GET" && postMatch) {
+        const actor = isReadOnly ? null : ensureActor(false);
+        const viewerId = actor ? actor.id : "__guest__";
+        const expectedThreadParam = url.searchParams.get("threadId");
+        const contextParam = url.searchParams.get("context");
+        const detail = this.getPost(Number(postMatch[1]), viewerId, {
+          expectedThreadId:
+            expectedThreadParam && /^\d+$/.test(expectedThreadParam)
+              ? Number(expectedThreadParam)
+              : null,
+          contextWindow:
+            contextParam && /^\d+$/.test(contextParam)
+              ? Number(contextParam)
+              : 0,
+        });
+        if (!detail) {
+          return Response.json({ error: "Post not found" }, { status: 404 });
+        }
+        return Response.json(detail);
+      }
+
+      if (request.method === "GET" && url.pathname === "/search") {
+        const actor = isReadOnly ? null : ensureActor(false);
+        const viewerId = actor ? actor.id : "__guest__";
+        const q = url.searchParams.get("q") || "";
+        const threadParam = url.searchParams.get("threadId");
+        const limitParam = url.searchParams.get("limit");
+        const result = this.searchPosts(viewerId, {
+          query: q,
+          threadId:
+            threadParam && /^\d+$/.test(threadParam)
+              ? Number(threadParam)
+              : undefined,
+          author: url.searchParams.get("author") || undefined,
+          exact: url.searchParams.get("exact") === "1",
+          limit:
+            limitParam && /^\d+$/.test(limitParam)
+              ? Number(limitParam)
+              : undefined,
+        });
+        return Response.json(result);
       }
 
       if (isReadOnly) {

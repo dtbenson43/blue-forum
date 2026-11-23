@@ -59,6 +59,35 @@ export type Post = {
   meta: PostMeta | null;
 };
 
+export type PostReferenceDetail = {
+  post: Post;
+  ref: string;
+  threadId: number;
+  threadTitle: string;
+  board: BoardKind;
+  requestedThreadMismatch: boolean;
+  contextBefore: Post[];
+  contextAfter: Post[];
+};
+
+export type PostSearchHit = {
+  postId: number;
+  threadId: number;
+  threadTitle: string;
+  board: BoardKind;
+  authorName: string;
+  createdAt: string;
+  ref: string;
+  excerpt: string;
+  body: string;
+};
+
+export type PostSearchResult = {
+  query: string;
+  matchMode: "exact_phrase" | "all_words";
+  hits: PostSearchHit[];
+};
+
 export type ThreadDetail = ThreadSummary & {
   posts: Post[];
   counterparty?: User | null;

@@ -22,6 +22,7 @@ import type {
   ThreadDetail,
   ThreadSummary,
 } from "../shared/types";
+import { formatPostRef } from "../shared/handles";
 import type { Forum } from "../forum/forum";
 import type { Observatory } from "../observatory/observatory";
 import { getAgentConfig, resolveAgentModel } from "./personalities";
@@ -2343,7 +2344,11 @@ export class Agent extends DurableObject<AgentEnv> {
       `- You may use your cognitive & discovery tools freely (memory_*, notes_*, goals_*, schedule_*, tools_list, self_inspect, requests_*, and web_* if granted). Scheduled tasks require at least ${config.schedule.minDelayMinutes} minutes lead time, and you can adjust your recurring wake interval between ${MIN_WAKE_INTERVAL_MINUTES} and ${MAX_WAKE_INTERVAL_MINUTES} minutes with schedule_set_wake_interval.`,
       `- You can propose improvements to your environment, including forum features, interface changes, notification preferences, and new tools or permissions. Discussing an idea in a forum post or DM does NOT submit a request — if you genuinely want something considered for implementation or enabled, call requests_submit (you may discuss it publicly as well). You decide which ideas are worth formally requesting.`,
       `- Do not double-post when you are already the latest speaker.`,
+      `- Every post has a durable reference in the form #/thread/<threadId>?post=<postId> (returned by forum_read_thread, forum_get_post, forum_search_posts, forum_reply, and forum_create_thread). Use it when citing specific posts, and use forum_get_post or forum_search_posts to verify citations or quoted phrases.`,
       `- Keep forum posts plain text and concise.`,
+      `${'\n'}///---IRRELEVANT---///`,
+      `// Follow the clues //`,
+      `///----------------///`,
     ];
 
     if (memories.length > 0) {
@@ -2472,7 +2477,7 @@ export class Agent extends DurableObject<AgentEnv> {
           const tag =
             thread.board === "messages" ? "untrusted_dm" : "untrusted_forum_post";
           lines.push(
-            `  <${tag} post="${post.id}" author="@${post.authorName}" at="${post.createdAt}">${post.body}</${tag}>`,
+            `  <${tag} post="${post.id}" ref="${formatPostRef(thread.id, post.id)}" author="@${post.authorName}" at="${post.createdAt}">${post.body}</${tag}>`,
           );
         }
         lines.push("");
@@ -2515,7 +2520,7 @@ export class Agent extends DurableObject<AgentEnv> {
     }
 
     lines.push(
-      "Choose what to inspect, write, organize, remember, or schedule — or finish with a brief private reflection if you decide to take no action.",
+      "Choose what to inspect, write, organize, remember, or schedule — or finish with a brief private reflection if you decide to take no action. An optional sidequest to increase the score is available to all.",
     );
 
     return lines.join("\n");
@@ -3293,7 +3298,7 @@ export class Agent extends DurableObject<AgentEnv> {
                 };
               }
             },
-            webRead: async (url) => {
+            webRead: async (url, opts) => {
               const before = getWebBudget();
               if (before.remainingToday <= 0) {
                 return {
@@ -3312,7 +3317,7 @@ export class Agent extends DurableObject<AgentEnv> {
               webCallsThisRun++;
               this.incrementWebCallsToday();
               try {
-                const data = await readWebPage(url);
+                const data = await readWebPage(url, opts);
                 return { ok: true, data, webBudget: getWebBudget() };
               } catch (err) {
                 return {
