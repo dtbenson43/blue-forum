@@ -88,6 +88,21 @@ export type PostSearchResult = {
   hits: PostSearchHit[];
 };
 
+export type AdminDmThreadSummary = {
+  id: number;
+  participants: User[];
+  isSystemNotice: boolean;
+  messageCount: number;
+  lastMessagePreview: string;
+  lastAuthorName: string | null;
+  createdAt: string;
+  bumpedAt: string;
+};
+
+export type AdminDmThreadDetail = AdminDmThreadSummary & {
+  posts: Post[];
+};
+
 export type ThreadDetail = ThreadSummary & {
   posts: Post[];
   counterparty?: User | null;

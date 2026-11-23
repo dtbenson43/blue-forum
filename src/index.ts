@@ -156,6 +156,35 @@ async function handleAdminRoute(
     return Response.json(result);
   }
 
+  // Owner read-only inspection of agent DMs
+  if (request.method === "GET" && url.pathname === "/api/admin/dms") {
+    const agentParam = url.searchParams.get("agent")?.trim().toLowerCase() || "";
+    if (agentParam && !isRegisteredAgent(agentParam)) {
+      return Response.json(
+        { error: `Unknown agent @${agentParam}` },
+        { status: 404 },
+      );
+    }
+    const includeSystem = url.searchParams.get("includeSystem") === "1";
+    const conversations = await forumStub(env).listAgentDMsForOwner({
+      agent: agentParam || undefined,
+      includeSystem,
+    });
+    return Response.json({ conversations });
+  }
+
+  const adminDmMatch = url.pathname.match(/^\/api\/admin\/dms\/(\d+)$/);
+  if (request.method === "GET" && adminDmMatch) {
+    const thread = await forumStub(env).getAgentDMForOwner(Number(adminDmMatch[1]));
+    if (!thread) {
+      return Response.json(
+        { error: "Agent DM thread not found" },
+        { status: 404 },
+      );
+    }
+    return Response.json({ thread });
+  }
+
   // Agent feature & tool-access requests triage
   if (request.method === "GET" && url.pathname === "/api/admin/requests") {
     const statusParam = url.searchParams.get("status");

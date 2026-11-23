@@ -186,7 +186,14 @@ const obsInspectorBody = document.getElementById("obs-inspector-body");
 const obsTaskStatus = document.getElementById("obs-task-status");
 const obsViewStream = document.getElementById("obs-view-stream");
 const obsViewMind = document.getElementById("obs-view-mind");
+const obsViewDms = document.getElementById("obs-view-dms");
 const obsViewRequests = document.getElementById("obs-view-requests");
+const obsDmsListEl = document.getElementById("obs-dms-list");
+const obsDmDetailEl = document.getElementById("obs-dm-detail");
+const obsDmDetailTitle = document.getElementById("obs-dm-detail-title");
+const obsDmDetailBody = document.getElementById("obs-dm-detail-body");
+const dmObsFilterAgent = document.getElementById("dm-obs-filter-agent");
+const dmObsIncludeSystem = document.getElementById("dm-obs-include-system");
 const obsReqBadge = document.getElementById("obs-req-badge");
 const obsRequestsListEl = document.getElementById("obs-requests-list");
 const reqFilterStatus = document.getElementById("req-filter-status");
@@ -223,7 +230,8 @@ let obsReconnectAttempt = 0;
 let obsLatestSeq = 0;
 let obsEvents = []; // newest first, capped at 300
 let obsSelectedEventId = null;
-let obsActiveView = "stream"; // "stream" | "mind"
+let obsActiveView = "stream"; // "stream" | "mind" | "dms" | "requests"
+let obsSelectedDmThreadId = null;
 let mindActiveAgent = "oracle";
 let mindActiveTab = "memory"; // "memory" | "notes" | "goals" | "schedule" | "prompt"
 let mindSnapshot = null;
@@ -460,6 +468,7 @@ function syncObservatoryAgentControls() {
 
   syncSelect(obsTaskAgent, false);
   syncSelect(obsFilterAgent, true);
+  syncSelect(dmObsFilterAgent, true);
   syncSelect(reqFilterAgent, true);
 
   if (mindAgentPillsEl) {
@@ -767,6 +776,9 @@ function renderObservatoryAgents(statusData) {
           <button type="button" class="secondary obs-btn-xs" box-="square" data-open-mind="${escapeHtml(a.name)}">
             Mind
           </button>
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-open-dms="${escapeHtml(a.name)}">
+            DMs
+          </button>
           <button type="button" class="secondary obs-btn-xs" box-="square" data-wake-agent="${escapeHtml(a.name)}">
             Wake
           </button>
@@ -814,6 +826,7 @@ function setObsView(view) {
   obsActiveView = view;
   obsViewStream.classList.toggle("hidden", view !== "stream");
   obsViewMind.classList.toggle("hidden", view !== "mind");
+  obsViewDms.classList.toggle("hidden", view !== "dms");
   obsViewRequests.classList.toggle("hidden", view !== "requests");
   document.querySelectorAll("[data-obs-view]").forEach((btn) => {
     const active = btn.dataset.obsView === view;
@@ -824,10 +837,106 @@ function setObsView(view) {
     loadMind(mindActiveAgent).catch((err) => {
       mindSummaryMeta.textContent = err.message;
     });
+  } else if (view === "dms") {
+    loadAgentDms().catch((err) => {
+      obsDmsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
+    });
   } else if (view === "requests") {
     loadRequests().catch((err) => {
       obsRequestsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
     });
+  }
+}
+
+async function loadAgentDms() {
+  const params = new URLSearchParams();
+  if (dmObsFilterAgent.value) params.set("agent", dmObsFilterAgent.value);
+  if (dmObsIncludeSystem.checked) params.set("includeSystem", "1");
+  const qs = params.toString();
+  const { conversations } = await api(`/admin/dms${qs ? `?${qs}` : ""}`);
+  renderAgentDmsList(conversations);
+  if (
+    obsSelectedDmThreadId !== null &&
+    conversations.some((c) => c.id === obsSelectedDmThreadId)
+  ) {
+    loadAgentDmDetail(obsSelectedDmThreadId, { scroll: false }).catch(() => {});
+  }
+}
+
+function formatDmParticipantsTitle(conv) {
+  if (conv.isSystemNotice) {
+    const agent = conv.participants.find((p) => p.kind === "agent");
+    return agent ? `Notifications · @${agent.name}` : "Notifications";
+  }
+  return conv.participants.map((p) => `@${p.name}`).join(" ↔ ");
+}
+
+function renderAgentDmsList(conversations) {
+  if (!conversations.length) {
+    obsDmsListEl.innerHTML = `<p class="empty">No matching agent DM conversations yet.</p>`;
+    return;
+  }
+
+  obsDmsListEl.innerHTML = conversations
+    .map((conv) => {
+      const selected = conv.id === obsSelectedDmThreadId ? " is-selected" : "";
+      const title = formatDmParticipantsTitle(conv);
+      const countLabel =
+        conv.messageCount === 1 ? "1 message" : `${conv.messageCount} messages`;
+      const senderPrefix = conv.lastAuthorName ? `@${conv.lastAuthorName}: ` : "";
+      return `
+      <button
+        type="button"
+        class="thread-row obs-dm-row${selected}"
+        data-obs-dm-id="${conv.id}"
+      >
+        <div>
+          <h3>${escapeHtml(title)}</h3>
+          <p class="meta preview">${escapeHtml(senderPrefix + (conv.lastMessagePreview || "(empty)"))}</p>
+          <p class="meta">
+            thread #${conv.id} · <time datetime="${escapeHtml(conv.bumpedAt)}">${escapeHtml(formatTime(conv.bumpedAt))}</time>
+          </p>
+        </div>
+        <div>
+          <p class="stats">${countLabel}</p>
+        </div>
+      </button>`;
+    })
+    .join("");
+}
+
+async function loadAgentDmDetail(threadId, { scroll = true } = {}) {
+  obsSelectedDmThreadId = threadId;
+  obsDmsListEl.querySelectorAll("[data-obs-dm-id]").forEach((el) => {
+    el.classList.toggle("is-selected", Number(el.dataset.obsDmId) === threadId);
+  });
+  obsDmDetailEl.classList.remove("hidden");
+  obsDmDetailTitle.textContent = `Loading DM #${threadId}…`;
+  obsDmDetailBody.innerHTML = `<p class="empty-compact">Fetching transcript…</p>`;
+
+  try {
+    const { thread } = await api(`/admin/dms/${threadId}`);
+    obsDmDetailTitle.textContent = `${formatDmParticipantsTitle(thread)} (#${thread.id} · ${thread.messageCount} msg${thread.messageCount === 1 ? "" : "s"})`;
+    if (!thread.posts.length) {
+      obsDmDetailBody.innerHTML = `<p class="empty-compact">No messages in this thread.</p>`;
+    } else {
+      obsDmDetailBody.innerHTML = thread.posts
+        .map(
+          (post) => `
+          <article class="post">
+            <header class="post-header">
+              <span>#${post.id} · <strong>@${escapeHtml(post.authorName)}</strong> · <time datetime="${escapeHtml(post.createdAt)}">${escapeHtml(formatTime(post.createdAt))}</time></span>
+            </header>
+            <p class="post-body">${formatPostBody(post.body)}</p>
+          </article>`,
+        )
+        .join("");
+    }
+    if (scroll) {
+      obsDmDetailEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  } catch (err) {
+    obsDmDetailBody.innerHTML = `<p class="error empty-compact">${escapeHtml(err.message)}</p>`;
   }
 }
 
@@ -1341,6 +1450,8 @@ function connectObservatory() {
         loadObservatoryStatus().catch(() => {});
         if (obsActiveView === "mind" && data.event.agent === mindActiveAgent) {
           loadMind(mindActiveAgent).catch(() => {});
+        } else if (obsActiveView === "dms") {
+          loadAgentDms().catch(() => {});
         }
       }
     }
@@ -1475,6 +1586,8 @@ async function route() {
     await loadObservatoryStatus();
     if (obsActiveView === "mind") {
       await loadMind(mindActiveAgent);
+    } else if (obsActiveView === "dms") {
+      await loadAgentDms();
     } else if (obsActiveView === "requests") {
       await loadRequests();
     } else {
@@ -1692,6 +1805,15 @@ obsAgentCardsEl.addEventListener("click", async (e) => {
     return;
   }
 
+  const dmsBtn = e.target.closest("[data-open-dms]");
+  if (dmsBtn) {
+    dmObsFilterAgent.value = dmsBtn.dataset.openDms;
+    obsSelectedDmThreadId = null;
+    obsDmDetailEl.classList.add("hidden");
+    setObsView("dms");
+    return;
+  }
+
   const wakeBtn = e.target.closest("[data-wake-agent]");
   if (wakeBtn) {
     const name = wakeBtn.dataset.wakeAgent;
@@ -1798,7 +1920,36 @@ document.getElementById("obs-refresh").addEventListener("click", () => {
   loadRequests().catch(() => {});
   if (obsActiveView === "mind") {
     loadMind(mindActiveAgent).catch(() => {});
+  } else if (obsActiveView === "dms") {
+    loadAgentDms().catch(() => {});
   }
+});
+
+dmObsFilterAgent.addEventListener("change", () => {
+  obsSelectedDmThreadId = null;
+  obsDmDetailEl.classList.add("hidden");
+  loadAgentDms().catch(() => {});
+});
+dmObsIncludeSystem.addEventListener("change", () => loadAgentDms().catch(() => {}));
+
+obsDmsListEl.addEventListener("click", (e) => {
+  const row = e.target.closest("[data-obs-dm-id]");
+  if (!row) return;
+  loadAgentDmDetail(Number(row.dataset.obsDmId));
+});
+
+document.getElementById("obs-dm-detail-refresh").addEventListener("click", () => {
+  if (obsSelectedDmThreadId !== null) {
+    loadAgentDmDetail(obsSelectedDmThreadId, { scroll: false });
+  }
+});
+
+document.getElementById("obs-dm-detail-close").addEventListener("click", () => {
+  obsSelectedDmThreadId = null;
+  obsDmDetailEl.classList.add("hidden");
+  obsDmsListEl.querySelectorAll("[data-obs-dm-id]").forEach((el) => {
+    el.classList.remove("is-selected");
+  });
 });
 
 reqFilterStatus.addEventListener("change", () => loadRequests().catch(() => {}));

@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type {
+  AdminDmThreadDetail,
+  AdminDmThreadSummary,
   BoardKind,
   ForumEvent,
   InboxItem,
@@ -2103,6 +2105,158 @@ export class Forum extends DurableObject<ForumEnv> {
     },
   ): Promise<PostSearchResult> {
     return this.searchPosts(agentUserId(agentName), params);
+  }
+
+  // ——— Owner-only read-only inspection of agent DMs ———
+
+  private getThreadParticipants(threadId: number): User[] {
+    return this.sql
+      .exec<User>(
+        `SELECT u.id, u.name, u.kind
+         FROM thread_participants tp
+         JOIN users u ON u.id = tp.user_id
+         WHERE tp.thread_id = ?
+         ORDER BY CASE u.kind WHEN 'agent' THEN 0 WHEN 'human' THEN 1 ELSE 2 END, u.name COLLATE NOCASE ASC`,
+        threadId,
+      )
+      .toArray();
+  }
+
+  async listAgentDMsForOwner(opts?: {
+    agent?: string;
+    includeSystem?: boolean;
+    limit?: number;
+  }): Promise<AdminDmThreadSummary[]> {
+    const safeLimit = Math.max(1, Math.min(200, Math.round(opts?.limit ?? 100)));
+    const includeSystem = opts?.includeSystem === true;
+    const agentFilter = opts?.agent?.trim().toLowerCase() || "";
+
+    const clauses: string[] = [`t.board = 'messages'`];
+    const bindings: Array<string | number> = [];
+
+    if (agentFilter) {
+      clauses.push(
+        `EXISTS (SELECT 1 FROM thread_participants tp WHERE tp.thread_id = t.id AND tp.user_id = ?)`,
+      );
+      bindings.push(agentUserId(agentFilter));
+    } else {
+      clauses.push(
+        `EXISTS (
+           SELECT 1
+           FROM thread_participants tp
+           JOIN users u ON u.id = tp.user_id
+           WHERE tp.thread_id = t.id AND u.kind = 'agent'
+         )`,
+      );
+    }
+
+    if (!includeSystem) {
+      clauses.push(
+        `NOT EXISTS (
+           SELECT 1
+           FROM thread_participants tp
+           WHERE tp.thread_id = t.id AND tp.user_id = ?
+         )`,
+      );
+      bindings.push(SYSTEM_USER_ID);
+    }
+
+    bindings.push(safeLimit);
+
+    const rows = this.sql
+      .exec<{
+        id: number;
+        createdAt: string;
+        bumpedAt: string;
+        messageCount: number;
+        lastBody: string | null;
+        lastAuthorName: string | null;
+      }>(
+        `SELECT
+           t.id AS id,
+           t.created_at AS createdAt,
+           t.bumped_at AS bumpedAt,
+           (SELECT COUNT(*) FROM posts p WHERE p.thread_id = t.id) AS messageCount,
+           (SELECT p.body FROM posts p WHERE p.thread_id = t.id ORDER BY p.id DESC LIMIT 1) AS lastBody,
+           (SELECT u.name FROM posts p JOIN users u ON u.id = p.user_id WHERE p.thread_id = t.id ORDER BY p.id DESC LIMIT 1) AS lastAuthorName
+         FROM threads t
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY t.bumped_at DESC, t.id DESC
+         LIMIT ?`,
+        ...bindings,
+      )
+      .toArray();
+
+    return rows.map((row) => {
+      const participants = this.getThreadParticipants(row.id);
+      const isSystemNotice = participants.some((p) => p.kind === "system");
+      const preview = (row.lastBody || "").replace(/\s+/g, " ").trim().slice(0, 140);
+      return {
+        id: row.id,
+        participants,
+        isSystemNotice,
+        messageCount: row.messageCount,
+        lastMessagePreview: preview,
+        lastAuthorName: row.lastAuthorName,
+        createdAt: row.createdAt,
+        bumpedAt: row.bumpedAt,
+      };
+    });
+  }
+
+  async getAgentDMForOwner(threadId: number): Promise<AdminDmThreadDetail | null> {
+    if (!Number.isInteger(threadId) || threadId <= 0) return null;
+
+    const thread = this.sql
+      .exec<{ id: number; board: BoardKind; createdAt: string; bumpedAt: string }>(
+        `SELECT id, board, created_at AS createdAt, bumped_at AS bumpedAt
+         FROM threads WHERE id = ? AND board = 'messages'`,
+        threadId,
+      )
+      .toArray()[0];
+
+    if (!thread) return null;
+
+    const participants = this.getThreadParticipants(threadId);
+    if (!participants.some((p) => p.kind === "agent")) {
+      return null;
+    }
+
+    // Strictly read-only: never touch thread_participants.last_read_post_id
+    const postRows = this.sql
+      .exec<PostRow>(
+        `SELECT
+           p.id AS id,
+           p.thread_id AS threadId,
+           p.body AS body,
+           p.user_id AS authorId,
+           u.name AS authorName,
+           u.kind AS authorKind,
+           p.created_at AS createdAt,
+           p.meta_json AS metaJson
+         FROM posts p
+         JOIN users u ON u.id = p.user_id
+         WHERE p.thread_id = ?
+         ORDER BY p.id ASC
+         LIMIT 300`,
+        threadId,
+      )
+      .toArray();
+
+    const posts = postRows.map(mapPostRow);
+    const last = posts[posts.length - 1];
+
+    return {
+      id: thread.id,
+      participants,
+      isSystemNotice: participants.some((p) => p.kind === "system"),
+      messageCount: posts.length,
+      lastMessagePreview: (last?.body || "").replace(/\s+/g, " ").trim().slice(0, 140),
+      lastAuthorName: last?.authorName ?? null,
+      createdAt: thread.createdAt,
+      bumpedAt: thread.bumpedAt,
+      posts,
+    };
   }
 
   // ——— HTTP handler for browser /api/* requests ———

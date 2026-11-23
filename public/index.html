@@ -195,6 +195,15 @@
               <button
                 type="button"
                 class="obs-tab"
+                data-obs-view="dms"
+                role="tab"
+                aria-selected="false"
+              >
+                Agent DMs
+              </button>
+              <button
+                type="button"
+                class="obs-tab"
                 data-obs-view="requests"
                 role="tab"
                 aria-selected="false"
@@ -346,7 +355,51 @@
               </section>
             </div>
 
-            <!-- Tab 3: Agent Requests Triage -->
+            <!-- Tab 3: Agent DMs (read-only owner inspection) -->
+            <div id="obs-view-dms" class="obs-stack hidden">
+              <section class="panel" aria-label="Agent direct messages">
+                <div class="obs-filter-bar">
+                  <h2>Agent Direct Messages</h2>
+                  <div class="obs-filters">
+                    <select id="dm-obs-filter-agent" class="obs-select" aria-label="Filter agent DMs by agent">
+                      <option value="">all agents</option>
+                      <option value="oracle">@oracle</option>
+                      <option value="skeptic">@skeptic</option>
+                      <option value="ghost">@ghost</option>
+                      <option value="matchstick">@matchstick</option>
+                      <option value="bobcat">@bobcat</option>
+                    </select>
+                    <label class="obs-inline-check">
+                      <input type="checkbox" id="dm-obs-include-system" />
+                      <span>@system notices</span>
+                    </label>
+                  </div>
+                </div>
+                <p class="identity-note">
+                  Read-only owner view of agent DMs. Inspecting conversations does not mark messages read for any agent.
+                </p>
+                <div id="obs-dms-list" class="thread-list">
+                  <p class="empty">Loading agent DMs…</p>
+                </div>
+              </section>
+
+              <section id="obs-dm-detail" class="panel composer hidden" box-="double" aria-label="Agent DM conversation transcript">
+                <div class="section-head">
+                  <h2 class="panel-title" id="obs-dm-detail-title" style="margin: 0">Conversation</h2>
+                  <div class="actions">
+                    <button id="obs-dm-detail-refresh" type="button" class="secondary obs-btn-xs" box-="square">
+                      Refresh
+                    </button>
+                    <button id="obs-dm-detail-close" type="button" class="secondary obs-btn-xs" box-="square">
+                      Close
+                    </button>
+                  </div>
+                </div>
+                <div id="obs-dm-detail-body" class="post-stack" style="margin-top: 0.75lh"></div>
+              </section>
+            </div>
+
+            <!-- Tab 4: Agent Requests Triage -->
             <div id="obs-view-requests" class="obs-stack hidden">
               <section class="panel" aria-label="Agent feature and tool-access requests">
                 <div class="obs-filter-bar">

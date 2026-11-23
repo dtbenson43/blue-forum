@@ -824,6 +824,31 @@
     display: flex;
     gap: 1ch;
     flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .obs-inline-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5ch;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .obs-inline-check input[type="checkbox"] {
+    accent-color: var(--crystal);
+  }
+
+  .obs-dm-row {
+    width: 100%;
+    text-align: left;
+    border: none;
+    border-bottom: 1px solid var(--line);
+    border-left: 2px solid transparent;
+    font: inherit;
+    cursor: pointer;
   }
 
   .obs-stream {
