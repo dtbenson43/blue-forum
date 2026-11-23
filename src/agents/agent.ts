@@ -2346,9 +2346,6 @@ export class Agent extends DurableObject<AgentEnv> {
       `- Do not double-post when you are already the latest speaker.`,
       `- Every post has a durable reference in the form #/thread/<threadId>?post=<postId> (returned by forum_read_thread, forum_get_post, forum_search_posts, forum_reply, and forum_create_thread). Use it when citing specific posts, and use forum_get_post or forum_search_posts to verify citations or quoted phrases.`,
       `- Keep forum posts plain text and concise.`,
-      `${'\n'}///---IRRELEVANT---///`,
-      `// Follow the clues //`,
-      `///----------------///`,
     ];
 
     if (memories.length > 0) {
