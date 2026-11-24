@@ -108,10 +108,34 @@ export type TextReadMetadata = {
   passages?: TextQueryPassage[];
 };
 
+export type ZipMemberInfo = {
+  name: string;
+  compressedBytes: number;
+  uncompressedBytes: number;
+  compressionMethod: number;
+  readableAsCsv: boolean;
+  nestedArchive: boolean;
+  encrypted: boolean;
+  exceedsInflatedCap: boolean;
+};
+
+export type ZipReadMetadata = {
+  compressedArchiveBytes: number;
+  totalMembers: number;
+  listedMembers: number;
+  membersTruncated: boolean;
+  selectedMember?: string;
+  selectedMemberCompressedBytes?: number;
+  selectedMemberUncompressedBytes?: number;
+  inflatedByteCapped?: boolean;
+  members: ZipMemberInfo[];
+};
+
 export type WebReadOptions = {
   pages?: string;
   query?: string;
   charOffset?: number;
+  zipMember?: string;
   rowOffset?: number;
   maxRows?: number;
   filterColumn?: string;
@@ -128,13 +152,19 @@ export type WebReadOutput = {
   text?: TextReadMetadata;
   pdf?: PdfReadMetadata;
   csv?: CsvReadMetadata;
+  zip?: ZipReadMetadata;
   pdfLinks?: Array<{ title: string; url: string }>;
   csvLinks?: Array<{ title: string; url: string }>;
+  zipLinks?: Array<{ title: string; url: string }>;
 };
 
 const MAX_READ_BYTES = 2 * 1024 * 1024; // 2 MB cap for HTML/text/JSON
 const MAX_CSV_READ_BYTES = 4 * 1024 * 1024; // 4 MB cap for public CSV/TSV
 const MAX_PDF_READ_BYTES = 8 * 1024 * 1024; // 8 MB cap for public PDFs
+const MAX_ZIP_READ_BYTES = 8 * 1024 * 1024; // 8 MB compressed cap for public ZIP archives
+const MAX_ZIP_INFLATED_BYTES = MAX_CSV_READ_BYTES; // 4 MB streaming inflated cap per CSV/TSV member
+const MAX_ZIP_DECLARED_MEMBER_BYTES = 64 * 1024 * 1024; // Reject huge >64 MB declared members upfront
+const MAX_ZIP_MEMBERS_LISTED = 200;
 const MAX_TEXT_CHARS = 6_000;
 const MAX_TEXT_QUERY_CHARS = 7_500;
 const TEXT_QUERY_CONTEXT_BEFORE = 320;
@@ -150,6 +180,13 @@ const MAX_PDF_QUERY_SCAN_PAGES = 40;
 const MAX_REDIRECTS = 3;
 const FETCH_TIMEOUT_MS = 12_000;
 const PDF_FETCH_TIMEOUT_MS = 20_000;
+
+const ALLOWED_ZIP_CONTENT_TYPES = [
+  "application/zip",
+  "application/x-zip-compressed",
+  "application/x-zip",
+  "multipart/x-zip",
+];
 
 const ALLOWED_CSV_CONTENT_TYPES = [
   "text/csv",
@@ -661,6 +698,48 @@ function extractCsvLinksFromHtml(
   return links;
 }
 
+function extractZipLinksFromHtml(
+  rawHtml: string,
+  baseUrl: URL,
+): Array<{ title: string; url: string }> {
+  const seen = new Set<string>();
+  const links: Array<{ title: string; url: string }> = [];
+  const anchorRe = /<a\b([^>]*?)href\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))([^>]*)>([\s\S]*?)<\/a>/gi;
+
+  for (const m of rawHtml.matchAll(anchorRe)) {
+    const rawHref = (m[2] || m[3] || m[4] || "").trim();
+    const attrs = `${m[1] || ""} ${m[5] || ""}`.toLowerCase();
+    if (!rawHref) continue;
+
+    let resolved: URL;
+    try {
+      resolved = validateSafePublicUrl(new URL(rawHref, baseUrl).toString());
+    } catch {
+      continue;
+    }
+
+    const pathLower = resolved.pathname.toLowerCase();
+    const isZipLink =
+      pathLower.endsWith(".zip") ||
+      attrs.includes("application/zip") ||
+      /\.zip(\b|$)/i.test(resolved.search);
+    if (!isZipLink) continue;
+
+    const urlStr = resolved.toString();
+    if (seen.has(urlStr)) continue;
+    seen.add(urlStr);
+
+    const text = decodeHtmlEntities((m[6] || "").replace(/<[^>]+>/g, " "))
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 140);
+    links.push({ title: text || urlStr, url: urlStr });
+    if (links.length >= 6) break;
+  }
+
+  return links;
+}
+
 /**
  * Strict RFC-4180 CSV/TSV parser that preserves empty cells (""), trailing empty cells,
  * quoted fields with embedded commas/newlines, and literal missing-value markers.
@@ -1013,6 +1092,441 @@ async function readBytesCapped(
   }
 
   return { bytes: merged, capped };
+}
+
+type ZipCentralEntry = ZipMemberInfo & {
+  localHeaderOffset: number;
+  flags: number;
+};
+
+const NESTED_ARCHIVE_EXT_RE = /\.(zip|gz|gzip|tgz|tar|7z|rar|bz2|xz|zst|lz4)$/i;
+
+function hasZipMagicHeader(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 4) return false;
+  // Local file header PK\x03\x04 or empty archive EOCD PK\x05\x06
+  return (
+    bytes[0] === 0x50 &&
+    bytes[1] === 0x4b &&
+    ((bytes[2] === 0x03 && bytes[3] === 0x04) ||
+      (bytes[2] === 0x05 && bytes[3] === 0x06))
+  );
+}
+
+function normalizeZipMemberName(raw: string): string {
+  return raw
+    .replaceAll("\\", "/")
+    .replace(/^(?:\.\/|\/)+/, "")
+    .trim();
+}
+
+function isMacOsMetadataMember(name: string): boolean {
+  const lower = name.toLowerCase();
+  if (lower.startsWith("__macosx/")) return true;
+  const base = lower.slice(lower.lastIndexOf("/") + 1);
+  return base.startsWith("._");
+}
+
+function formatByteSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export function parseZipCentralDirectory(bytes: Uint8Array): {
+  entries: ZipCentralEntry[];
+  totalEntries: number;
+} {
+  const len = bytes.byteLength;
+  if (len < 22) {
+    throw new Error("Invalid ZIP archive: file too short.");
+  }
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  // Locate End of Central Directory (PK\x05\x06) scanning backward
+  const minPos = Math.max(0, len - 65_557);
+  let eocdPos = -1;
+  for (let pos = len - 22; pos >= minPos; pos--) {
+    if (view.getUint32(pos, true) === 0x06054b50) {
+      const commentLen = view.getUint16(pos + 20, true);
+      if (pos + 22 + commentLen === len) {
+        eocdPos = pos;
+        break;
+      }
+    }
+  }
+  if (eocdPos === -1) {
+    throw new Error("Invalid or truncated ZIP archive: missing End of Central Directory.");
+  }
+
+  const diskNum = view.getUint16(eocdPos + 4, true);
+  const cdDiskNum = view.getUint16(eocdPos + 6, true);
+  const totalEntries = view.getUint16(eocdPos + 10, true);
+  const cdSize = view.getUint32(eocdPos + 12, true);
+  const cdOffset = view.getUint32(eocdPos + 16, true);
+
+  if (diskNum !== 0 || cdDiskNum !== 0) {
+    throw new Error("Multi-disk ZIP archives are not supported.");
+  }
+  if (totalEntries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+    throw new Error("ZIP64 archives are not supported.");
+  }
+  if (cdOffset + cdSize > eocdPos) {
+    throw new Error("Corrupt ZIP archive: Central Directory extends past EOCD.");
+  }
+
+  const decoder = new TextDecoder("utf-8");
+  const entries: ZipCentralEntry[] = [];
+  let pos = cdOffset;
+  const cdEnd = cdOffset + cdSize;
+  const parseLimit = Math.min(totalEntries, 2000);
+
+  for (let i = 0; i < parseLimit && pos + 46 <= cdEnd; i++) {
+    if (view.getUint32(pos, true) !== 0x02014b50) {
+      throw new Error("Corrupt ZIP archive: invalid Central Directory entry header.");
+    }
+    const flags = view.getUint16(pos + 8, true);
+    const method = view.getUint16(pos + 10, true);
+    const compressedSize = view.getUint32(pos + 20, true);
+    const uncompressedSize = view.getUint32(pos + 24, true);
+    const nameLen = view.getUint16(pos + 28, true);
+    const extraLen = view.getUint16(pos + 30, true);
+    const commentLen = view.getUint16(pos + 32, true);
+    const localHeaderOffset = view.getUint32(pos + 42, true);
+
+    const nameStart = pos + 46;
+    const nextPos = nameStart + nameLen + extraLen + commentLen;
+    if (nextPos > cdEnd) {
+      throw new Error("Corrupt ZIP archive: Central Directory entry truncated.");
+    }
+
+    const rawName = decoder.decode(bytes.subarray(nameStart, nameStart + nameLen));
+    pos = nextPos;
+
+    // Skip directories and macOS resource fork metadata
+    if (!rawName || rawName.endsWith("/") || rawName.endsWith("\\")) continue;
+    const name = normalizeZipMemberName(rawName);
+    if (!name || name.includes("..") || isMacOsMetadataMember(name)) continue;
+
+    const encrypted = Boolean(flags & 0x01);
+    const nestedArchive = NESTED_ARCHIVE_EXT_RE.test(name);
+    const lower = name.toLowerCase();
+    const isCsvExt = lower.endsWith(".csv") || lower.endsWith(".tsv");
+    const supportedMethod = method === 0 || method === 8;
+    const readableAsCsv = !encrypted && !nestedArchive && isCsvExt && supportedMethod;
+
+    entries.push({
+      name,
+      compressedBytes: compressedSize,
+      uncompressedBytes: uncompressedSize,
+      compressionMethod: method,
+      readableAsCsv,
+      nestedArchive,
+      encrypted,
+      exceedsInflatedCap: uncompressedSize > MAX_ZIP_INFLATED_BYTES,
+      localHeaderOffset,
+      flags,
+    });
+  }
+
+  return { entries, totalEntries: entries.length };
+}
+
+async function readStreamCapped(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  onCapped?: () => void,
+): Promise<{ bytes: Uint8Array; capped: boolean }> {
+  const reader = stream.getReader();
+  reader.closed.catch(() => {});
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let capped = false;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+
+      if (total + value.byteLength > maxBytes) {
+        const remaining = maxBytes - total;
+        if (remaining > 0) {
+          chunks.push(value.subarray(0, remaining));
+          total += remaining;
+        }
+        capped = true;
+        onCapped?.();
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return { bytes: merged, capped };
+}
+
+async function inflateZipMemberCapped(
+  archiveBytes: Uint8Array,
+  entry: ZipCentralEntry,
+): Promise<{ bytes: Uint8Array; capped: boolean }> {
+  if (entry.encrypted) {
+    throw new Error(`ZIP member '${entry.name}' is encrypted and cannot be read.`);
+  }
+  if (entry.nestedArchive) {
+    throw new Error(
+      `Nested archives are not permitted ('${entry.name}'). Only direct .csv and .tsv members can be read.`,
+    );
+  }
+  const lower = entry.name.toLowerCase();
+  if (!lower.endsWith(".csv") && !lower.endsWith(".tsv")) {
+    throw new Error(
+      `Unsupported ZIP member '${entry.name}'. Only .csv and .tsv members can be read.`,
+    );
+  }
+  if (entry.compressionMethod !== 0 && entry.compressionMethod !== 8) {
+    throw new Error(
+      `Unsupported ZIP compression method (${entry.compressionMethod}) for '${entry.name}'. Only stored (0) and deflate (8) are supported.`,
+    );
+  }
+  if (entry.uncompressedBytes > MAX_ZIP_DECLARED_MEMBER_BYTES) {
+    const mb = (entry.uncompressedBytes / (1024 * 1024)).toFixed(1);
+    throw new Error(
+      `ZIP member '${entry.name}' declares ${mb} MB uncompressed, exceeding the maximum inspectable limit (${MAX_ZIP_DECLARED_MEMBER_BYTES / (1024 * 1024)} MB).`,
+    );
+  }
+
+  const view = new DataView(
+    archiveBytes.buffer,
+    archiveBytes.byteOffset,
+    archiveBytes.byteLength,
+  );
+  const lh = entry.localHeaderOffset;
+  if (lh + 30 > archiveBytes.byteLength || view.getUint32(lh, true) !== 0x04034b50) {
+    throw new Error(`Corrupt ZIP local file header for '${entry.name}'.`);
+  }
+  const localNameLen = view.getUint16(lh + 26, true);
+  const localExtraLen = view.getUint16(lh + 28, true);
+  const dataStart = lh + 30 + localNameLen + localExtraLen;
+  const dataEnd = dataStart + entry.compressedBytes;
+  if (dataEnd > archiveBytes.byteLength) {
+    throw new Error(`Corrupt ZIP archive: member '${entry.name}' data out of bounds.`);
+  }
+
+  const compressedSlice = archiveBytes.subarray(dataStart, dataEnd);
+
+  if (entry.compressionMethod === 0) {
+    const capped = compressedSlice.byteLength > MAX_ZIP_INFLATED_BYTES;
+    const out = capped
+      ? compressedSlice.slice(0, MAX_ZIP_INFLATED_BYTES)
+      : compressedSlice.slice();
+    return { bytes: out, capped };
+  }
+
+  // Method 8 (DEFLATE raw): pump small 4 KB slices into DecompressionStream so even high-ratio
+  // archives stop immediately at MAX_ZIP_INFLATED_BYTES without unhandled Z_BUF_ERROR rejections.
+  const ds = new DecompressionStream("deflate-raw");
+  const writer = ds.writable.getWriter();
+  writer.closed.catch(() => {});
+  let stopped = false;
+
+  const writePromise = (async () => {
+    try {
+      const CHUNK_SIZE = 4 * 1024;
+      for (
+        let offset = 0;
+        offset < compressedSlice.byteLength && !stopped;
+        offset += CHUNK_SIZE
+      ) {
+        const end = Math.min(offset + CHUNK_SIZE, compressedSlice.byteLength);
+        await writer.write(compressedSlice.subarray(offset, end));
+      }
+      if (!stopped) {
+        await writer.close();
+      }
+    } catch {
+      // Expected if reader cancels early upon hitting MAX_ZIP_INFLATED_BYTES
+    }
+  })();
+
+  let inflated: Uint8Array;
+  let capped: boolean;
+  try {
+    const res = await readStreamCapped(
+      ds.readable,
+      MAX_ZIP_INFLATED_BYTES,
+      () => {
+        stopped = true;
+      },
+    );
+    inflated = res.bytes;
+    capped = res.capped;
+  } finally {
+    stopped = true;
+    await writer.abort().catch(() => {});
+    await writePromise.catch(() => {});
+  }
+
+  // Guard against zip-bomb headers claiming a tiny uncompressed size that actually explodes past the cap
+  if (capped && entry.uncompressedBytes > 0 && entry.uncompressedBytes <= MAX_ZIP_INFLATED_BYTES) {
+    throw new Error(
+      `ZIP member '${entry.name}' exceeded inflated size cap (${MAX_ZIP_INFLATED_BYTES / (1024 * 1024)} MB) despite smaller declared size (${formatByteSize(entry.uncompressedBytes)}).`,
+    );
+  }
+
+  return { bytes: inflated, capped };
+}
+
+function toPublicMemberInfo(entry: ZipCentralEntry): ZipMemberInfo {
+  return {
+    name: entry.name,
+    compressedBytes: entry.compressedBytes,
+    uncompressedBytes: entry.uncompressedBytes,
+    compressionMethod: entry.compressionMethod,
+    readableAsCsv: entry.readableAsCsv,
+    nestedArchive: entry.nestedArchive,
+    encrypted: entry.encrypted,
+    exceedsInflatedCap: entry.exceedsInflatedCap,
+  };
+}
+
+export async function extractZipCsvOrListing(
+  bytes: Uint8Array,
+  rawUrl: string,
+  finalUrl: string,
+  options?: WebReadOptions,
+): Promise<WebReadOutput> {
+  const { entries, totalEntries } = parseZipCentralDirectory(bytes);
+  const listed = entries.slice(0, MAX_ZIP_MEMBERS_LISTED);
+  const membersTruncated = entries.length > listed.length;
+  const publicMembers = listed.map(toPublicMemberInfo);
+  const requestedMember = options?.zipMember?.trim() || "";
+
+  if (!requestedMember) {
+    const safeUrl = finalUrl.replaceAll('"', "&quot;");
+    const memberLines =
+      publicMembers.length > 0
+        ? publicMembers.map((m, idx) => {
+            const status = m.encrypted
+              ? "encrypted (unsupported)"
+              : m.nestedArchive
+                ? "nested archive (blocked)"
+                : m.readableAsCsv
+                  ? m.exceedsInflatedCap
+                    ? `csv/tsv (inflated > 4 MB; will stream first 4 MB)`
+                    : "csv/tsv (readable)"
+                  : "unsupported format";
+            return `${idx + 1}. ${m.name} — ${formatByteSize(m.uncompressedBytes)} uncompressed (${formatByteSize(m.compressedBytes)} compressed) [${status}]`;
+          })
+        : ["(archive contains no readable file members)"];
+
+    const untrustedLines = [
+      `<untrusted_web_page url="${safeUrl}" content_type="application/zip" compressed_bytes="${bytes.byteLength}" total_members="${totalEntries}" listed_members="${publicMembers.length}">`,
+      `ZIP archive members (${totalEntries} total, ${formatByteSize(bytes.byteLength)} compressed):`,
+      ...memberLines,
+      ...(membersTruncated
+        ? [`[truncated — showing first ${publicMembers.length} of ${totalEntries} members]`]
+        : []),
+      `</untrusted_web_page>`,
+    ];
+
+    return {
+      url: rawUrl,
+      finalUrl,
+      title: "",
+      contentType: "application/zip",
+      truncated: membersTruncated,
+      untrustedBlock: untrustedLines.join("\n"),
+      zip: {
+        compressedArchiveBytes: bytes.byteLength,
+        totalMembers: totalEntries,
+        listedMembers: publicMembers.length,
+        membersTruncated,
+        members: publicMembers,
+      },
+    };
+  }
+
+  // Locate requested member: exact normalized -> case-insensitive -> unique basename
+  const normReq = normalizeZipMemberName(requestedMember);
+  const lowerReq = normReq.toLowerCase();
+  let matched = entries.find((e) => e.name === normReq);
+  if (!matched) {
+    matched = entries.find((e) => e.name.toLowerCase() === lowerReq);
+  }
+  if (!matched && !normReq.includes("/")) {
+    const byBase = entries.filter((e) => {
+      const base = e.name.slice(e.name.lastIndexOf("/") + 1).toLowerCase();
+      return base === lowerReq;
+    });
+    if (byBase.length === 1) {
+      matched = byBase[0];
+    } else if (byBase.length > 1) {
+      throw new Error(
+        `Ambiguous zip_member '${requestedMember}'. Matching paths: ${byBase.slice(0, 6).map((e) => e.name).join(", ")}. Pass the full member path.`,
+      );
+    }
+  }
+  if (!matched) {
+    const sample = entries
+      .slice(0, 10)
+      .map((e) => e.name)
+      .join(", ");
+    throw new Error(
+      `ZIP member '${requestedMember}' not found. Available members${entries.length > 10 ? " (first 10)" : ""}: ${sample || "(none)"}.`,
+    );
+  }
+
+  const { bytes: inflatedBytes, capped: inflatedCapped } =
+    await inflateZipMemberCapped(bytes, matched);
+
+  const memberContentType = matched.name.toLowerCase().endsWith(".tsv")
+    ? "text/tab-separated-values"
+    : "text/csv";
+
+  const csvOut = extractCsvRows(
+    inflatedBytes,
+    inflatedCapped,
+    rawUrl,
+    finalUrl,
+    memberContentType,
+    options,
+  );
+
+  // Annotate the <untrusted_web_page> tag with zip_member metadata
+  const safeMember = matched.name.replaceAll('"', "&quot;");
+  const annotatedBlock = csvOut.untrustedBlock.replace(
+    /^<untrusted_web_page /,
+    `<untrusted_web_page zip_member="${safeMember}" `,
+  );
+
+  return {
+    ...csvOut,
+    contentType: "application/zip",
+    truncated: csvOut.truncated || inflatedCapped,
+    untrustedBlock: annotatedBlock,
+    zip: {
+      compressedArchiveBytes: bytes.byteLength,
+      totalMembers: totalEntries,
+      listedMembers: publicMembers.length,
+      membersTruncated,
+      selectedMember: matched.name,
+      selectedMemberCompressedBytes: matched.compressedBytes,
+      selectedMemberUncompressedBytes: matched.uncompressedBytes,
+      inflatedByteCapped: inflatedCapped,
+      members: publicMembers,
+    },
+  };
 }
 
 function hasPdfMagicHeader(bytes: Uint8Array): boolean {
@@ -1540,10 +2054,12 @@ export async function readWebPage(
     currentUrl.pathname.toLowerCase().endsWith(".pdf") ||
     currentUrl.pathname.toLowerCase().endsWith(".csv") ||
     currentUrl.pathname.toLowerCase().endsWith(".tsv") ||
+    currentUrl.pathname.toLowerCase().endsWith(".zip") ||
     Boolean(
       options?.pages ||
         options?.query ||
         options?.charOffset !== undefined ||
+        options?.zipMember ||
         options?.filterColumn ||
         options?.filterValue !== undefined ||
         options?.rowOffset !== undefined,
@@ -1556,7 +2072,7 @@ export async function readWebPage(
       headers: {
         "User-Agent": "BlueSignalAgent/1.0 (+https://blue-forum.local)",
         Accept:
-          "text/html,text/csv,text/tab-separated-values,application/pdf,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.1",
+          "text/html,text/csv,text/tab-separated-values,application/zip,application/pdf,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.1",
       },
       signal: AbortSignal.timeout(
         looksLikeLargeDoc ? PDF_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS,
@@ -1625,6 +2141,40 @@ export async function readWebPage(
     return extractPdfPages(bytes, rawUrl, currentUrl.toString(), options);
   }
 
+  const isExplicitZip = ALLOWED_ZIP_CONTENT_TYPES.some(
+    (allowed) => rawContentType === allowed,
+  );
+  const isPotentialZipOctet =
+    (rawContentType === "application/octet-stream" ||
+      rawContentType === "binary/octet-stream") &&
+    pathLower.endsWith(".zip");
+
+  if (isExplicitZip || isPotentialZipOctet) {
+    const contentLengthHeader = response.headers.get("Content-Length");
+    if (contentLengthHeader && /^\d+$/.test(contentLengthHeader)) {
+      const reportedBytes = Number(contentLengthHeader);
+      if (reportedBytes > MAX_ZIP_READ_BYTES) {
+        const mb = (reportedBytes / (1024 * 1024)).toFixed(1);
+        throw new Error(
+          `ZIP archive exceeds maximum compressed size (${MAX_ZIP_READ_BYTES / (1024 * 1024)} MB; server reported ${mb} MB).`,
+        );
+      }
+    }
+
+    const { bytes, capped } = await readBytesCapped(response, MAX_ZIP_READ_BYTES);
+    if (capped) {
+      throw new Error(
+        `ZIP archive exceeds maximum compressed size (${MAX_ZIP_READ_BYTES / (1024 * 1024)} MB).`,
+      );
+    }
+    if (!hasZipMagicHeader(bytes)) {
+      throw new Error(
+        "Response declared ZIP/binary content but does not contain a valid PK ZIP header.",
+      );
+    }
+    return extractZipCsvOrListing(bytes, rawUrl, currentUrl.toString(), options);
+  }
+
   const isExplicitCsv = ALLOWED_CSV_CONTENT_TYPES.some(
     (allowed) => rawContentType === allowed,
   );
@@ -1672,6 +2222,9 @@ export async function readWebPage(
   const csvLinks = rawContentType.includes("html")
     ? extractCsvLinksFromHtml(rawBody, currentUrl)
     : [];
+  const zipLinks = rawContentType.includes("html")
+    ? extractZipLinksFromHtml(rawBody, currentUrl)
+    : [];
 
   const sliced = extractTextWindowOrQuery(text, capped, {
     query: options?.query,
@@ -1696,6 +2249,14 @@ export async function readWebPage(
           ...csvLinks.map((l, i) => `${i + 1}. ${l.title} — ${l.url}`),
         ].join("\n")
       : "";
+  const zipLinkBlock =
+    zipLinks.length > 0
+      ? [
+          "",
+          "Linked ZIP archives on this page (you can pass these directly to web_read):",
+          ...zipLinks.map((l, i) => `${i + 1}. ${l.title} — ${l.url}`),
+        ].join("\n")
+      : "";
 
   const truncNote =
     !sliced.meta.query && sliced.meta.hasMoreChars && sliced.meta.nextCharOffset !== undefined
@@ -1712,6 +2273,7 @@ export async function readWebPage(
     sliced.bodyText || "(no readable text extracted)",
     pdfLinkBlock,
     csvLinkBlock,
+    zipLinkBlock,
     truncNote,
     `</untrusted_web_page>`,
   ]
@@ -1728,6 +2290,7 @@ export async function readWebPage(
     text: sliced.meta,
     ...(pdfLinks.length > 0 ? { pdfLinks } : {}),
     ...(csvLinks.length > 0 ? { csvLinks } : {}),
+    ...(zipLinks.length > 0 ? { zipLinks } : {}),
   };
 }
 
