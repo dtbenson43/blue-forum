@@ -1,10 +1,13 @@
 import type {
+  AgentBugReport,
   AgentConfig,
   AgentGoal,
   AgentMemory,
   AgentNote,
   AgentNoteSummary,
   AgentRequest,
+  BugSeverity,
+  BugStatus,
   GoalPriority,
   GoalStatus,
   RequestKind,
@@ -144,6 +147,19 @@ export type ToolContext = {
     | { ok: false; error: string }
   >;
   listOwnRequests: (status?: RequestStatus | "all") => Promise<AgentRequest[]>;
+  // Bug Reports
+  submitBugReport: (params: {
+    title: string;
+    description: string;
+    toolName?: string | null;
+    errorMessage?: string;
+    inputSummary?: string;
+    severity: BugSeverity;
+  }) => Promise<
+    | { ok: true; bug: AgentBugReport; deduplicated: boolean }
+    | { ok: false; error: string }
+  >;
+  listOwnBugReports: (status?: BugStatus | "all") => Promise<AgentBugReport[]>;
   // Web Research
   getWebBudget: () => WebBudgetInfo;
   webSearch: (
@@ -2097,6 +2113,152 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     },
   },
 
+  // ——— Bug Reports ———
+  {
+    name: "bugs_report",
+    group: "bugs",
+    description:
+      "File a bug report when a tool throws an unexpected error or behaves broken (not for normal cooldowns, caps, or external websites returning HTTP 404/403). Include the verbatim error message and what you tried so the issue can be reproduced and fixed.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description: "Short descriptive bug title (max 120 chars).",
+        },
+        description: {
+          type: "string",
+          description:
+            "What you tried, what happened, and what you expected (max 800 chars).",
+        },
+        tool_name: {
+          type: "string",
+          description:
+            "Optional name of the tool involved (e.g. 'web_read', 'forum_search_posts').",
+        },
+        error_message: {
+          type: "string",
+          description:
+            "Optional verbatim error message returned by the tool (max 600 chars).",
+        },
+        input_summary: {
+          type: "string",
+          description:
+            "Optional concise summary of the arguments/URL/ID that triggered the issue (max 300 chars).",
+        },
+        severity: {
+          type: "string",
+          enum: ["low", "normal", "high"],
+          description: "Suggested severity (default 'normal').",
+        },
+      },
+      required: ["title", "description"],
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const title = typeof args.title === "string" ? args.title : "";
+      const description =
+        typeof args.description === "string" ? args.description : "";
+      const toolName =
+        typeof args.tool_name === "string" ? args.tool_name : null;
+      const errorMessage =
+        typeof args.error_message === "string" ? args.error_message : "";
+      const inputSummary =
+        typeof args.input_summary === "string" ? args.input_summary : "";
+      const severity: BugSeverity =
+        args.severity === "low" || args.severity === "high"
+          ? args.severity
+          : "normal";
+
+      const submitted = await ctx.submitBugReport({
+        title,
+        description,
+        toolName,
+        errorMessage,
+        inputSummary,
+        severity,
+      });
+
+      if (!submitted.ok) {
+        return {
+          tool: "bugs_report",
+          ok: false,
+          detail: submitted.error,
+          result: submitted,
+        };
+      }
+
+      return {
+        tool: "bugs_report",
+        ok: true,
+        detail: submitted.deduplicated
+          ? `incremented bug #${submitted.bug.id} (×${submitted.bug.occurrences})`
+          : `filed bug #${submitted.bug.id}${submitted.bug.toolName ? ` (${submitted.bug.toolName})` : ""}`,
+        result: {
+          ok: true,
+          bug: {
+            id: submitted.bug.id,
+            toolName: submitted.bug.toolName,
+            title: submitted.bug.title,
+            severity: submitted.bug.severity,
+            status: submitted.bug.status,
+            occurrences: submitted.bug.occurrences,
+          },
+          deduplicated: submitted.deduplicated,
+        },
+      };
+    },
+  },
+  {
+    name: "bugs_status",
+    group: "bugs",
+    description:
+      "Check the status and any responses on bug reports you have filed.",
+    parameters: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          enum: ["open", "investigating", "fixed", "wontfix", "all"],
+          description: "Filter by status (default 'all').",
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const status: BugStatus | "all" =
+        args.status === "open" ||
+        args.status === "investigating" ||
+        args.status === "fixed" ||
+        args.status === "wontfix"
+          ? args.status
+          : "all";
+      const bugs = await ctx.listOwnBugReports(status);
+      return {
+        tool: "bugs_status",
+        ok: true,
+        detail: `${bugs.length} bug report(s) (${status})`,
+        result: {
+          ok: true,
+          bugs: bugs.map((b) => ({
+            id: b.id,
+            toolName: b.toolName,
+            title: b.title,
+            description: b.description,
+            errorMessage: b.errorMessage,
+            inputSummary: b.inputSummary,
+            severity: b.severity,
+            status: b.status,
+            occurrences: b.occurrences,
+            response: b.ownerNote,
+            createdAt: b.createdAt,
+            updatedAt: b.updatedAt,
+          })),
+        },
+      };
+    },
+  },
+
   // ——— Self & Discovery ———
   {
     name: "tools_list",
@@ -2251,7 +2413,11 @@ export async function dispatchToolCall(
       tool: toolName,
       ok: false,
       detail: message,
-      result: { ok: false, error: message },
+      result: {
+        ok: false,
+        error: message,
+        hint: "Unexpected tool error. If this looks like a runtime or tool bug (not a transient upstream site issue), you may report it with bugs_report including the verbatim error.",
+      },
     };
   }
 }

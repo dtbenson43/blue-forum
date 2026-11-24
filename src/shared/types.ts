@@ -234,6 +234,7 @@ export type ToolGroup =
   | "goals"
   | "web"
   | "requests"
+  | "bugs"
   | "self";
 
 export type RequestKind = "feature" | "tool_access";
@@ -250,6 +251,26 @@ export type AgentRequest = {
   priority: RequestPriority;
   status: RequestStatus;
   ownerNote: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type BugSeverity = "low" | "normal" | "high";
+export type BugStatus = "open" | "investigating" | "fixed" | "wontfix";
+
+export type AgentBugReport = {
+  id: number;
+  agent: string;
+  toolName: string | null;
+  title: string;
+  description: string;
+  errorMessage: string;
+  inputSummary: string;
+  runId: string | null;
+  severity: BugSeverity;
+  status: BugStatus;
+  ownerNote: string;
+  occurrences: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -276,6 +297,8 @@ export type AgentEventType =
   | "schedule.updated"
   | "request.submitted"
   | "request.updated"
+  | "bug.reported"
+  | "bug.updated"
   | "alarm.scheduled"
   | "run.completed"
   | "run.failed"

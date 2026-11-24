@@ -211,6 +211,16 @@
                 <span>Requests</span>
                 <span id="obs-req-badge" class="nav-unread hidden"></span>
               </button>
+              <button
+                type="button"
+                class="obs-tab"
+                data-obs-view="bugs"
+                role="tab"
+                aria-selected="false"
+              >
+                <span>Bug Reports</span>
+                <span id="obs-bug-badge" class="nav-unread hidden"></span>
+              </button>
             </div>
 
             <!-- Tab 1: Live Stream -->
@@ -287,6 +297,8 @@
                       <option value="schedule.updated">schedule.updated</option>
                       <option value="request.submitted">request.submitted</option>
                       <option value="request.updated">request.updated</option>
+                      <option value="bug.reported">bug.reported</option>
+                      <option value="bug.updated">bug.updated</option>
                       <option value="alarm.scheduled">alarm.scheduled</option>
                       <option value="run.completed">run.completed</option>
                       <option value="run.failed">run.failed</option>
@@ -427,6 +439,44 @@
                 </p>
                 <div id="obs-requests-list" class="mind-list">
                   <p class="empty">Loading requests…</p>
+                </div>
+              </section>
+            </div>
+
+            <!-- Tab 5: Agent Bug Reports Triage -->
+            <div id="obs-view-bugs" class="obs-stack hidden">
+              <section class="panel" aria-label="Agent bug reports">
+                <div class="obs-filter-bar">
+                  <h2>Bug Reports</h2>
+                  <div class="obs-filters">
+                    <select id="bug-filter-status" class="obs-select" aria-label="Filter bug reports by status">
+                      <option value="open">open</option>
+                      <option value="investigating">investigating</option>
+                      <option value="all">all statuses</option>
+                      <option value="fixed">fixed</option>
+                      <option value="wontfix">wontfix</option>
+                    </select>
+                    <select id="bug-filter-severity" class="obs-select" aria-label="Filter bug reports by severity">
+                      <option value="all">all severities</option>
+                      <option value="high">high</option>
+                      <option value="normal">normal</option>
+                      <option value="low">low</option>
+                    </select>
+                    <select id="bug-filter-agent" class="obs-select" aria-label="Filter bug reports by agent">
+                      <option value="">all agents</option>
+                      <option value="oracle">@oracle</option>
+                      <option value="skeptic">@skeptic</option>
+                      <option value="ghost">@ghost</option>
+                      <option value="matchstick">@matchstick</option>
+                      <option value="bobcat">@bobcat</option>
+                    </select>
+                  </div>
+                </div>
+                <p class="identity-note">
+                  Agent-filed bug reports. Updating status or leaving a note wakes the reporting agent with your update.
+                </p>
+                <div id="obs-bugs-list" class="mind-list">
+                  <p class="empty">Loading bug reports…</p>
                 </div>
               </section>
             </div>

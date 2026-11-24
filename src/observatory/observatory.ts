@@ -1,7 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import type {
+  AgentBugReport,
   AgentEventType,
   AgentRequest,
+  BugSeverity,
+  BugStatus,
   EventMeta,
   ObservatoryEventInput,
   ObservatoryEventSummary,
@@ -12,6 +15,13 @@ import type {
 
 const MAX_LIVE_EVENTS = 2000;
 const MAX_OPEN_REQUESTS_PER_AGENT = 8;
+const MAX_OPEN_BUGS_PER_AGENT = 10;
+
+const SEVERITY_RANK: Record<BugSeverity, number> = {
+  low: 0,
+  normal: 1,
+  high: 2,
+};
 
 type LiveEventRow = {
   seq: number;
@@ -35,6 +45,23 @@ type AgentRequestRow = {
   priority: RequestPriority;
   status: RequestStatus;
   owner_note: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type BugReportRow = {
+  id: number;
+  agent: string;
+  tool_name: string | null;
+  title: string;
+  description: string;
+  error_message: string;
+  input_summary: string;
+  run_id: string | null;
+  severity: BugSeverity;
+  status: BugStatus;
+  owner_note: string;
+  occurrences: number;
   created_at: string;
   updated_at: string;
 };
@@ -72,6 +99,25 @@ function mapRequestRow(row: AgentRequestRow): AgentRequest {
     priority: row.priority,
     status: row.status,
     ownerNote: row.owner_note,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapBugReportRow(row: BugReportRow): AgentBugReport {
+  return {
+    id: row.id,
+    agent: row.agent,
+    toolName: row.tool_name,
+    title: row.title,
+    description: row.description,
+    errorMessage: row.error_message,
+    inputSummary: row.input_summary,
+    runId: row.run_id,
+    severity: row.severity,
+    status: row.status,
+    ownerNote: row.owner_note,
+    occurrences: row.occurrences,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -122,6 +168,27 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       );
       CREATE INDEX IF NOT EXISTS idx_agent_requests_agent ON agent_requests(agent, id DESC);
       CREATE INDEX IF NOT EXISTS idx_agent_requests_status ON agent_requests(status, id DESC);
+
+      CREATE TABLE IF NOT EXISTS bug_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        tool_name TEXT,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        error_message TEXT NOT NULL DEFAULT '',
+        input_summary TEXT NOT NULL DEFAULT '',
+        run_id TEXT,
+        severity TEXT NOT NULL DEFAULT 'normal'
+          CHECK (severity IN ('low', 'normal', 'high')),
+        status TEXT NOT NULL DEFAULT 'open'
+          CHECK (status IN ('open', 'investigating', 'fixed', 'wontfix')),
+        owner_note TEXT NOT NULL DEFAULT '',
+        occurrences INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_bug_reports_agent ON bug_reports(agent, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_bug_reports_status ON bug_reports(status, id DESC);
     `);
   }
 
@@ -153,6 +220,16 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       this.sql
         .exec<{ c: number }>(
           `SELECT COUNT(*) AS c FROM agent_requests WHERE status = 'open'`,
+        )
+        .toArray()[0]?.c ?? 0
+    );
+  }
+
+  private getOpenBugCount(): number {
+    return (
+      this.sql
+        .exec<{ c: number }>(
+          `SELECT COUNT(*) AS c FROM bug_reports WHERE status = 'open'`,
         )
         .toArray()[0]?.c ?? 0
     );
@@ -474,6 +551,257 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
     return true;
   }
 
+  // ——— Agent bug reports (agent-filed only) ———
+
+  async submitBugReport(input: {
+    agent: string;
+    title: string;
+    description: string;
+    toolName?: string | null;
+    errorMessage?: string;
+    inputSummary?: string;
+    runId?: string | null;
+    severity?: BugSeverity;
+  }): Promise<
+    | { ok: true; bug: AgentBugReport; deduplicated: boolean }
+    | { ok: false; error: string }
+  > {
+    const agent = input.agent.trim().toLowerCase();
+    const title = input.title.trim().slice(0, 120);
+    const description = input.description.trim().slice(0, 800);
+    const toolName =
+      typeof input.toolName === "string" && input.toolName.trim()
+        ? input.toolName.trim().toLowerCase().slice(0, 64)
+        : null;
+    const errorMessage =
+      typeof input.errorMessage === "string"
+        ? input.errorMessage.trim().slice(0, 600)
+        : "";
+    const inputSummary =
+      typeof input.inputSummary === "string"
+        ? input.inputSummary.trim().slice(0, 300)
+        : "";
+    const runId =
+      typeof input.runId === "string" && input.runId.trim()
+        ? input.runId.trim().slice(0, 64)
+        : null;
+    const severity: BugSeverity =
+      input.severity === "low" || input.severity === "high"
+        ? input.severity
+        : "normal";
+
+    if (!title || !description) {
+      return { ok: false, error: "Both title and description are required." };
+    }
+
+    // Deduplicate against an active (open or investigating) report from the same agent
+    // with the same tool_name and matching title or non-empty verbatim error_message.
+    const duplicate = this.sql
+      .exec<BugReportRow>(
+        `SELECT * FROM bug_reports
+         WHERE agent = ?
+           AND status IN ('open', 'investigating')
+           AND tool_name IS ?
+           AND (LOWER(title) = LOWER(?) OR (? != '' AND LOWER(error_message) = LOWER(?)))
+         ORDER BY id DESC
+         LIMIT 1`,
+        agent,
+        toolName,
+        title,
+        errorMessage,
+        errorMessage,
+      )
+      .toArray()[0];
+
+    if (duplicate) {
+      const nextSeverity =
+        SEVERITY_RANK[severity] > SEVERITY_RANK[duplicate.severity]
+          ? severity
+          : duplicate.severity;
+      const nextError = duplicate.error_message || errorMessage;
+      const nextInput = duplicate.input_summary || inputSummary;
+      const nextRunId = runId ?? duplicate.run_id;
+
+      this.sql.exec(
+        `UPDATE bug_reports
+         SET occurrences = occurrences + 1,
+             severity = ?,
+             error_message = ?,
+             input_summary = ?,
+             run_id = ?,
+             updated_at = datetime('now')
+         WHERE id = ?`,
+        nextSeverity,
+        nextError,
+        nextInput,
+        nextRunId,
+        duplicate.id,
+      );
+
+      const updated = mapBugReportRow(
+        this.sql
+          .exec<BugReportRow>(`SELECT * FROM bug_reports WHERE id = ?`, duplicate.id)
+          .one(),
+      );
+      this.broadcast({
+        type: "bug",
+        bug: updated,
+        openBugs: this.getOpenBugCount(),
+      });
+      return { ok: true, bug: updated, deduplicated: true };
+    }
+
+    const openForAgent =
+      this.sql
+        .exec<{ c: number }>(
+          `SELECT COUNT(*) AS c FROM bug_reports WHERE agent = ? AND status = 'open'`,
+          agent,
+        )
+        .toArray()[0]?.c ?? 0;
+
+    if (openForAgent >= MAX_OPEN_BUGS_PER_AGENT) {
+      return {
+        ok: false,
+        error: `Open bug report limit reached (${MAX_OPEN_BUGS_PER_AGENT}). Wait for existing reports to be reviewed.`,
+      };
+    }
+
+    this.sql.exec(
+      `INSERT INTO bug_reports (
+         agent, tool_name, title, description, error_message,
+         input_summary, run_id, severity, status, owner_note, occurrences
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', '', 1)`,
+      agent,
+      toolName,
+      title,
+      description,
+      errorMessage,
+      inputSummary,
+      runId,
+      severity,
+    );
+
+    const created = this.sql
+      .exec<BugReportRow>(`SELECT * FROM bug_reports ORDER BY id DESC LIMIT 1`)
+      .one();
+
+    const bug = mapBugReportRow(created);
+    this.broadcast({
+      type: "bug",
+      bug,
+      openBugs: this.getOpenBugCount(),
+    });
+    return { ok: true, bug, deduplicated: false };
+  }
+
+  async listBugReports(opts?: {
+    agent?: string;
+    status?: BugStatus | "all";
+    severity?: BugSeverity | "all";
+    limit?: number;
+  }): Promise<{ bugs: AgentBugReport[]; openCount: number }> {
+    const limit = Math.max(1, Math.min(opts?.limit ?? 100, 200));
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+
+    if (opts?.agent && opts.agent.trim()) {
+      clauses.push(`agent = ?`);
+      params.push(opts.agent.trim().toLowerCase());
+    }
+    if (opts?.status && opts.status !== "all") {
+      clauses.push(`status = ?`);
+      params.push(opts.status);
+    }
+    if (opts?.severity && opts.severity !== "all") {
+      clauses.push(`severity = ?`);
+      params.push(opts.severity);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.sql
+      .exec<BugReportRow>(
+        `SELECT * FROM bug_reports ${where}
+         ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'investigating' THEN 1 WHEN 'fixed' THEN 2 ELSE 3 END,
+                  CASE severity WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+                  updated_at DESC,
+                  id DESC
+         LIMIT ?`,
+        ...params,
+        limit,
+      )
+      .toArray();
+
+    return {
+      bugs: rows.map(mapBugReportRow),
+      openCount: this.getOpenBugCount(),
+    };
+  }
+
+  async getBugReport(id: number): Promise<AgentBugReport | null> {
+    const row = this.sql
+      .exec<BugReportRow>(`SELECT * FROM bug_reports WHERE id = ?`, id)
+      .toArray()[0];
+    return row ? mapBugReportRow(row) : null;
+  }
+
+  async updateBugReport(
+    id: number,
+    patch: { status?: BugStatus; ownerNote?: string },
+  ): Promise<AgentBugReport | null> {
+    const existing = this.sql
+      .exec<BugReportRow>(`SELECT * FROM bug_reports WHERE id = ?`, id)
+      .toArray()[0];
+    if (!existing) return null;
+
+    const nextStatus: BugStatus =
+      patch.status === "open" ||
+      patch.status === "investigating" ||
+      patch.status === "fixed" ||
+      patch.status === "wontfix"
+        ? patch.status
+        : existing.status;
+
+    const nextNote =
+      typeof patch.ownerNote === "string"
+        ? patch.ownerNote.trim().slice(0, 500)
+        : existing.owner_note;
+
+    this.sql.exec(
+      `UPDATE bug_reports
+       SET status = ?, owner_note = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      nextStatus,
+      nextNote,
+      id,
+    );
+
+    const updated = mapBugReportRow(
+      this.sql
+        .exec<BugReportRow>(`SELECT * FROM bug_reports WHERE id = ?`, id)
+        .one(),
+    );
+    this.broadcast({
+      type: "bug",
+      bug: updated,
+      openBugs: this.getOpenBugCount(),
+    });
+    return updated;
+  }
+
+  async deleteBugReport(id: number): Promise<boolean> {
+    const existing = this.sql
+      .exec<{ id: number }>(`SELECT id FROM bug_reports WHERE id = ?`, id)
+      .toArray()[0];
+    if (!existing) return false;
+    this.sql.exec(`DELETE FROM bug_reports WHERE id = ?`, id);
+    this.broadcast({
+      type: "bug_deleted",
+      id,
+      openBugs: this.getOpenBugCount(),
+    });
+    return true;
+  }
+
   // ——— WebSocket Hibernation ———
 
   override async fetch(request: Request): Promise<Response> {
@@ -503,6 +831,7 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
             events,
             latestSeq,
             openRequests: this.getOpenRequestCount(),
+            openBugs: this.getOpenBugCount(),
           }),
         );
       } catch {

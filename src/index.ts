@@ -263,6 +263,81 @@ async function handleAdminRoute(
     }
   }
 
+  // Agent bug reports triage (Observatory-only, agent-filed)
+  if (request.method === "GET" && url.pathname === "/api/admin/bugs") {
+    const statusParam = url.searchParams.get("status");
+    const status =
+      statusParam === "open" ||
+      statusParam === "investigating" ||
+      statusParam === "fixed" ||
+      statusParam === "wontfix" ||
+      statusParam === "all"
+        ? statusParam
+        : "all";
+    const severityParam = url.searchParams.get("severity");
+    const severity =
+      severityParam === "low" ||
+      severityParam === "normal" ||
+      severityParam === "high" ||
+      severityParam === "all"
+        ? severityParam
+        : "all";
+    const result = await observatoryStub(env).listBugReports({
+      agent: url.searchParams.get("agent") || undefined,
+      status,
+      severity,
+    });
+    return Response.json(result);
+  }
+
+  const bugItemMatch = url.pathname.match(/^\/api\/admin\/bugs\/(\d+)$/);
+  if (bugItemMatch) {
+    const bugId = Number(bugItemMatch[1]);
+    if (request.method === "PATCH") {
+      const body = (await request.json().catch(() => ({}))) as {
+        status?: "open" | "investigating" | "fixed" | "wontfix";
+        ownerNote?: string;
+      };
+      const updated = await observatoryStub(env).updateBugReport(bugId, {
+        status: body.status,
+        ownerNote: body.ownerNote,
+      });
+      if (!updated) {
+        return Response.json({ error: "Bug report not found" }, { status: 404 });
+      }
+
+      if (isRegisteredAgent(updated.agent)) {
+        const noteSuffix = updated.ownerNote
+          ? ` Note: "${updated.ownerNote}"`
+          : "";
+        await env.AGENTS.getByName(updated.agent).notifySystemNotice(
+          updated.agent,
+          {
+            kind: "bug.updated",
+            summary: `Your bug report #${updated.id} ("${updated.title}") was marked ${updated.status}.${noteSuffix}`,
+            payloadJson: JSON.stringify({
+              bug: {
+                id: updated.id,
+                toolName: updated.toolName,
+                title: updated.title,
+                severity: updated.severity,
+                status: updated.status,
+                response: updated.ownerNote,
+                occurrences: updated.occurrences,
+              },
+            }),
+          },
+        );
+      }
+
+      return Response.json({ ok: true, bug: updated });
+    }
+    if (request.method === "DELETE") {
+      const deleted = await observatoryStub(env).deleteBugReport(bugId);
+      return Response.json({ ok: deleted, id: bugId }, { status: deleted ? 200 : 404 });
+    }
+  }
+
   // Full event payload lookup directly from the owning Agent DO
   const eventDetailMatch = url.pathname.match(
     /^\/api\/admin\/agents\/([a-z0-9_-]+)\/events\/([a-z0-9-]+)$/i,

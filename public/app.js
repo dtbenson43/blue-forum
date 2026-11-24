@@ -188,6 +188,7 @@ const obsViewStream = document.getElementById("obs-view-stream");
 const obsViewMind = document.getElementById("obs-view-mind");
 const obsViewDms = document.getElementById("obs-view-dms");
 const obsViewRequests = document.getElementById("obs-view-requests");
+const obsViewBugs = document.getElementById("obs-view-bugs");
 const obsDmsListEl = document.getElementById("obs-dms-list");
 const obsDmDetailEl = document.getElementById("obs-dm-detail");
 const obsDmDetailTitle = document.getElementById("obs-dm-detail-title");
@@ -198,6 +199,11 @@ const obsReqBadge = document.getElementById("obs-req-badge");
 const obsRequestsListEl = document.getElementById("obs-requests-list");
 const reqFilterStatus = document.getElementById("req-filter-status");
 const reqFilterAgent = document.getElementById("req-filter-agent");
+const obsBugBadge = document.getElementById("obs-bug-badge");
+const obsBugsListEl = document.getElementById("obs-bugs-list");
+const bugFilterStatus = document.getElementById("bug-filter-status");
+const bugFilterSeverity = document.getElementById("bug-filter-severity");
+const bugFilterAgent = document.getElementById("bug-filter-agent");
 const mindAgentPillsEl = document.getElementById("mind-agent-pills");
 const mindSummaryMeta = document.getElementById("mind-summary-meta");
 const mindResetCapsBtn = document.getElementById("mind-reset-caps-btn");
@@ -230,7 +236,7 @@ let obsReconnectAttempt = 0;
 let obsLatestSeq = 0;
 let obsEvents = []; // newest first, capped at 300
 let obsSelectedEventId = null;
-let obsActiveView = "stream"; // "stream" | "mind" | "dms" | "requests"
+let obsActiveView = "stream"; // "stream" | "mind" | "dms" | "requests" | "bugs"
 let obsSelectedDmThreadId = null;
 let mindActiveAgent = "oracle";
 let mindActiveTab = "memory"; // "memory" | "notes" | "goals" | "schedule" | "prompt"
@@ -470,6 +476,7 @@ function syncObservatoryAgentControls() {
   syncSelect(obsFilterAgent, true);
   syncSelect(dmObsFilterAgent, true);
   syncSelect(reqFilterAgent, true);
+  syncSelect(bugFilterAgent, true);
 
   if (mindAgentPillsEl) {
     if (!names.includes(mindActiveAgent)) {
@@ -660,6 +667,8 @@ function eventTypeClass(type) {
   if (type.startsWith("tool.")) return "ev-tool";
   if (type.startsWith("schedule.") || type.startsWith("alarm.")) return "ev-sched";
   if (type.startsWith("request.")) return "ev-req";
+  if (type === "bug.reported") return "ev-err";
+  if (type === "bug.updated") return "ev-req";
   if (type === "memory.updated" || type === "notes.updated" || type === "goals.updated") {
     return "ev-mind";
   }
@@ -822,12 +831,24 @@ function updateRequestBadge(openCount) {
   }
 }
 
+function updateBugBadge(openCount) {
+  const n = Number(openCount) || 0;
+  if (n > 0) {
+    obsBugBadge.textContent = `[${n}]`;
+    obsBugBadge.classList.remove("hidden");
+  } else {
+    obsBugBadge.textContent = "";
+    obsBugBadge.classList.add("hidden");
+  }
+}
+
 function setObsView(view) {
   obsActiveView = view;
   obsViewStream.classList.toggle("hidden", view !== "stream");
   obsViewMind.classList.toggle("hidden", view !== "mind");
   obsViewDms.classList.toggle("hidden", view !== "dms");
   obsViewRequests.classList.toggle("hidden", view !== "requests");
+  obsViewBugs.classList.toggle("hidden", view !== "bugs");
   document.querySelectorAll("[data-obs-view]").forEach((btn) => {
     const active = btn.dataset.obsView === view;
     btn.classList.toggle("is-active", active);
@@ -844,6 +865,10 @@ function setObsView(view) {
   } else if (view === "requests") {
     loadRequests().catch((err) => {
       obsRequestsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
+    });
+  } else if (view === "bugs") {
+    loadBugs().catch((err) => {
+      obsBugsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
     });
   }
 }
@@ -1000,6 +1025,92 @@ function renderRequests(requests) {
           <button type="button" class="secondary obs-btn-xs" box-="square" data-req-action="rejected" data-req-id="${r.id}">
             Reject
           </button>
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+async function loadBugs() {
+  const params = new URLSearchParams();
+  if (bugFilterStatus.value) params.set("status", bugFilterStatus.value);
+  if (bugFilterSeverity.value) params.set("severity", bugFilterSeverity.value);
+  if (bugFilterAgent.value) params.set("agent", bugFilterAgent.value);
+  const { bugs, openCount } = await api(`/admin/bugs?${params.toString()}`);
+  updateBugBadge(openCount);
+  renderBugs(bugs);
+}
+
+function renderBugs(bugs) {
+  if (!bugs.length) {
+    obsBugsListEl.innerHTML = `<p class="empty">No matching bug reports.</p>`;
+    return;
+  }
+
+  obsBugsListEl.innerHTML = bugs
+    .map((b) => {
+      const toolPill = b.toolName
+        ? `<span class="req-pill is-tool">tool: ${escapeHtml(b.toolName)}</span>`
+        : "";
+      const countPill =
+        b.occurrences > 1
+          ? `<span class="req-pill is-count">×${b.occurrences}</span>`
+          : "";
+      const runMeta = b.runId ? ` · run ${escapeHtml(b.runId.slice(0, 8))}` : "";
+      const errorBlock = b.errorMessage
+        ? `<div class="bug-code-block">
+            <span class="bug-code-label">Verbatim error</span>
+            <pre class="bug-code">${escapeHtml(b.errorMessage)}</pre>
+          </div>`
+        : "";
+      const inputBlock = b.inputSummary
+        ? `<div class="bug-code-block">
+            <span class="bug-code-label">Input / reproduction</span>
+            <pre class="bug-code is-input">${escapeHtml(b.inputSummary)}</pre>
+          </div>`
+        : "";
+      const reopenBtn =
+        b.status === "fixed" || b.status === "wontfix"
+          ? `<button type="button" class="secondary obs-btn-xs" box-="square" data-bug-action="open" data-bug-id="${b.id}">Reopen</button>`
+          : "";
+      return `
+      <div class="mind-item-row req-card" data-bug-card="${b.id}">
+        <div class="mind-item-head">
+          <div class="req-meta-pills">
+            <span class="ev-agent">@${escapeHtml(b.agent)}</span>
+            ${toolPill}
+            <span class="req-pill is-sev-${escapeHtml(b.severity)}">${escapeHtml(b.severity.toUpperCase())}</span>
+            <span class="req-pill is-status-${escapeHtml(b.status)}">${escapeHtml(b.status.toUpperCase())}</span>
+            ${countPill}
+          </div>
+          <div class="mind-item-actions">
+            <span class="ev-time">#${b.id}${runMeta} · ${escapeHtml(formatTime(b.updatedAt || b.createdAt))}</span>
+            <button type="button" class="obs-mini-btn is-danger" data-bug-delete="${b.id}" title="Delete bug report">×</button>
+          </div>
+        </div>
+        <strong class="req-title">${escapeHtml(b.title)}</strong>
+        <p class="req-reason">${escapeHtml(b.description)}</p>
+        ${errorBlock}
+        ${inputBlock}
+        <input
+          type="text"
+          class="mind-inline-input"
+          data-bug-note="${b.id}"
+          maxlength="500"
+          placeholder="Optional note to @${escapeHtml(b.agent)}…"
+          value="${escapeHtml(b.ownerNote || "")}"
+        />
+        <div class="obs-card-actions">
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-bug-action="investigating" data-bug-id="${b.id}">
+            Investigating
+          </button>
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-bug-action="fixed" data-bug-id="${b.id}">
+            Fixed
+          </button>
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-bug-action="wontfix" data-bug-id="${b.id}">
+            Won't fix
+          </button>
+          ${reopenBtn}
         </div>
       </div>`;
     })
@@ -1426,6 +1537,9 @@ function connectObservatory() {
       if (typeof data.openRequests === "number") {
         updateRequestBadge(data.openRequests);
       }
+      if (typeof data.openBugs === "number") {
+        updateBugBadge(data.openBugs);
+      }
       mergeObservatoryEvents(data.events || []);
     } else if (data.type === "request" || data.type === "request_deleted") {
       if (typeof data.openCount === "number") {
@@ -1433,6 +1547,13 @@ function connectObservatory() {
       }
       if (obsActiveView === "requests") {
         loadRequests().catch(() => {});
+      }
+    } else if (data.type === "bug" || data.type === "bug_deleted") {
+      if (typeof data.openBugs === "number") {
+        updateBugBadge(data.openBugs);
+      }
+      if (obsActiveView === "bugs") {
+        loadBugs().catch(() => {});
       }
     } else if (data.type === "event" && data.event) {
       mergeObservatoryEvents([data.event]);
@@ -1586,12 +1707,21 @@ async function route() {
     await loadObservatoryStatus();
     if (obsActiveView === "mind") {
       await loadMind(mindActiveAgent);
+      loadRequests().catch(() => {});
+      loadBugs().catch(() => {});
     } else if (obsActiveView === "dms") {
       await loadAgentDms();
+      loadRequests().catch(() => {});
+      loadBugs().catch(() => {});
     } else if (obsActiveView === "requests") {
       await loadRequests();
+      loadBugs().catch(() => {});
+    } else if (obsActiveView === "bugs") {
+      await loadBugs();
+      loadRequests().catch(() => {});
     } else {
       loadRequests().catch(() => {});
+      loadBugs().catch(() => {});
     }
     connectObservatory();
   } else {
@@ -1918,6 +2048,7 @@ document.getElementById("obs-reset-all-caps").addEventListener("click", async (e
 document.getElementById("obs-refresh").addEventListener("click", () => {
   loadObservatoryStatus().catch(() => {});
   loadRequests().catch(() => {});
+  loadBugs().catch(() => {});
   if (obsActiveView === "mind") {
     loadMind(mindActiveAgent).catch(() => {});
   } else if (obsActiveView === "dms") {
@@ -1986,6 +2117,46 @@ obsRequestsListEl.addEventListener("click", async (e) => {
         body: JSON.stringify({ status, ownerNote, grantRequestedTool }),
       });
       await loadRequests();
+      loadObservatoryStatus().catch(() => {});
+    } finally {
+      actionBtn.disabled = false;
+    }
+  }
+});
+
+bugFilterStatus.addEventListener("change", () => loadBugs().catch(() => {}));
+bugFilterSeverity.addEventListener("change", () => loadBugs().catch(() => {}));
+bugFilterAgent.addEventListener("change", () => loadBugs().catch(() => {}));
+
+obsBugsListEl.addEventListener("click", async (e) => {
+  const delBtn = e.target.closest("[data-bug-delete]");
+  if (delBtn) {
+    delBtn.disabled = true;
+    try {
+      await api(`/admin/bugs/${delBtn.dataset.bugDelete}`, {
+        method: "DELETE",
+      });
+      await loadBugs();
+    } finally {
+      delBtn.disabled = false;
+    }
+    return;
+  }
+
+  const actionBtn = e.target.closest("[data-bug-action]");
+  if (actionBtn) {
+    const id = actionBtn.dataset.bugId;
+    const status = actionBtn.dataset.bugAction;
+    const noteEl = obsBugsListEl.querySelector(`[data-bug-note="${id}"]`);
+    const ownerNote = noteEl ? noteEl.value : "";
+
+    actionBtn.disabled = true;
+    try {
+      await api(`/admin/bugs/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status, ownerNote }),
+      });
+      await loadBugs();
       loadObservatoryStatus().catch(() => {});
     } finally {
       actionBtn.disabled = false;

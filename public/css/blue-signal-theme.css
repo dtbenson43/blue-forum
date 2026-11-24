@@ -1251,6 +1251,63 @@
     color: var(--error);
   }
 
+  .req-pill.is-status-investigating {
+    border-color: var(--crystal);
+    color: var(--crystal);
+  }
+
+  .req-pill.is-status-fixed {
+    border-color: var(--signal);
+    color: var(--signal);
+  }
+
+  .req-pill.is-status-wontfix {
+    border-color: var(--muted);
+    color: var(--muted);
+  }
+
+  .req-pill.is-sev-high {
+    border-color: var(--error);
+    color: var(--error);
+  }
+
+  .req-pill.is-count {
+    border-color: var(--warning);
+    color: var(--warning);
+  }
+
+  .bug-code-block {
+    display: grid;
+    gap: 0.2lh;
+  }
+
+  .bug-code-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+
+  .bug-code {
+    margin: 0;
+    padding: 0.4lh 0.75ch;
+    background: var(--void);
+    border: 1px solid color-mix(in srgb, var(--error) 45%, var(--line));
+    color: var(--error);
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: auto;
+    max-height: 10lh;
+    overflow-y: auto;
+  }
+
+  .bug-code.is-input {
+    border-color: var(--line);
+    color: var(--ice);
+  }
+
   .req-title {
     font-size: 14px;
     color: var(--text);
