@@ -89,9 +89,29 @@ export type DiscoverRandomOutput = {
   untrustedBlock: string;
 };
 
+export type TextQueryPassage = {
+  startChar: number;
+  endChar: number;
+  matchType: "exact_phrase" | "all_words";
+};
+
+export type TextReadMetadata = {
+  totalChars: number;
+  charOffset: number;
+  returnedChars: number;
+  hasMoreChars: boolean;
+  nextCharOffset?: number;
+  fileByteCapped: boolean;
+  query?: string;
+  matchMode?: "exact_phrase" | "all_words" | "none";
+  totalMatches?: number;
+  passages?: TextQueryPassage[];
+};
+
 export type WebReadOptions = {
   pages?: string;
   query?: string;
+  charOffset?: number;
   rowOffset?: number;
   maxRows?: number;
   filterColumn?: string;
@@ -105,16 +125,21 @@ export type WebReadOutput = {
   contentType: string;
   truncated: boolean;
   untrustedBlock: string;
+  text?: TextReadMetadata;
   pdf?: PdfReadMetadata;
   csv?: CsvReadMetadata;
   pdfLinks?: Array<{ title: string; url: string }>;
   csvLinks?: Array<{ title: string; url: string }>;
 };
 
-const MAX_READ_BYTES = 256 * 1024; // 256 KB cap for HTML/text
+const MAX_READ_BYTES = 2 * 1024 * 1024; // 2 MB cap for HTML/text/JSON
 const MAX_CSV_READ_BYTES = 4 * 1024 * 1024; // 4 MB cap for public CSV/TSV
 const MAX_PDF_READ_BYTES = 8 * 1024 * 1024; // 8 MB cap for public PDFs
 const MAX_TEXT_CHARS = 6_000;
+const MAX_TEXT_QUERY_CHARS = 7_500;
+const TEXT_QUERY_CONTEXT_BEFORE = 320;
+const TEXT_QUERY_CONTEXT_AFTER = 680;
+const TEXT_QUERY_MERGE_GAP = 120;
 const MAX_PDF_TEXT_CHARS = 8_000;
 const MAX_CSV_TEXT_CHARS = 8_000;
 const DEFAULT_CSV_ROWS_PER_CALL = 40;
@@ -222,15 +247,28 @@ function decodeHtmlEntities(text: string): string {
     .replaceAll("&quot;", '"')
     .replaceAll("&#39;", "'")
     .replaceAll("&#x27;", "'")
+    .replaceAll("&mdash;", "—")
+    .replaceAll("&ndash;", "–")
+    .replaceAll("&rsquo;", "'")
+    .replaceAll("&lsquo;", "'")
+    .replaceAll("&rdquo;", '"')
+    .replaceAll("&ldquo;", '"')
+    .replaceAll("&hellip;", "...")
     .replace(/&#(\d+);/g, (_m, n) => {
       const code = Number(n);
+      return Number.isFinite(code) && code > 31 && code < 0x10ffff
+        ? String.fromCodePoint(code)
+        : " ";
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex) => {
+      const code = Number.parseInt(hex, 16);
       return Number.isFinite(code) && code > 31 && code < 0x10ffff
         ? String.fromCodePoint(code)
         : " ";
     });
 }
 
-function extractReadableText(
+export function extractReadableText(
   raw: string,
   contentType: string,
 ): { title: string; text: string } {
@@ -243,19 +281,299 @@ function extractReadableText(
     ? decodeHtmlEntities(titleMatch[1]!.replace(/\s+/g, " ").trim()).slice(0, 160)
     : "";
 
+  const COL_SEP_MARKER = "\uE000";
   const stripped = raw
     .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/<(script|style|noscript|svg|template|iframe)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
-    .replace(/<\/?(p|div|section|article|main|h[1-6]|li|tr|br|blockquote|pre)\b[^>]*>/gi, "\n")
+    .replace(/<\/t[dh]>\s*<t[dh]\b[^>]*>/gi, COL_SEP_MARKER)
+    .replace(
+      /<\/?(p|div|section|article|main|header|footer|aside|nav|figure|figcaption|h[1-6]|li|tr|table|thead|tbody|tfoot|caption|dt|dd|br|blockquote|pre)\b[^>]*>/gi,
+      "\n",
+    )
     .replace(/<[^>]+>/g, " ");
 
   const decoded = decodeHtmlEntities(stripped)
     .replace(/[ \t\r]+/g, " ")
-    .replace(/\n[ \t]+/g, "\n")
+    .replaceAll(COL_SEP_MARKER, "  |  ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
   return { title, text: decoded };
+}
+
+function snapStartToBoundary(text: string, rawStart: number, minStart: number): number {
+  if (rawStart <= minStart) return minStart;
+  const lookback = Math.max(minStart, rawStart - 40);
+  const nl = text.lastIndexOf("\n", rawStart);
+  if (nl >= lookback) return nl + 1;
+  const sp = text.lastIndexOf(" ", rawStart);
+  if (sp >= lookback) return sp + 1;
+  return rawStart;
+}
+
+function snapEndToBoundary(text: string, rawEnd: number, maxEnd: number): number {
+  if (rawEnd >= maxEnd) return maxEnd;
+  const lookahead = Math.min(maxEnd, rawEnd + 40);
+  const nl = text.indexOf("\n", rawEnd);
+  if (nl !== -1 && nl <= lookahead) return nl;
+  const sp = text.indexOf(" ", rawEnd);
+  if (sp !== -1 && sp <= lookahead) return sp;
+  return rawEnd;
+}
+
+function tokenizeQueryWords(query: string): string[] {
+  return Array.from(
+    new Set(
+      query
+        .toLowerCase()
+        .split(/\s+/)
+        .map((w) => w.replace(/^[^a-z0-9%£$€._-]+|[^a-z0-9%£$€._-]+$/gi, ""))
+        .filter((w) => w.length >= 2 || /^\d+$/.test(w)),
+    ),
+  );
+}
+
+/**
+ * Slice extracted HTML/text/JSON content by char_offset, or search the full
+ * extracted text with query and return bounded, merged passages with context.
+ */
+export function extractTextWindowOrQuery(
+  fullText: string,
+  fileByteCapped: boolean,
+  options?: Pick<WebReadOptions, "query" | "charOffset">,
+): {
+  bodyText: string;
+  truncated: boolean;
+  meta: TextReadMetadata;
+} {
+  const totalChars = fullText.length;
+  const charOffset =
+    typeof options?.charOffset === "number" &&
+    Number.isFinite(options.charOffset) &&
+    options.charOffset >= 0
+      ? Math.floor(options.charOffset)
+      : 0;
+  const query = options?.query?.trim().slice(0, 200) || "";
+
+  // Mode A: keyword / phrase search across full extracted text
+  if (query) {
+    const searchStart = Math.min(charOffset, totalChars);
+    const lowerFull = fullText.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+
+    type RawHit = { start: number; end: number; matchType: "exact_phrase" | "all_words" };
+    const hits: RawHit[] = [];
+
+    // 1. Exact phrase matches
+    let pos = searchStart;
+    while (pos < totalChars && hits.length < 200) {
+      const idx = lowerFull.indexOf(lowerQuery, pos);
+      if (idx === -1) break;
+      hits.push({ start: idx, end: idx + lowerQuery.length, matchType: "exact_phrase" });
+      pos = idx + Math.max(1, lowerQuery.length);
+    }
+
+    // 2. Fallback: all-words matches across paragraphs (and adjacent paragraph pairs)
+    let matchMode: "exact_phrase" | "all_words" | "none" =
+      hits.length > 0 ? "exact_phrase" : "none";
+
+    if (hits.length === 0) {
+      const words = tokenizeQueryWords(query);
+      if (words.length >= 2) {
+        // Split into non-empty line/paragraph blocks with character offsets
+        const blocks: Array<{ start: number; end: number; lower: string }> = [];
+        const lineRe = /[^\n]+/g;
+        lineRe.lastIndex = searchStart;
+        let m: RegExpExecArray | null;
+        while ((m = lineRe.exec(fullText)) !== null) {
+          blocks.push({
+            start: m.index,
+            end: m.index + m[0].length,
+            lower: m[0].toLowerCase(),
+          });
+        }
+
+        for (let i = 0; i < blocks.length && hits.length < 200; i++) {
+          const cur = blocks[i]!;
+          if (words.every((w) => cur.lower.includes(w))) {
+            hits.push({ start: cur.start, end: cur.end, matchType: "all_words" });
+            continue;
+          }
+          // Check minimal consecutive block span up to 800 chars (covers heading + table header + rows)
+          let combined = cur.lower;
+          for (let j = i + 1; j < blocks.length; j++) {
+            const nxt = blocks[j]!;
+            if (nxt.end - cur.start > 800) break;
+            combined += `\n${nxt.lower}`;
+            if (words.every((w) => combined.includes(w))) {
+              hits.push({ start: cur.start, end: nxt.end, matchType: "all_words" });
+              i = j;
+              break;
+            }
+          }
+        }
+        if (hits.length > 0) {
+          matchMode = "all_words";
+        }
+      }
+    }
+
+    if (hits.length === 0) {
+      return {
+        bodyText: `(0 passages matched query ${JSON.stringify(query)} across ${totalChars} extracted chars${searchStart > 0 ? ` starting at char_offset=${searchStart}` : ""}${fileByteCapped ? "; raw page exceeded 2 MB byte cap" : ""})`,
+        truncated: fileByteCapped,
+        meta: {
+          totalChars,
+          charOffset: searchStart,
+          returnedChars: 0,
+          hasMoreChars: false,
+          fileByteCapped,
+          query,
+          matchMode: "none",
+          totalMatches: 0,
+          passages: [],
+        },
+      };
+    }
+
+    // Build context windows & merge overlapping/nearby windows
+    type Window = { start: number; end: number; matchType: "exact_phrase" | "all_words" };
+    const windows: Window[] = [];
+    for (const h of hits) {
+      const start = snapStartToBoundary(
+        fullText,
+        Math.max(searchStart, h.start - TEXT_QUERY_CONTEXT_BEFORE),
+        searchStart,
+      );
+      const end = snapEndToBoundary(
+        fullText,
+        Math.min(totalChars, h.end + TEXT_QUERY_CONTEXT_AFTER),
+        totalChars,
+      );
+      const prev = windows[windows.length - 1];
+      if (prev && start <= prev.end + TEXT_QUERY_MERGE_GAP) {
+        prev.end = Math.max(prev.end, end);
+      } else {
+        windows.push({ start, end, matchType: h.matchType });
+      }
+    }
+
+    const renderedPassages: string[] = [];
+    const returnedPassages: TextQueryPassage[] = [];
+    let usedChars = 0;
+    let omittedCount = 0;
+    let nextCharOffset: number | undefined;
+
+    for (let i = 0; i < windows.length; i++) {
+      const w = windows[i]!;
+      const header = `--- Passage ${i + 1} [chars ${w.start}–${w.end} of ${totalChars}] ---`;
+      let snippet = fullText.slice(w.start, w.end).trim();
+      const overhead = header.length + 1 + (renderedPassages.length > 0 ? 2 : 0);
+      const remaining = MAX_TEXT_QUERY_CHARS - usedChars - overhead;
+
+      if (remaining < 160) {
+        omittedCount = windows.length - i;
+        nextCharOffset = w.start;
+        break;
+      }
+
+      let actualEnd = w.end;
+      if (snippet.length > remaining) {
+        snippet = `${snippet.slice(0, Math.max(80, remaining - 3)).trimEnd()}...`;
+        actualEnd = Math.min(w.end, w.start + remaining);
+        omittedCount = windows.length - i - 1;
+        nextCharOffset = actualEnd;
+      }
+
+      const block = `${header}\n${snippet}`;
+      renderedPassages.push(block);
+      returnedPassages.push({
+        startChar: w.start,
+        endChar: actualEnd,
+        matchType: w.matchType,
+      });
+      usedChars += block.length + (renderedPassages.length > 1 ? 2 : 0);
+
+      if (nextCharOffset !== undefined) {
+        break;
+      }
+    }
+
+    const hasMoreChars = nextCharOffset !== undefined;
+    const footer = hasMoreChars
+      ? `\n[truncated — returned ${returnedPassages.length} of ${windows.length} matching passage(s) (${hits.length} total hit(s)); pass query=${JSON.stringify(query)} with char_offset=${nextCharOffset} to inspect later matches]`
+      : fileByteCapped
+        ? `\n[note — raw page exceeded 2 MB byte cap; ${returnedPassages.length} matching passage(s) found within fetched portion]`
+        : "";
+
+    return {
+      bodyText: `${renderedPassages.join("\n\n")}${footer}`,
+      truncated: hasMoreChars || fileByteCapped,
+      meta: {
+        totalChars,
+        charOffset: searchStart,
+        returnedChars: usedChars,
+        hasMoreChars,
+        ...(nextCharOffset !== undefined ? { nextCharOffset } : {}),
+        fileByteCapped,
+        query,
+        matchMode,
+        totalMatches: hits.length,
+        passages: returnedPassages,
+      },
+    };
+  }
+
+  // Mode B: sequential char_offset slice
+  if (charOffset >= totalChars) {
+    return {
+      bodyText:
+        totalChars === 0
+          ? "(no readable text extracted)"
+          : `(char_offset=${charOffset} is at or past end of extracted text; total_chars=${totalChars})`,
+      truncated: fileByteCapped,
+      meta: {
+        totalChars,
+        charOffset,
+        returnedChars: 0,
+        hasMoreChars: false,
+        fileByteCapped,
+      },
+    };
+  }
+
+  let end = Math.min(totalChars, charOffset + MAX_TEXT_CHARS);
+  if (end < totalChars) {
+    // Snap backward slightly to a newline or space so we don't chop mid-word
+    const minSnap = charOffset + Math.floor(MAX_TEXT_CHARS * 0.85);
+    const nl = fullText.lastIndexOf("\n", end);
+    if (nl >= minSnap) {
+      end = nl;
+    } else {
+      const sp = fullText.lastIndexOf(" ", end);
+      if (sp >= minSnap) {
+        end = sp;
+      }
+    }
+  }
+
+  const snippet = fullText.slice(charOffset, end);
+  const hasMoreChars = end < totalChars;
+  const nextCharOffset = hasMoreChars ? end : undefined;
+
+  return {
+    bodyText: snippet || "(no readable text extracted)",
+    truncated: hasMoreChars || fileByteCapped,
+    meta: {
+      totalChars,
+      charOffset,
+      returnedChars: snippet.length,
+      hasMoreChars,
+      ...(nextCharOffset !== undefined ? { nextCharOffset } : {}),
+      fileByteCapped,
+    },
+  };
 }
 
 function extractPdfLinksFromHtml(
@@ -1225,6 +1543,7 @@ export async function readWebPage(
     Boolean(
       options?.pages ||
         options?.query ||
+        options?.charOffset !== undefined ||
         options?.filterColumn ||
         options?.filterValue !== undefined ||
         options?.rowOffset !== undefined,
@@ -1353,8 +1672,11 @@ export async function readWebPage(
   const csvLinks = rawContentType.includes("html")
     ? extractCsvLinksFromHtml(rawBody, currentUrl)
     : [];
-  const truncated = capped || text.length > MAX_TEXT_CHARS;
-  const snippet = text.slice(0, MAX_TEXT_CHARS);
+
+  const sliced = extractTextWindowOrQuery(text, capped, {
+    query: options?.query,
+    charOffset: options?.charOffset,
+  });
 
   const safeUrl = currentUrl.toString().replaceAll('"', "&quot;");
   const safeTitle = title.replaceAll('"', "&quot;");
@@ -1374,12 +1696,23 @@ export async function readWebPage(
           ...csvLinks.map((l, i) => `${i + 1}. ${l.title} — ${l.url}`),
         ].join("\n")
       : "";
+
+  const truncNote =
+    !sliced.meta.query && sliced.meta.hasMoreChars && sliced.meta.nextCharOffset !== undefined
+      ? `\n[truncated — showing chars ${sliced.meta.charOffset}–${sliced.meta.charOffset + sliced.meta.returnedChars} of ${sliced.meta.totalChars}${capped ? "; raw page exceeded 2 MB cap" : ""}; pass char_offset=${sliced.meta.nextCharOffset} to continue or query="..." to search the full page]`
+      : !sliced.meta.query && capped
+        ? `\n[note — raw page exceeded 2 MB byte cap; total_chars extracted=${sliced.meta.totalChars}]`
+        : "";
+
+  const queryAttr = sliced.meta.query
+    ? ` query="${sliced.meta.query.replaceAll('"', "&quot;")}" matches="${sliced.meta.totalMatches ?? 0}"`
+    : "";
   const untrustedBlock = [
-    `<untrusted_web_page url="${safeUrl}"${safeTitle ? ` title="${safeTitle}"` : ""}>`,
-    snippet || "(no readable text extracted)",
+    `<untrusted_web_page url="${safeUrl}"${safeTitle ? ` title="${safeTitle}"` : ""} total_chars="${sliced.meta.totalChars}" char_offset="${sliced.meta.charOffset}" returned_chars="${sliced.meta.returnedChars}"${queryAttr}>`,
+    sliced.bodyText || "(no readable text extracted)",
     pdfLinkBlock,
     csvLinkBlock,
-    truncated ? "\n[truncated]" : "",
+    truncNote,
     `</untrusted_web_page>`,
   ]
     .filter(Boolean)
@@ -1390,8 +1723,9 @@ export async function readWebPage(
     finalUrl: currentUrl.toString(),
     title,
     contentType: rawContentType,
-    truncated,
+    truncated: sliced.truncated,
     untrustedBlock,
+    text: sliced.meta,
     ...(pdfLinks.length > 0 ? { pdfLinks } : {}),
     ...(csvLinks.length > 0 ? { csvLinks } : {}),
   };
