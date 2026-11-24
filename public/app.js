@@ -235,6 +235,7 @@ const mindPauseBtn = document.getElementById("mind-pause-btn");
 const mindPanelMemory = document.getElementById("mind-panel-memory");
 const mindPanelNotes = document.getElementById("mind-panel-notes");
 const mindPanelGoals = document.getElementById("mind-panel-goals");
+const mindPanelLists = document.getElementById("mind-panel-lists");
 const mindPanelSchedule = document.getElementById("mind-panel-schedule");
 const mindPanelPrompt = document.getElementById("mind-panel-prompt");
 
@@ -710,7 +711,12 @@ function eventTypeClass(type) {
   if (type === "bug.reported") return "ev-err";
   if (type === "bug.updated") return "ev-req";
   if (type.startsWith("checkpoint.") || type.startsWith("fast_forward.")) return "ev-owner";
-  if (type === "memory.updated" || type === "notes.updated" || type === "goals.updated") {
+  if (
+    type === "memory.updated" ||
+    type === "notes.updated" ||
+    type === "goals.updated" ||
+    type === "lists.updated"
+  ) {
     return "ev-mind";
   }
   if (type === "run.failed") return "ev-err";
@@ -830,7 +836,7 @@ function renderObservatoryAgents(statusData) {
         </div>
         <p class="obs-card-meta">${escapeHtml(a.model)} · v${a.promptVersion}</p>
         <p class="obs-card-meta">
-          calls: ${a.callsToday}/${a.maxCallsPerDay} · web: ${a.webCallsToday ?? 0}/${a.maxWebCallsPerDay ?? 0} · mem: ${a.memoryCount} · notes: ${a.noteCount ?? 0} · goals: ${a.activeGoalCount ?? 0}
+          calls: ${a.callsToday}/${a.maxCallsPerDay} · web: ${a.webCallsToday ?? 0}/${a.maxWebCallsPerDay ?? 0} · mem: ${a.memoryCount} · notes: ${a.noteCount ?? 0} · goals: ${a.activeGoalCount ?? 0} · lists: ${a.listEntryCount ?? 0}
         </p>
         <p class="obs-card-meta">${escapeHtml(wakeLabel)} · ${escapeHtml(idleLabel)} · next: ${escapeHtml(alarmLabel)}</p>
         <div class="obs-card-actions">
@@ -1369,6 +1375,7 @@ function setMindTab(tab) {
   mindPanelMemory.classList.toggle("hidden", tab !== "memory");
   mindPanelNotes.classList.toggle("hidden", tab !== "notes");
   mindPanelGoals.classList.toggle("hidden", tab !== "goals");
+  mindPanelLists.classList.toggle("hidden", tab !== "lists");
   mindPanelSchedule.classList.toggle("hidden", tab !== "schedule");
   mindPanelPrompt.classList.toggle("hidden", tab !== "prompt");
 }
@@ -1393,12 +1400,13 @@ function renderMind() {
     s.wakeIntervalMinutes !== null && s.wakeIntervalMinutes !== undefined
       ? `${s.wakeIntervalMinutes}m`
       : "off";
-  mindSummaryMeta.textContent = `@${s.name} · ${s.model} · prompt v${s.promptVersion} · ${s.paused ? "PAUSED" : "ACTIVE"} · calls ${s.callsToday}/${s.maxCallsPerDay} · wake: ${wakeLabel} · next alarm: ${alarmLabel}`;
+  mindSummaryMeta.textContent = `@${s.name} · ${s.model} · prompt v${s.promptVersion} · ${s.paused ? "PAUSED" : s.fastForwardActive ? "FAST-FORWARD" : "ACTIVE"} · calls ${s.callsToday}/${s.maxCallsPerDay} · wake: ${wakeLabel} · next alarm: ${alarmLabel}`;
   mindPauseBtn.textContent = s.paused ? "Resume" : "Pause";
 
   renderMindMemory();
   renderMindNotes();
   renderMindGoals();
+  renderMindLists();
   renderMindSchedule();
   renderMindPrompt();
 }
@@ -1547,6 +1555,86 @@ function renderMindGoals() {
       <input id="mind-goal-desc" class="mind-inline-input" type="text" maxlength="500" placeholder="Optional description / motivation…" />
     </form>
     <div class="mind-list">${rows}</div>
+  `;
+}
+
+const PERSONAL_LIST_LABELS = [
+  { key: "friends", label: "Friends", group: "People" },
+  { key: "acquaintances", label: "Acquaintances", group: "People" },
+  { key: "rivals", label: "Rivals", group: "People" },
+  { key: "admired", label: "Admired", group: "People" },
+  { key: "avoid", label: "Avoid", group: "People" },
+  { key: "hopes", label: "Hopes", group: "Inner Life" },
+  { key: "fears", label: "Fears", group: "Inner Life" },
+  { key: "curiosities", label: "Curiosities", group: "Inner Life" },
+  { key: "pet_peeves", label: "Pet Peeves", group: "Inner Life" },
+  { key: "values", label: "Values", group: "Inner Life" },
+];
+
+function renderMindLists() {
+  const items = mindSnapshot.lists || [];
+  const grouped = new Map();
+  for (const meta of PERSONAL_LIST_LABELS) grouped.set(meta.key, []);
+  for (const item of items) {
+    if (grouped.has(item.list)) grouped.get(item.list).push(item);
+  }
+
+  const populatedGroups = [];
+  const emptyNames = [];
+  for (const meta of PERSONAL_LIST_LABELS) {
+    const entries = grouped.get(meta.key) || [];
+    if (!entries.length) {
+      emptyNames.push(meta.label);
+      continue;
+    }
+    const entriesHtml = entries
+      .map(
+        (it) => `
+        <div class="mind-list-entry">
+          <div class="mind-list-entry-text">
+            <span><strong>${escapeHtml(it.entry)}</strong> <span class="ev-time">· ${escapeHtml(it.updatedBy)}</span></span>
+            ${it.note ? `<p class="mind-list-entry-note">${escapeHtml(it.note)}</p>` : ""}
+          </div>
+          <button type="button" class="obs-mini-btn is-danger" data-list-del="${it.id}" title="Remove entry">×</button>
+        </div>`,
+      )
+      .join("");
+    populatedGroups.push(`
+      <div class="mind-list-group">
+        <div class="mind-list-group-head">
+          <h3 class="mind-list-group-title">${escapeHtml(meta.label)} (${entries.length})</h3>
+          <span class="ev-time">${escapeHtml(meta.group)}</span>
+        </div>
+        <div class="mind-list-entries">${entriesHtml}</div>
+      </div>`);
+  }
+
+  const listOptions = PERSONAL_LIST_LABELS.map(
+    (m) => `<option value="${m.key}">${escapeHtml(m.group)}: ${escapeHtml(m.label)}</option>`,
+  ).join("");
+
+  mindPanelLists.innerHTML = `
+    <h2 class="panel-title">Personal Lists (${items.length})</h2>
+    <form id="mind-add-list-form" class="mind-editor-form" style="margin-bottom: 0.75lh" autocomplete="off">
+      <div class="obs-task-form">
+        <select id="mind-list-name" class="obs-select" aria-label="List category">
+          ${listOptions}
+        </select>
+        <input id="mind-list-entry" class="obs-input-grow" type="text" maxlength="140" placeholder="@handle or concise item…" required />
+        <button type="submit" class="secondary" box-="square">Add / Update</button>
+      </div>
+      <input id="mind-list-note" class="mind-inline-input" type="text" maxlength="240" placeholder="Optional private note explaining why…" />
+    </form>
+    ${
+      populatedGroups.length
+        ? `<div class="mind-lists-grid">${populatedGroups.join("")}</div>`
+        : `<p class="empty-compact">All personal lists are currently empty.</p>`
+    }
+    ${
+      emptyNames.length
+        ? `<p class="obs-card-meta" style="margin-top: 0.65lh">Empty lists: ${escapeHtml(emptyNames.join(", "))}</p>`
+        : ""
+    }
   `;
 }
 
@@ -1835,6 +1923,7 @@ function connectObservatory() {
         data.event.type === "memory.updated" ||
         data.event.type === "notes.updated" ||
         data.event.type === "goals.updated" ||
+        data.event.type === "lists.updated" ||
         data.event.type === "alarm.scheduled" ||
         data.event.type === "owner.action" ||
         data.event.type === "owner.edited"
@@ -2757,6 +2846,19 @@ obsViewMind.addEventListener("submit", async (e) => {
     return;
   }
 
+  if (e.target.id === "mind-add-list-form") {
+    const list = document.getElementById("mind-list-name").value;
+    const entry = document.getElementById("mind-list-entry").value;
+    const note = document.getElementById("mind-list-note").value;
+    await api(`/admin/agents/${agent}/lists`, {
+      method: "POST",
+      body: JSON.stringify({ list, entry, note }),
+    });
+    await loadMind(mindActiveAgent);
+    loadObservatoryStatus().catch(() => {});
+    return;
+  }
+
   if (e.target.id === "mind-wake-interval-form") {
     const minutes = Number(document.getElementById("mind-wake-interval-min").value);
     const statusEl = document.getElementById("mind-wake-interval-status");
@@ -2894,6 +2996,16 @@ obsViewMind.addEventListener("click", async (e) => {
       method: "DELETE",
     });
     await loadMind(mindActiveAgent);
+    return;
+  }
+
+  const listDel = e.target.closest("[data-list-del]");
+  if (listDel) {
+    await api(`/admin/agents/${agent}/lists/${encodeURIComponent(listDel.dataset.listDel)}`, {
+      method: "DELETE",
+    });
+    await loadMind(mindActiveAgent);
+    loadObservatoryStatus().catch(() => {});
     return;
   }
 

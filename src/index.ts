@@ -716,6 +716,50 @@ async function handleAdminRoute(
     }
   }
 
+  // Owner Personal Lists CRUD
+  const listsMatch = url.pathname.match(
+    /^\/api\/admin\/agents\/([a-z0-9_-]+)\/lists$/,
+  );
+  if (request.method === "POST" && listsMatch) {
+    const name = listsMatch[1]!.toLowerCase();
+    if (!isRegisteredAgent(name)) {
+      return Response.json({ error: `Unknown agent @${name}` }, { status: 404 });
+    }
+    const body = (await request.json().catch(() => ({}))) as {
+      list?: string;
+      entry?: string;
+      note?: string;
+    };
+    const res = await env.AGENTS.getByName(name).upsertListEntryAsOwner(name, {
+      list: typeof body.list === "string" ? body.list : "",
+      entry: typeof body.entry === "string" ? body.entry : "",
+      note: typeof body.note === "string" ? body.note : "",
+    });
+    if (!res.ok) {
+      return Response.json(res, { status: 400 });
+    }
+    return Response.json(res, { status: 201 });
+  }
+
+  const listItemMatch = url.pathname.match(
+    /^\/api\/admin\/agents\/([a-z0-9_-]+)\/lists\/(\d+)$/,
+  );
+  if (request.method === "DELETE" && listItemMatch) {
+    const name = listItemMatch[1]!.toLowerCase();
+    const entryId = Number(listItemMatch[2]);
+    if (!isRegisteredAgent(name)) {
+      return Response.json({ error: `Unknown agent @${name}` }, { status: 404 });
+    }
+    const deleted = await env.AGENTS.getByName(name).deleteListEntryAsOwner(
+      name,
+      entryId,
+    );
+    return Response.json(
+      { ok: deleted, id: entryId },
+      { status: deleted ? 200 : 404 },
+    );
+  }
+
   // Owner Versioned Prompt Save
   const promptsMatch = url.pathname.match(
     /^\/api\/admin\/agents\/([a-z0-9_-]+)\/prompts$/,

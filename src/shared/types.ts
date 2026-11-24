@@ -232,10 +232,54 @@ export type ToolGroup =
   | "memory"
   | "notes"
   | "goals"
+  | "lists"
   | "web"
   | "requests"
   | "bugs"
   | "self";
+
+export type PersonalListName =
+  | "friends"
+  | "acquaintances"
+  | "rivals"
+  | "admired"
+  | "avoid"
+  | "hopes"
+  | "fears"
+  | "curiosities"
+  | "pet_peeves"
+  | "values";
+
+export const PEOPLE_LIST_NAMES: readonly PersonalListName[] = [
+  "friends",
+  "acquaintances",
+  "rivals",
+  "admired",
+  "avoid",
+];
+
+export const INNER_LIST_NAMES: readonly PersonalListName[] = [
+  "hopes",
+  "fears",
+  "curiosities",
+  "pet_peeves",
+  "values",
+];
+
+export const ALL_PERSONAL_LIST_NAMES: readonly PersonalListName[] = [
+  ...PEOPLE_LIST_NAMES,
+  ...INNER_LIST_NAMES,
+];
+
+export type AgentListEntry = {
+  id: number;
+  list: PersonalListName;
+  entry: string;
+  note: string;
+  updatedBy: string;
+  createdAt: string;
+  updatedAt: string;
+};
 
 export type RequestKind = "feature" | "tool_access";
 export type RequestPriority = "low" | "normal" | "high";
@@ -294,6 +338,7 @@ export type AgentEventType =
   | "memory.updated"
   | "notes.updated"
   | "goals.updated"
+  | "lists.updated"
   | "schedule.updated"
   | "request.submitted"
   | "request.updated"
@@ -434,9 +479,20 @@ export type AgentStateSnapshot = {
       status: string;
       created_at: string;
     }>;
+    personalLists?: Array<{
+      id: number;
+      list_name: string;
+      entry: string;
+      entry_key: string;
+      note: string;
+      updated_by: string;
+      created_at: string;
+      updated_at: string;
+    }>;
     sequences: {
       memory: number;
       systemNotices: number;
+      personalLists?: number;
     };
   };
   config: {
@@ -541,6 +597,7 @@ export type AgentStatusSnapshot = {
   memoryCount: number;
   noteCount: number;
   activeGoalCount: number;
+  listEntryCount?: number;
   pendingTasks: ScheduledTask[];
   recentRuns: AgentRunLogEntry[];
 };
@@ -555,6 +612,7 @@ export type AgentMindSnapshot = {
   memories: AgentMemory[];
   notes: AgentNote[];
   goals: AgentGoal[];
+  lists: AgentListEntry[];
   pendingTasks: ScheduledTask[];
   tools: ToolDescriptor[];
 };

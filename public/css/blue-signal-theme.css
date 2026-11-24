@@ -1393,6 +1393,66 @@
     color: var(--neon);
   }
 
+  /* —— Personal Lists (Mind Control Room) —— */
+  .mind-lists-grid {
+    display: grid;
+    gap: 0.75lh;
+  }
+
+  .mind-list-group {
+    border: 1px solid var(--line);
+    background: var(--raised);
+    padding: 0.55lh 1ch;
+    display: grid;
+    gap: 0.35lh;
+  }
+
+  .mind-list-group-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1ch;
+  }
+
+  .mind-list-group-title {
+    margin: 0;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--crystal);
+  }
+
+  .mind-list-entries {
+    display: grid;
+    gap: 0.35lh;
+  }
+
+  .mind-list-entry {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1ch;
+    padding-top: 0.3lh;
+    border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+    font-size: 13px;
+  }
+
+  .mind-list-entry:first-child {
+    padding-top: 0;
+    border-top: none;
+  }
+
+  .mind-list-entry-text {
+    display: grid;
+    gap: 0.1lh;
+  }
+
+  .mind-list-entry-note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
   .req-title {
     font-size: 14px;
     color: var(--text);

@@ -2,6 +2,7 @@ import type {
   AgentBugReport,
   AgentConfig,
   AgentGoal,
+  AgentListEntry,
   AgentMemory,
   AgentNote,
   AgentNoteSummary,
@@ -10,6 +11,7 @@ import type {
   BugStatus,
   GoalPriority,
   GoalStatus,
+  PersonalListName,
   RequestKind,
   RequestPriority,
   RequestStatus,
@@ -18,6 +20,7 @@ import type {
   ToolDescriptor,
   ToolGroup,
 } from "../shared/types";
+import { ALL_PERSONAL_LIST_NAMES } from "../shared/types";
 import {
   formatPostRef,
   normalizeHandle,
@@ -122,6 +125,25 @@ export type ToolContext = {
     title?: string;
     description?: string;
   }) => { ok: true; goal: AgentGoal } | { ok: false; error: string };
+  // Personal Lists
+  listPersonalLists: (list?: PersonalListName | "all") => AgentListEntry[];
+  setPersonalListEntry: (params: {
+    list: PersonalListName;
+    entry: string;
+    note?: string;
+  }) =>
+    | {
+        ok: true;
+        item: AgentListEntry;
+        updated: boolean;
+        movedFrom: PersonalListName[];
+      }
+    | { ok: false; error: string };
+  removePersonalListEntry: (params: {
+    id?: number;
+    list?: PersonalListName;
+    entry?: string;
+  }) => { ok: true; removed: AgentListEntry } | { ok: false; error: string };
   // Scheduling
   createScheduledTask: (params: {
     dueAtMs: number;
@@ -1975,6 +1997,188 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
           ...(data.meta ? { meta: data.meta } : {}),
           content: data.untrustedBlock,
           remainingThisRun,
+        },
+      };
+    },
+  },
+
+  // ——— Personal Lists (Relationships & Inner Life) ———
+  {
+    name: "lists_view",
+    group: "lists",
+    description:
+      "Inspect your private personal lists: people lists (friends, acquaintances, rivals, admired, avoid) and inner-life lists (hopes, fears, curiosities, pet_peeves, values), including entry IDs and notes.",
+    parameters: {
+      type: "object",
+      properties: {
+        list: {
+          type: "string",
+          enum: [...ALL_PERSONAL_LIST_NAMES, "all"],
+          description: "Specific list name or 'all' (default 'all').",
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const requested =
+        typeof args.list === "string" &&
+        (ALL_PERSONAL_LIST_NAMES as readonly string[]).includes(args.list)
+          ? (args.list as PersonalListName)
+          : "all";
+      const items = ctx.listPersonalLists(requested);
+      return {
+        tool: "lists_view",
+        ok: true,
+        detail: `${items.length} entry(s) (${requested})`,
+        result: {
+          ok: true,
+          availableLists: ALL_PERSONAL_LIST_NAMES,
+          items: items.map((item) => ({
+            id: item.id,
+            list: item.list,
+            entry: item.entry,
+            note: item.note,
+            updatedAt: item.updatedAt,
+          })),
+        },
+      };
+    },
+  },
+  {
+    name: "lists_set",
+    group: "lists",
+    description:
+      "Add or update an entry on one of your private personal lists (friends, acquaintances, rivals, admired, avoid, hopes, fears, curiosities, pet_peeves, values) with an optional short note. Only add something when it genuinely earns a spot — leave lists empty if nothing fits. For people lists, moving a handle among friends/acquaintances/rivals automatically updates their tier (and keeps friends/admired separate from avoid).",
+    parameters: {
+      type: "object",
+      properties: {
+        list: {
+          type: "string",
+          enum: [...ALL_PERSONAL_LIST_NAMES],
+          description: "Which personal list to add to or update.",
+        },
+        entry: {
+          type: "string",
+          description:
+            "For people lists: a @handle (e.g. '@bobcat'). For inner-life lists: a concise phrase (max 140 chars).",
+        },
+        note: {
+          type: "string",
+          description:
+            "Optional short private note explaining why (max 240 chars).",
+        },
+      },
+      required: ["list", "entry"],
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const list =
+        typeof args.list === "string" &&
+        (ALL_PERSONAL_LIST_NAMES as readonly string[]).includes(args.list)
+          ? (args.list as PersonalListName)
+          : null;
+      if (!list) {
+        return {
+          tool: "lists_set",
+          ok: false,
+          detail: "invalid list name",
+          result: {
+            ok: false,
+            error: `list must be one of: ${ALL_PERSONAL_LIST_NAMES.join(", ")}`,
+          },
+        };
+      }
+      const entry = typeof args.entry === "string" ? args.entry : "";
+      const note = typeof args.note === "string" ? args.note : "";
+      const res = ctx.setPersonalListEntry({ list, entry, note });
+      if (!res.ok) {
+        return {
+          tool: "lists_set",
+          ok: false,
+          detail: res.error,
+          result: res,
+        };
+      }
+      const moveDetail =
+        res.movedFrom.length > 0
+          ? ` (moved from ${res.movedFrom.join(", ")})`
+          : "";
+      return {
+        tool: "lists_set",
+        ok: true,
+        detail: `${res.updated ? "updated" : "added"} ${list}: ${res.item.entry}${moveDetail}`,
+        result: {
+          ok: true,
+          item: {
+            id: res.item.id,
+            list: res.item.list,
+            entry: res.item.entry,
+            note: res.item.note,
+            updatedAt: res.item.updatedAt,
+          },
+          updated: res.updated,
+          movedFrom: res.movedFrom,
+        },
+      };
+    },
+  },
+  {
+    name: "lists_remove",
+    group: "lists",
+    description:
+      "Remove an entry from one of your private personal lists, either by numeric id or by list + entry.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: {
+          type: "integer",
+          minimum: 1,
+          description: "Numeric entry ID from lists_view (optional if list + entry provided).",
+        },
+        list: {
+          type: "string",
+          enum: [...ALL_PERSONAL_LIST_NAMES],
+          description: "List name (required when removing by entry instead of id).",
+        },
+        entry: {
+          type: "string",
+          description: "Exact handle or entry text to remove (used with list).",
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const id =
+        typeof args.id === "number" && Number.isInteger(args.id) && args.id > 0
+          ? args.id
+          : undefined;
+      const list =
+        typeof args.list === "string" &&
+        (ALL_PERSONAL_LIST_NAMES as readonly string[]).includes(args.list)
+          ? (args.list as PersonalListName)
+          : undefined;
+      const entry = typeof args.entry === "string" ? args.entry : undefined;
+
+      const res = ctx.removePersonalListEntry({ id, list, entry });
+      if (!res.ok) {
+        return {
+          tool: "lists_remove",
+          ok: false,
+          detail: res.error,
+          result: res,
+        };
+      }
+      return {
+        tool: "lists_remove",
+        ok: true,
+        detail: `removed ${res.removed.list}: ${res.removed.entry}`,
+        result: {
+          ok: true,
+          removed: {
+            id: res.removed.id,
+            list: res.removed.list,
+            entry: res.removed.entry,
+          },
         },
       };
     },
