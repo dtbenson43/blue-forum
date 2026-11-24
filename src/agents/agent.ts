@@ -2388,9 +2388,8 @@ export class Agent extends DurableObject<AgentEnv> {
     priorWrites: JobWriteRow[];
   }): string {
     const lines: string[] = [
-      `Wake trigger: ${params.trigger}`,
-      `Current UTC time: ${new Date().toISOString()}`,
       `Handle: @${params.config.name} (prompt v${params.promptVersion})`,
+      `Wake trigger: ${params.trigger}`,
       "",
     ];
 
@@ -2526,6 +2525,7 @@ export class Agent extends DurableObject<AgentEnv> {
     }
 
     const capacityLines = [
+      `- Current UTC time: ${new Date().toISOString()}`,
       `- Public/DM posts this wake-up: ${params.writesRemaining}/${params.config.limits.maxWritesPerRun} remaining`,
       `- Model steps today: ${params.callsRemainingToday}/${params.config.limits.maxCallsPerDay} remaining (up to ${MAX_LLM_STEPS} per wake-up)`,
       `- Recurring wake interval: ${params.wakeIntervalMinutes !== null ? `${params.wakeIntervalMinutes}m` : "off"} (adjustable ${MIN_WAKE_INTERVAL_MINUTES}–${MAX_WAKE_INTERVAL_MINUTES}m via schedule_set_wake_interval)`,
@@ -2965,6 +2965,8 @@ export class Agent extends DurableObject<AgentEnv> {
     ).length;
     let promptTokens = 0;
     let completionTokens = 0;
+    let cachedTokens = 0;
+    let cacheWriteTokens = 0;
     let runError: string | null = null;
     let completed = false;
     const runStartMs = Date.now();
@@ -3006,11 +3008,23 @@ export class Agent extends DurableObject<AgentEnv> {
           temperature: config.temperature,
           maxTokens: 1500,
           siteUrl: this.env.SITE_URL,
+          sessionId: `agent:${name}`,
         });
         const llmDurationMs = Date.now() - llmStart;
 
         promptTokens += completion.promptTokens;
         completionTokens += completion.completionTokens;
+        cachedTokens += completion.cachedTokens;
+        cacheWriteTokens += completion.cacheWriteTokens;
+
+        const cacheParts: string[] = [];
+        if (completion.cachedTokens > 0) {
+          cacheParts.push(`${completion.cachedTokens} cached`);
+        }
+        if (completion.cacheWriteTokens > 0) {
+          cacheParts.push(`${completion.cacheWriteTokens} cache write`);
+        }
+        const cacheTag = cacheParts.length > 0 ? `, ${cacheParts.join(" / ")}` : "";
 
         const toolNames = completion.toolCalls.map((tc) => tc.function.name);
         const resEventId = this.emitEvent({
@@ -3020,8 +3034,8 @@ export class Agent extends DurableObject<AgentEnv> {
           type: "llm.response",
           summary:
             toolNames.length > 0
-              ? `Requested ${toolNames.join(", ")} (${completion.promptTokens}→${completion.completionTokens} tok, ${llmDurationMs}ms)`
-              : `Concluded without tools (${completion.promptTokens}→${completion.completionTokens} tok, ${llmDurationMs}ms)`,
+              ? `Requested ${toolNames.join(", ")} (${completion.promptTokens}→${completion.completionTokens} tok${cacheTag}, ${llmDurationMs}ms)`
+              : `Concluded without tools (${completion.promptTokens}→${completion.completionTokens} tok${cacheTag}, ${llmDurationMs}ms)`,
           payload: {
             step: step + 1,
             model,
@@ -3029,6 +3043,8 @@ export class Agent extends DurableObject<AgentEnv> {
             finishReason: completion.finishReason,
             promptTokens: completion.promptTokens,
             completionTokens: completion.completionTokens,
+            cachedTokens: completion.cachedTokens,
+            cacheWriteTokens: completion.cacheWriteTokens,
             content: completion.content,
             toolCalls: completion.toolCalls,
           },
@@ -3036,6 +3052,8 @@ export class Agent extends DurableObject<AgentEnv> {
             durationMs: llmDurationMs,
             promptTokens: completion.promptTokens,
             completionTokens: completion.completionTokens,
+            cachedTokens: completion.cachedTokens,
+            cacheWriteTokens: completion.cacheWriteTokens,
             toolCount: toolNames.length,
           },
         });
@@ -3553,12 +3571,17 @@ export class Agent extends DurableObject<AgentEnv> {
       this.releaseClaimedNotices(systemNoticeIds);
     }
 
+    const cachePct =
+      promptTokens > 0 && cachedTokens > 0
+        ? ` · ${Math.round((cachedTokens / promptTokens) * 100)}% cached`
+        : "";
+
     this.emitEvent({
       agent: name,
       runId,
       type: jobDone ? "run.completed" : "run.failed",
       summary: jobDone
-        ? `${steps} model call(s) · ${actions.length} action(s) · ${writes} write(s) · ${runDurationMs}ms`
+        ? `${steps} model call(s) · ${actions.length} action(s) · ${writes} write(s)${cachePct} · ${runDurationMs}ms`
         : `Failed after ${steps} step(s): ${(runError || "unknown").slice(0, 120)}`,
       payload: {
         trigger,
@@ -3567,6 +3590,8 @@ export class Agent extends DurableObject<AgentEnv> {
         writes,
         promptTokens,
         completionTokens,
+        cachedTokens,
+        cacheWriteTokens,
         durationMs: runDurationMs,
         actions,
         error: runError,
@@ -3576,6 +3601,8 @@ export class Agent extends DurableObject<AgentEnv> {
         writes,
         promptTokens,
         completionTokens,
+        cachedTokens,
+        cacheWriteTokens,
         durationMs: runDurationMs,
         ok: jobDone,
       },

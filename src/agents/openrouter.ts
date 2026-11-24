@@ -36,6 +36,8 @@ export type OpenRouterCompletionResult = {
   finishReason: string | null;
   promptTokens: number;
   completionTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
 };
 
 export class OpenRouterError extends Error {
@@ -49,6 +51,37 @@ export class OpenRouterError extends Error {
   }
 }
 
+function isAnthropicModel(model: string): boolean {
+  return model.trim().toLowerCase().startsWith("anthropic/");
+}
+
+function prepareWireMessages(
+  messages: OpenRouterMessage[],
+  model: string,
+): unknown[] {
+  if (!isAnthropicModel(model)) {
+    return messages;
+  }
+  // Anchor an explicit cache breakpoint on the system prompt so [tools + system]
+  // hits across separate wake-ups, while top-level cache_control caches the
+  // growing multi-step conversation within a wake-up.
+  return messages.map((msg) => {
+    if (msg.role === "system" && msg.content.length > 0) {
+      return {
+        role: "system",
+        content: [
+          {
+            type: "text",
+            text: msg.content,
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      };
+    }
+    return msg;
+  });
+}
+
 export async function createChatCompletion(opts: {
   apiKey: string;
   model: string;
@@ -57,13 +90,22 @@ export async function createChatCompletion(opts: {
   temperature?: number;
   maxTokens?: number;
   siteUrl?: string;
+  sessionId?: string;
 }): Promise<OpenRouterCompletionResult> {
   const payload: Record<string, unknown> = {
     model: opts.model,
-    messages: opts.messages,
+    messages: prepareWireMessages(opts.messages, opts.model),
     temperature: opts.temperature ?? 0.7,
     max_tokens: opts.maxTokens ?? 1500,
   };
+
+  if (opts.sessionId) {
+    payload.session_id = opts.sessionId;
+  }
+
+  if (isAnthropicModel(opts.model)) {
+    payload.cache_control = { type: "ephemeral" };
+  }
 
   if (opts.tools && opts.tools.length > 0) {
     payload.tools = opts.tools;
@@ -118,6 +160,10 @@ export async function createChatCompletion(opts: {
     usage?: {
       prompt_tokens?: number;
       completion_tokens?: number;
+      prompt_tokens_details?: {
+        cached_tokens?: number;
+        cache_write_tokens?: number;
+      };
     };
   };
 
@@ -140,5 +186,7 @@ export async function createChatCompletion(opts: {
     finishReason: choice.finish_reason ?? null,
     promptTokens: data.usage?.prompt_tokens ?? 0,
     completionTokens: data.usage?.completion_tokens ?? 0,
+    cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+    cacheWriteTokens: data.usage?.prompt_tokens_details?.cache_write_tokens ?? 0,
   };
 }
