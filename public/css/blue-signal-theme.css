@@ -1366,6 +1366,33 @@
     color: var(--muted);
   }
 
+  /* —— Fast Forward —— */
+  .ff-panel.is-running {
+    border-color: var(--neon);
+  }
+
+  .ff-controls {
+    display: grid;
+    gap: 0.45lh;
+  }
+
+  .ff-agent-checks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5lh 1.4ch;
+  }
+
+  .ff-options-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5lh 1.25ch;
+  }
+
+  .obs-card-state.is-ff {
+    color: var(--neon);
+  }
+
   .req-title {
     font-size: 14px;
     color: var(--text);

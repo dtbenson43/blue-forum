@@ -73,6 +73,10 @@ const MIN_WAKE_INTERVAL_MINUTES = 5;
 const MAX_WAKE_INTERVAL_MINUTES = 240;
 const DEFAULT_WAKE_INTERVAL_MINUTES = 5;
 const MAX_DISCOVER_PER_RUN = 3;
+const FAST_FORWARD_WAKE_MINUTES = 1;
+const FAST_FORWARD_DEFAULT_MAX_STEPS = 12;
+const FAST_FORWARD_THREAD_COOLDOWN_SEC = 30;
+const FAST_FORWARD_NEW_THREAD_MIN = 5;
 
 type ActiveJobRow = {
   job_id: string;
@@ -1488,6 +1492,49 @@ export class Agent extends DurableObject<AgentEnv> {
 
   // ——— Single-alarm multiplexing ———
 
+  private isFastForwardActive(now = Date.now()): boolean {
+    const until = this.getNumberState("fast_forward_until", 0);
+    if (until <= 0) return false;
+    if (now >= until) {
+      this.clearFastForwardLocal();
+      return false;
+    }
+    return true;
+  }
+
+  private clearFastForwardLocal() {
+    this.deleteState("fast_forward_until");
+    this.deleteState("fast_forward_max_steps");
+    this.setState("next_wake_interval_at", "0");
+  }
+
+  private getEffectiveWakeIntervalMinutes(now = Date.now()): number | null {
+    if (this.isFastForwardActive(now)) return FAST_FORWARD_WAKE_MINUTES;
+    return this.getWakeIntervalMinutes();
+  }
+
+  private getEffectiveMaxSteps(now = Date.now()): number {
+    if (!this.isFastForwardActive(now)) return MAX_LLM_STEPS;
+    const raw = this.getNumberState(
+      "fast_forward_max_steps",
+      FAST_FORWARD_DEFAULT_MAX_STEPS,
+    );
+    return Math.max(1, Math.min(20, raw));
+  }
+
+  private resetUsageCapsLocal(clearNewThreadCooldown = false) {
+    this.setState("budget_day", utcDay());
+    this.setState("calls_today", "0");
+    this.setState("web_calls_today", "0");
+    this.setState("backoff_until", "0");
+    if (clearNewThreadCooldown) {
+      this.setState("last_new_thread_at", "0");
+      this.sql.exec(`DELETE FROM thread_activity`);
+    } else {
+      this.sql.exec(`UPDATE thread_activity SET replies_today = 0`);
+    }
+  }
+
   private async recomputeAlarm(
     config: AgentConfig,
     opts?: { runId?: string | null; emitScheduleEvent?: boolean },
@@ -1507,7 +1554,7 @@ export class Agent extends DurableObject<AgentEnv> {
     const pendingNotices = this.hasPendingSystemNotices();
     const forceWake = this.getState("force_browse") === "1";
     const earliestTask = this.getEarliestPendingTask();
-    const wakeIntervalMinutes = this.getWakeIntervalMinutes();
+    const wakeIntervalMinutes = this.getEffectiveWakeIntervalMinutes(now);
 
     let target: number | null = null;
     let reason = "dormant";
@@ -1821,6 +1868,65 @@ export class Agent extends DurableObject<AgentEnv> {
 
     if (config) {
       await this.recomputeAlarm(config, { emitScheduleEvent: true });
+    }
+  }
+
+  async enterFastForward(
+    agentName: string,
+    opts: { endsAtMs: number; maxSteps: number; staggerMs?: number },
+  ): Promise<void> {
+    const name = this.rememberIdentity(agentName);
+    const config = getAgentConfig(name);
+    if (!config) return;
+
+    const now = Date.now();
+    const maxSteps = Math.max(1, Math.min(20, Math.round(opts.maxSteps || 12)));
+    const staggerMs = Math.max(1_000, Math.min(55_000, Math.round(opts.staggerMs ?? 2_000)));
+
+    this.setState("paused", "0");
+    this.setState("fast_forward_until", String(opts.endsAtMs));
+    this.setState("fast_forward_max_steps", String(maxSteps));
+    this.resetUsageCapsLocal(true);
+    this.setState("next_wake_interval_at", String(now + staggerMs));
+
+    this.emitEvent({
+      agent: name,
+      type: "owner.action",
+      summary: `Entered Fast Forward (1m interval, up to ${maxSteps} turns/wake)`,
+      payload: {
+        action: "fast_forward_start",
+        endsAt: new Date(opts.endsAtMs).toISOString(),
+        maxSteps,
+        staggerMs,
+      },
+      meta: { action: "fast_forward_start", maxSteps },
+    });
+
+    await this.ctx.storage.setAlarm(now + staggerMs);
+  }
+
+  async exitFastForward(
+    agentName: string,
+    reason = "stopped",
+  ): Promise<void> {
+    const name = this.rememberIdentity(agentName);
+    const config = getAgentConfig(name);
+    const wasActive = this.getNumberState("fast_forward_until", 0) > 0;
+
+    this.clearFastForwardLocal();
+    if (wasActive) {
+      this.resetUsageCapsLocal(false);
+      this.emitEvent({
+        agent: name,
+        type: "owner.action",
+        summary: `Exited Fast Forward (${reason})`,
+        payload: { action: "fast_forward_stop", reason },
+        meta: { action: "fast_forward_stop", reason },
+      });
+    }
+
+    if (config) {
+      await this.recomputeAlarm(config);
     }
   }
 
@@ -2197,6 +2303,8 @@ export class Agent extends DurableObject<AgentEnv> {
 
       // Always keep agent paused after rollback and clear transient timers/backoff.
       // Daily API budget counters (budget_day / calls_today / web_calls_today) are preserved.
+      this.deleteState("fast_forward_until");
+      this.deleteState("fast_forward_max_steps");
       this.setState("paused", "1");
       this.setState("force_browse", "0");
       this.setState("backoff_until", "0");
@@ -2604,16 +2712,18 @@ export class Agent extends DurableObject<AgentEnv> {
       }>(`SELECT * FROM run_log ORDER BY id DESC LIMIT 10`)
       .toArray();
 
+    const fastForwardActive = this.isFastForwardActive();
     return {
       name,
       model: config ? this.getEffectiveModel(config) : "unknown",
       promptVersion: promptVer?.version ?? 1,
       paused:
         this.env.AGENTS_ENABLED === "false" || this.getState("paused") === "1",
+      fastForwardActive,
       pendingInbox: this.hasPendingInbox(),
       inboxCursor: this.getNumberState("inbox_cursor", 0),
       activeJobId: activeJob?.job_id ?? null,
-      wakeIntervalMinutes: this.getWakeIntervalMinutes(),
+      wakeIntervalMinutes: this.getEffectiveWakeIntervalMinutes(),
       maxIdleMinutes: config?.schedule.maxIdleMinutes ?? null,
       callsToday,
       maxCallsPerDay: config?.limits.maxCallsPerDay ?? 0,
@@ -2769,6 +2879,7 @@ export class Agent extends DurableObject<AgentEnv> {
     promptVersion: number;
     writesRemaining: number;
     callsRemainingToday: number;
+    maxSteps: number;
     wakeIntervalMinutes: number | null;
     webEnabled: boolean;
     webBudget: WebBudgetInfo;
@@ -2924,7 +3035,7 @@ export class Agent extends DurableObject<AgentEnv> {
     const capacityLines = [
       `- Current UTC time: ${new Date().toISOString()}`,
       `- Public/DM posts this wake-up: ${params.writesRemaining}/${params.config.limits.maxWritesPerRun} remaining`,
-      `- Model steps today: ${params.callsRemainingToday}/${params.config.limits.maxCallsPerDay} remaining (up to ${MAX_LLM_STEPS} per wake-up)`,
+      `- Model steps today: ${params.callsRemainingToday}/${params.config.limits.maxCallsPerDay} remaining (up to ${params.maxSteps} per wake-up)`,
       `- Recurring wake interval: ${params.wakeIntervalMinutes !== null ? `${params.wakeIntervalMinutes}m` : "off"} (adjustable ${MIN_WAKE_INTERVAL_MINUTES}–${MAX_WAKE_INTERVAL_MINUTES}m via schedule_set_wake_interval)`,
     ];
     if (params.webEnabled) {
@@ -3017,7 +3128,9 @@ export class Agent extends DurableObject<AgentEnv> {
     const systemNoticeIds = systemNotices.map((n) => n.id);
     const dueTasks = this.claimDueTasks(now);
     const dueTaskIds = dueTasks.map((t) => t.id);
-    const wakeIntervalMinutes = this.getWakeIntervalMinutes();
+    const fastForward = this.isFastForwardActive(now);
+    const maxSteps = this.getEffectiveMaxSteps(now);
+    const wakeIntervalMinutes = this.getEffectiveWakeIntervalMinutes(now);
     const nextWakeIntervalAt = this.getNumberState("next_wake_interval_at", 0);
     const intervalDue =
       wakeIntervalMinutes !== null &&
@@ -3340,6 +3453,7 @@ export class Agent extends DurableObject<AgentEnv> {
             0,
             config.limits.maxCallsPerDay - this.getCallsToday(),
           ),
+          maxSteps,
           wakeIntervalMinutes,
           webEnabled,
           webBudget: getWebBudget(),
@@ -3370,7 +3484,7 @@ export class Agent extends DurableObject<AgentEnv> {
     const runStartMs = Date.now();
 
     try {
-      for (let step = 0; step < MAX_LLM_STEPS; step++) {
+      for (let step = 0; step < maxSteps; step++) {
         if (this.getCallsToday() >= config.limits.maxCallsPerDay) {
           runError = "Daily LLM call cap reached mid-run";
           this.setState("backoff_until", String(nextUtcMidnightMs()));
@@ -3569,16 +3683,25 @@ export class Agent extends DurableObject<AgentEnv> {
             getThreadCooldownRemainingSec: (threadId) =>
               this.getThreadCooldownRemainingSec(
                 threadId,
-                config.limits.threadCooldownSeconds,
+                fastForward
+                  ? Math.min(
+                      config.limits.threadCooldownSeconds,
+                      FAST_FORWARD_THREAD_COOLDOWN_SEC,
+                    )
+                  : config.limits.threadCooldownSeconds,
               ),
             getThreadRepliesToday: (threadId) =>
               this.getThreadRepliesToday(threadId),
             getNewThreadCooldownRemainingMin: () => {
               const lastNew = this.getNumberState("last_new_thread_at", 0);
               if (!lastNew) return 0;
-              const remMs =
-                config.limits.minMinutesBetweenNewThreads * 60_000 -
-                (Date.now() - lastNew);
+              const minMinutes = fastForward
+                ? Math.min(
+                    config.limits.minMinutesBetweenNewThreads,
+                    FAST_FORWARD_NEW_THREAD_MIN,
+                  )
+                : config.limits.minMinutesBetweenNewThreads;
+              const remMs = minMinutes * 60_000 - (Date.now() - lastNew);
               return remMs > 0 ? Math.ceil(remMs / 60_000) : 0;
             },
             saveMemory: (note) =>
@@ -3952,7 +4075,7 @@ export class Agent extends DurableObject<AgentEnv> {
         this.setState("force_browse", "0");
       }
 
-      const currentWakeInterval = this.getWakeIntervalMinutes();
+      const currentWakeInterval = this.getEffectiveWakeIntervalMinutes();
       if (currentWakeInterval !== null) {
         this.setState(
           "next_wake_interval_at",
@@ -3965,6 +4088,10 @@ export class Agent extends DurableObject<AgentEnv> {
           "next_idle_at",
           String(Date.now() + jitteredIdleMs(config.schedule.maxIdleMinutes)),
         );
+      }
+
+      if (fastForward || this.isFastForwardActive()) {
+        this.resetUsageCapsLocal(false);
       }
 
       this.setState("backoff_until", "0");

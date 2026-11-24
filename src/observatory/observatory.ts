@@ -12,6 +12,7 @@ import type {
   CheckpointStats,
   CheckpointSummary,
   EventMeta,
+  FastForwardState,
   ForumSnapshot,
   ObservatoryEventInput,
   ObservatoryEventSummary,
@@ -627,6 +628,15 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
       request,
       openCount: this.getOpenRequestCount(),
     });
+
+    // If Fast Forward is active with stopOnRequest enabled, stop immediately on any new request.
+    const ff = this.readFastForwardState();
+    if (ff.active && ff.stopOnRequest) {
+      await this.stopFastForward(
+        `request_submitted:@${agent}:#${request.id} ("${request.title.slice(0, 60)}")`,
+      );
+    }
+
     return { ok: true, request, deduplicated: false };
   }
 
@@ -1079,13 +1089,38 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
       Number.isFinite(maxRaw) && maxRaw >= 1
         ? Math.min(50, Math.round(maxRaw))
         : DEFAULT_MAX_SCHEDULED_KEEP;
-    const alarmAt = await this.ctx.storage.getAlarm();
+    const nextAtMs = Number(this.getSetting("auto_checkpoint_next_at") ?? "0");
     return {
       intervalMinutes,
       maxScheduledKeep,
       nextScheduledAt:
-        intervalMinutes > 0 && alarmAt ? new Date(alarmAt).toISOString() : null,
+        intervalMinutes > 0 && nextAtMs > 0 ? new Date(nextAtMs).toISOString() : null,
     };
+  }
+
+  private async recomputeObservatoryAlarm(): Promise<void> {
+    const candidates: number[] = [];
+    const intervalRaw = Number(this.getSetting("auto_checkpoint_interval_minutes") ?? "0");
+    const nextCpMs = Number(this.getSetting("auto_checkpoint_next_at") ?? "0");
+    if (intervalRaw >= MIN_SCHEDULE_INTERVAL_MINUTES && nextCpMs > 0) {
+      candidates.push(nextCpMs);
+    }
+
+    const ff = this.readFastForwardState();
+    if (ff.active && ff.endsAt) {
+      const endsAtMs = Date.parse(ff.endsAt);
+      if (Number.isFinite(endsAtMs)) {
+        candidates.push(endsAtMs);
+      }
+    }
+
+    if (candidates.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    const earliest = Math.min(...candidates);
+    await this.ctx.storage.setAlarm(Math.max(Date.now() + 500, earliest));
   }
 
   async updateCheckpointSchedule(input: {
@@ -1109,11 +1144,15 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     }
 
     if (intervalMinutes > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + intervalMinutes * 60_000);
+      this.setSetting(
+        "auto_checkpoint_next_at",
+        String(Date.now() + intervalMinutes * 60_000),
+      );
     } else {
-      await this.ctx.storage.deleteAlarm();
+      this.setSetting("auto_checkpoint_next_at", "0");
     }
 
+    await this.recomputeObservatoryAlarm();
     const schedule = await this.getCheckpointSchedule();
     this.broadcast({ type: "checkpoint", schedule });
     return schedule;
@@ -1337,6 +1376,11 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
       return { ok: false, error: `Checkpoint #${id} not found` };
     }
 
+    // 0. If Fast Forward is running, stop it cleanly before rolling back
+    if (this.readFastForwardState().active) {
+      await this.stopFastForward("rollback");
+    }
+
     // 1. Pause all agents & purge forum outbox first so no new writes land mid-rollback
     const forumStub = this.env.FORUM.getByName("general");
     await Promise.all([
@@ -1415,27 +1459,234 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     return true;
   }
 
-  override async alarm(): Promise<void> {
-    const schedule = await this.getCheckpointSchedule();
-    if (schedule.intervalMinutes <= 0) {
-      return;
+  // ——— Fast Forward simulation mode ———
+
+  private readFastForwardState(): FastForwardState {
+    const raw = this.getSetting("fast_forward_state");
+    const fallback: FastForwardState = {
+      active: false,
+      agents: [...AGENT_NAMES],
+      durationMinutes: 15,
+      maxStepsPerWake: 12,
+      wakeIntervalMinutes: 1,
+      stopOnRequest: true,
+      startedAt: null,
+      endsAt: null,
+      stopReason: null,
+      stoppedAt: null,
+      checkpointId: null,
+    };
+    if (!raw) return fallback;
+    try {
+      const parsed = JSON.parse(raw) as Partial<FastForwardState>;
+      return { ...fallback, ...parsed };
+    } catch {
+      return fallback;
+    }
+  }
+
+  private saveFastForwardState(state: FastForwardState): void {
+    this.setSetting("fast_forward_state", JSON.stringify(state));
+  }
+
+  async getFastForwardState(): Promise<FastForwardState> {
+    const state = this.readFastForwardState();
+    if (state.active && state.endsAt) {
+      const endsAtMs = Date.parse(state.endsAt);
+      if (Number.isFinite(endsAtMs) && Date.now() >= endsAtMs) {
+        return this.stopFastForward("duration_elapsed");
+      }
+    }
+    return state;
+  }
+
+  async startFastForward(input: {
+    agents: string[];
+    durationMinutes?: number;
+    maxStepsPerWake?: number;
+    stopOnRequest?: boolean;
+    createCheckpoint?: boolean;
+  }): Promise<
+    | { ok: true; fastForward: FastForwardState }
+    | { ok: false; error: string }
+  > {
+    const agents = [...new Set(input.agents.map((a) => a.trim().toLowerCase()))].filter(
+      Boolean,
+    );
+    if (agents.length === 0) {
+      return { ok: false, error: "Select at least one agent for Fast Forward." };
     }
 
-    try {
-      await this.createCheckpoint({
-        kind: "scheduled",
-        skipIfUnchanged: true,
-      });
-    } catch (err) {
-      console.error("[Observatory] Scheduled checkpoint failed:", err);
-    } finally {
-      // Re-read schedule in case it was turned off while running
-      const latest = await this.getCheckpointSchedule();
-      if (latest.intervalMinutes > 0) {
-        await this.ctx.storage.setAlarm(
-          Date.now() + latest.intervalMinutes * 60_000,
+    // If a previous Fast Forward session was active, cleanly exit any agents not in the new set
+    const prev = this.readFastForwardState();
+    if (prev.active) {
+      const removed = prev.agents.filter((a) => !agents.includes(a));
+      if (removed.length > 0) {
+        await Promise.all(
+          removed.map((name) =>
+            this.env.AGENTS.getByName(name).exitFastForward(name, "reconfigured"),
+          ),
         );
       }
+    }
+
+    const durationMinutes = Math.max(
+      1,
+      Math.min(120, Math.round(input.durationMinutes ?? 15)),
+    );
+    const maxStepsPerWake = Math.max(
+      4,
+      Math.min(20, Math.round(input.maxStepsPerWake ?? 12)),
+    );
+    const stopOnRequest = input.stopOnRequest !== false;
+
+    let checkpointId: number | null = null;
+    if (input.createCheckpoint !== false) {
+      const cp = await this.createCheckpoint({
+        kind: "manual",
+        label: `Before Fast Forward (${durationMinutes}m · ${agents.map((a) => `@${a}`).join(", ")})`,
+        note: "Automatic checkpoint created right before starting Fast Forward mode.",
+      });
+      if (cp.ok && !cp.skipped) {
+        checkpointId = cp.checkpoint.id;
+      }
+    }
+
+    const now = Date.now();
+    const endsAtMs = now + durationMinutes * 60_000;
+    const state: FastForwardState = {
+      active: true,
+      agents,
+      durationMinutes,
+      maxStepsPerWake,
+      wakeIntervalMinutes: 1,
+      stopOnRequest,
+      startedAt: new Date(now).toISOString(),
+      endsAt: new Date(endsAtMs).toISOString(),
+      stopReason: null,
+      stoppedAt: null,
+      checkpointId,
+    };
+    this.saveFastForwardState(state);
+
+    // Stagger selected agents neatly across the 60s window so they don't all collide at t=0
+    const stepSpacingMs = Math.max(
+      3_000,
+      Math.min(12_000, Math.floor(50_000 / Math.max(1, agents.length))),
+    );
+    await Promise.all(
+      agents.map((name, idx) =>
+        this.env.AGENTS.getByName(name).enterFastForward(name, {
+          endsAtMs,
+          maxSteps: maxStepsPerWake,
+          staggerMs: 2_000 + idx * stepSpacingMs,
+        }),
+      ),
+    );
+
+    await this.recomputeObservatoryAlarm();
+
+    await this.recordEvent({
+      eventId: crypto.randomUUID(),
+      agent: "system",
+      runId: null,
+      parentId: null,
+      type: "fast_forward.started",
+      ts: now,
+      summary: `Started Fast Forward for ${durationMinutes}m (${agents.map((a) => `@${a}`).join(", ")}; 1m interval, ${maxStepsPerWake} turns/wake${stopOnRequest ? ", stop on request" : ""})`,
+      meta: {
+        durationMinutes,
+        maxStepsPerWake,
+        stopOnRequest,
+        agentCount: agents.length,
+        checkpointId,
+      },
+    });
+
+    this.broadcast({ type: "fast_forward", fastForward: state });
+    return { ok: true, fastForward: state };
+  }
+
+  async stopFastForward(reason = "manual"): Promise<FastForwardState> {
+    const prev = this.readFastForwardState();
+    if (!prev.active) {
+      return prev;
+    }
+
+    const now = Date.now();
+    const next: FastForwardState = {
+      ...prev,
+      active: false,
+      stopReason: reason,
+      stoppedAt: new Date(now).toISOString(),
+    };
+    this.saveFastForwardState(next);
+
+    await Promise.all(
+      prev.agents.map((name) =>
+        this.env.AGENTS.getByName(name).exitFastForward(name, reason),
+      ),
+    );
+
+    await this.recomputeObservatoryAlarm();
+
+    await this.recordEvent({
+      eventId: crypto.randomUUID(),
+      agent: "system",
+      runId: null,
+      parentId: null,
+      type: "fast_forward.stopped",
+      ts: now,
+      summary: `Stopped Fast Forward (${reason}) · restored normal schedules for ${prev.agents.map((a) => `@${a}`).join(", ")}`,
+      meta: {
+        reason,
+        agentCount: prev.agents.length,
+      },
+    });
+
+    this.broadcast({ type: "fast_forward", fastForward: next });
+    return next;
+  }
+
+  override async alarm(): Promise<void> {
+    const now = Date.now();
+
+    try {
+      // 1. Check Fast Forward expiry
+      const ff = this.readFastForwardState();
+      if (ff.active && ff.endsAt) {
+        const endsAtMs = Date.parse(ff.endsAt);
+        if (Number.isFinite(endsAtMs) && now >= endsAtMs - 1_000) {
+          await this.stopFastForward("duration_elapsed");
+        }
+      }
+
+      // 2. Check scheduled auto-checkpoint
+      const schedule = await this.getCheckpointSchedule();
+      const nextCpMs = Number(this.getSetting("auto_checkpoint_next_at") ?? "0");
+      if (
+        schedule.intervalMinutes > 0 &&
+        nextCpMs > 0 &&
+        now >= nextCpMs - 1_000
+      ) {
+        try {
+          await this.createCheckpoint({
+            kind: "scheduled",
+            skipIfUnchanged: true,
+          });
+        } catch (err) {
+          console.error("[Observatory] Scheduled checkpoint failed:", err);
+        }
+        const latestSched = await this.getCheckpointSchedule();
+        if (latestSched.intervalMinutes > 0) {
+          this.setSetting(
+            "auto_checkpoint_next_at",
+            String(Date.now() + latestSched.intervalMinutes * 60_000),
+          );
+        }
+      }
+    } finally {
+      await this.recomputeObservatoryAlarm();
     }
   }
 
@@ -1469,6 +1720,7 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
             latestSeq,
             openRequests: this.getOpenRequestCount(),
             openBugs: this.getOpenBugCount(),
+            fastForward: await this.getFastForwardState(),
           }),
         );
       } catch {

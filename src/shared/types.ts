@@ -301,6 +301,8 @@ export type AgentEventType =
   | "bug.updated"
   | "checkpoint.created"
   | "checkpoint.restored"
+  | "fast_forward.started"
+  | "fast_forward.stopped"
   | "alarm.scheduled"
   | "run.completed"
   | "run.failed"
@@ -505,11 +507,26 @@ export type AgentRunLogEntry = {
   error: string | null;
 };
 
+export type FastForwardState = {
+  active: boolean;
+  agents: string[];
+  durationMinutes: number;
+  maxStepsPerWake: number;
+  wakeIntervalMinutes: number;
+  stopOnRequest: boolean;
+  startedAt: string | null;
+  endsAt: string | null;
+  stopReason: string | null;
+  stoppedAt: string | null;
+  checkpointId: number | null;
+};
+
 export type AgentStatusSnapshot = {
   name: string;
   model: string;
   promptVersion: number;
   paused: boolean;
+  fastForwardActive?: boolean;
   pendingInbox: boolean;
   inboxCursor: number;
   activeJobId: string | null;

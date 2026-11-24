@@ -470,6 +470,59 @@ async function handleAdminRoute(
     );
   }
 
+  // Fast Forward simulation mode (Observatory-only)
+  if (request.method === "GET" && url.pathname === "/api/admin/fast-forward") {
+    const fastForward = await observatoryStub(env).getFastForwardState();
+    return Response.json({ fastForward });
+  }
+
+  if (
+    request.method === "POST" &&
+    url.pathname === "/api/admin/fast-forward/start"
+  ) {
+    const body = (await request.json().catch(() => ({}))) as {
+      agents?: string[];
+      durationMinutes?: number;
+      maxStepsPerWake?: number;
+      stopOnRequest?: boolean;
+      createCheckpoint?: boolean;
+    };
+    const requestedAgents = Array.isArray(body.agents)
+      ? body.agents
+          .filter((a): a is string => typeof a === "string")
+          .map((a) => a.trim().toLowerCase())
+          .filter((a) => isRegisteredAgent(a))
+      : [...AGENT_NAMES];
+    const uniqueAgents = [...new Set(requestedAgents)];
+    if (uniqueAgents.length === 0) {
+      return Response.json(
+        { error: "Select at least one registered agent for Fast Forward." },
+        { status: 400 },
+      );
+    }
+    const result = await observatoryStub(env).startFastForward({
+      agents: uniqueAgents,
+      durationMinutes:
+        typeof body.durationMinutes === "number" ? body.durationMinutes : 15,
+      maxStepsPerWake:
+        typeof body.maxStepsPerWake === "number" ? body.maxStepsPerWake : 12,
+      stopOnRequest: body.stopOnRequest !== false,
+      createCheckpoint: body.createCheckpoint !== false,
+    });
+    if (!result.ok) {
+      return Response.json(result, { status: 400 });
+    }
+    return Response.json(result);
+  }
+
+  if (
+    request.method === "POST" &&
+    url.pathname === "/api/admin/fast-forward/stop"
+  ) {
+    const fastForward = await observatoryStub(env).stopFastForward("manual");
+    return Response.json({ ok: true, fastForward });
+  }
+
   // Full event payload lookup directly from the owning Agent DO
   const eventDetailMatch = url.pathname.match(
     /^\/api\/admin\/agents\/([a-z0-9_-]+)\/events\/([a-z0-9-]+)$/i,

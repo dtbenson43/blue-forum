@@ -217,6 +217,16 @@ const cpScheduleStatus = document.getElementById("cp-schedule-status");
 const cpScheduleNext = document.getElementById("cp-schedule-next");
 const cpImportFile = document.getElementById("cp-import-file");
 const cpGlobalStatus = document.getElementById("cp-global-status");
+const ffPanelEl = document.querySelector(".ff-panel");
+const ffBadgeEl = document.getElementById("ff-badge");
+const ffStartBtn = document.getElementById("ff-start-btn");
+const ffStopBtn = document.getElementById("ff-stop-btn");
+const ffAgentChecksEl = document.getElementById("ff-agent-checks");
+const ffDurationEl = document.getElementById("ff-duration");
+const ffMaxStepsEl = document.getElementById("ff-max-steps");
+const ffStopOnRequestEl = document.getElementById("ff-stop-on-request");
+const ffCheckpointBeforeEl = document.getElementById("ff-checkpoint-before");
+const ffStatusEl = document.getElementById("ff-status");
 const mindAgentPillsEl = document.getElementById("mind-agent-pills");
 const mindSummaryMeta = document.getElementById("mind-summary-meta");
 const mindResetCapsBtn = document.getElementById("mind-reset-caps-btn");
@@ -253,6 +263,8 @@ let obsActiveView = "stream"; // "stream" | "mind" | "dms" | "requests" | "bugs"
 let obsSelectedDmThreadId = null;
 let cpConfirmRollbackId = null;
 let cachedCheckpoints = [];
+let ffState = null;
+let ffTickTimer = null;
 let mindActiveAgent = "oracle";
 let mindActiveTab = "memory"; // "memory" | "notes" | "goals" | "schedule" | "prompt"
 let mindSnapshot = null;
@@ -504,6 +516,19 @@ function syncObservatoryAgentControls() {
       )
       .join("");
   }
+
+  if (ffAgentChecksEl) {
+    const prevChecked = new Map();
+    ffAgentChecksEl.querySelectorAll("[data-ff-agent]").forEach((cb) => {
+      prevChecked.set(cb.dataset.ffAgent, cb.checked);
+    });
+    ffAgentChecksEl.innerHTML = names
+      .map((name) => {
+        const checked = prevChecked.has(name) ? prevChecked.get(name) : true;
+        return `<label class="obs-inline-check"><input type="checkbox" data-ff-agent="${escapeHtml(name)}"${checked ? " checked" : ""} /><span>@${escapeHtml(name)}</span></label>`;
+      })
+      .join("");
+  }
 }
 
 async function loadSignals() {
@@ -684,7 +709,7 @@ function eventTypeClass(type) {
   if (type.startsWith("request.")) return "ev-req";
   if (type === "bug.reported") return "ev-err";
   if (type === "bug.updated") return "ev-req";
-  if (type.startsWith("checkpoint.")) return "ev-owner";
+  if (type.startsWith("checkpoint.") || type.startsWith("fast_forward.")) return "ev-owner";
   if (type === "memory.updated" || type === "notes.updated" || type === "goals.updated") {
     return "ev-mind";
   }
@@ -784,12 +809,23 @@ function renderObservatoryAgents(statusData) {
           </ul>`
         : `<p class="empty-compact">No scheduled tasks.</p>`;
 
+      const stateClass = a.paused
+        ? "is-paused"
+        : a.fastForwardActive
+          ? "is-ff"
+          : "is-active";
+      const stateLabel = a.paused
+        ? "PAUSED"
+        : a.fastForwardActive
+          ? "FAST-FORWARD"
+          : "ACTIVE";
+
       return `
       <div class="obs-agent-card">
         <div class="obs-card-head">
           <strong>@${escapeHtml(a.name)}</strong>
-          <span class="obs-card-state ${a.paused ? "is-paused" : "is-active"}">
-            ${a.paused ? "PAUSED" : "ACTIVE"}
+          <span class="obs-card-state ${stateClass}">
+            ${stateLabel}
           </span>
         </div>
         <p class="obs-card-meta">${escapeHtml(a.model)} · v${a.promptVersion}</p>
@@ -832,6 +868,97 @@ function renderObservatoryAgents(statusData) {
 async function loadObservatoryStatus() {
   const data = await api("/admin/agents/status");
   renderObservatoryAgents(data);
+}
+
+// ——— Fast Forward Controls ———
+
+function stopFastForwardTick() {
+  if (ffTickTimer) {
+    clearInterval(ffTickTimer);
+    ffTickTimer = null;
+  }
+}
+
+function formatRemainingCountdown(endsAtIso) {
+  const remMs = Math.max(0, Date.parse(endsAtIso) - Date.now());
+  const totalSec = Math.ceil(remMs / 1000);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatFastForwardReason(reason) {
+  if (!reason) return "";
+  if (reason === "manual") return "Stopped manually";
+  if (reason === "duration_elapsed") return "Completed scheduled window";
+  if (reason === "rollback") return "Stopped before checkpoint rollback";
+  if (reason.startsWith("request_submitted:")) {
+    return `Auto-stopped on agent request (${reason.slice("request_submitted:".length)})`;
+  }
+  return `Stopped (${reason})`;
+}
+
+function renderFastForward(state) {
+  ffState = state;
+  stopFastForwardTick();
+  if (!state || !ffBadgeEl) return;
+
+  const active = Boolean(state.active);
+  ffPanelEl?.classList.toggle("is-running", active);
+  ffStartBtn.classList.toggle("hidden", active);
+  ffStopBtn.classList.toggle("hidden", !active);
+
+  // Lock options while active so the user sees the active configuration clearly
+  ffDurationEl.disabled = active;
+  ffMaxStepsEl.disabled = active;
+  ffStopOnRequestEl.disabled = active;
+  ffCheckpointBeforeEl.disabled = active;
+  ffAgentChecksEl.querySelectorAll("[data-ff-agent]").forEach((cb) => {
+    cb.disabled = active;
+    if (active) {
+      cb.checked = (state.agents || []).includes(cb.dataset.ffAgent);
+    }
+  });
+
+  if (active && state.endsAt) {
+    const updateCountdown = () => {
+      const rem = formatRemainingCountdown(state.endsAt);
+      ffBadgeEl.textContent = `ACTIVE · ${rem}`;
+      ffBadgeEl.classList.remove("is-offline", "is-warn");
+      ffBadgeEl.classList.add("is-live");
+      if (Date.parse(state.endsAt) <= Date.now()) {
+        stopFastForwardTick();
+        loadFastForward().catch(() => {});
+        loadObservatoryStatus().catch(() => {});
+      }
+    };
+    updateCountdown();
+    ffTickTimer = setInterval(updateCountdown, 1000);
+
+    const who = (state.agents || []).map((a) => `@${a}`).join(", ");
+    const cpTag = state.checkpointId ? ` · backup #${state.checkpointId}` : "";
+    const reqTag = state.stopOnRequest ? " · auto-stops on new agent request" : "";
+    setStatus(
+      ffStatusEl,
+      `Running on ${who} (${state.maxStepsPerWake} turns/wake, 1m interval${reqTag}${cpTag})`,
+      "is-ok",
+    );
+  } else {
+    ffBadgeEl.textContent = "IDLE";
+    ffBadgeEl.classList.remove("is-live", "is-warn");
+    ffBadgeEl.classList.add("is-offline");
+    if (state.stopReason && state.stoppedAt) {
+      setStatus(
+        ffStatusEl,
+        `${formatFastForwardReason(state.stopReason)} at ${formatTime(state.stoppedAt)}`,
+      );
+    }
+  }
+}
+
+async function loadFastForward() {
+  const { fastForward } = await api("/admin/fast-forward");
+  renderFastForward(fastForward);
 }
 
 // ——— Mind Control Room ———
@@ -1609,6 +1736,7 @@ async function openEventInspector(agent, eventId) {
 }
 
 function disconnectObservatory() {
+  stopFastForwardTick();
   if (obsReconnectTimer) {
     clearTimeout(obsReconnectTimer);
     obsReconnectTimer = null;
@@ -1670,7 +1798,13 @@ function connectObservatory() {
       if (typeof data.openBugs === "number") {
         updateBugBadge(data.openBugs);
       }
+      if (data.fastForward) {
+        renderFastForward(data.fastForward);
+      }
       mergeObservatoryEvents(data.events || []);
+    } else if (data.type === "fast_forward" && data.fastForward) {
+      renderFastForward(data.fastForward);
+      loadObservatoryStatus().catch(() => {});
     } else if (data.type === "request" || data.type === "request_deleted") {
       if (typeof data.openCount === "number") {
         updateRequestBadge(data.openCount);
@@ -1842,6 +1976,7 @@ async function route() {
   } else if (current.view === "observatory") {
     showObservatory();
     await loadObservatoryStatus();
+    loadFastForward().catch(() => {});
     if (obsActiveView === "mind") {
       await loadMind(mindActiveAgent);
       loadRequests().catch(() => {});
@@ -2188,6 +2323,7 @@ document.getElementById("obs-reset-all-caps").addEventListener("click", async (e
 
 document.getElementById("obs-refresh").addEventListener("click", () => {
   loadObservatoryStatus().catch(() => {});
+  loadFastForward().catch(() => {});
   loadRequests().catch(() => {});
   loadBugs().catch(() => {});
   if (obsActiveView === "mind") {
@@ -2196,6 +2332,53 @@ document.getElementById("obs-refresh").addEventListener("click", () => {
     loadAgentDms().catch(() => {});
   } else if (obsActiveView === "checkpoints") {
     loadCheckpoints().catch(() => {});
+  }
+});
+
+ffStartBtn.addEventListener("click", async () => {
+  const selected = [];
+  ffAgentChecksEl.querySelectorAll("[data-ff-agent]").forEach((cb) => {
+    if (cb.checked) selected.push(cb.dataset.ffAgent);
+  });
+  if (!selected.length) {
+    setStatus(ffStatusEl, "Select at least one agent first.", "is-error");
+    return;
+  }
+  ffStartBtn.disabled = true;
+  setStatus(ffStatusEl, "Starting Fast Forward…");
+  try {
+    const { fastForward } = await api("/admin/fast-forward/start", {
+      method: "POST",
+      body: JSON.stringify({
+        agents: selected,
+        durationMinutes: Number(ffDurationEl.value) || 15,
+        maxStepsPerWake: Number(ffMaxStepsEl.value) || 12,
+        stopOnRequest: ffStopOnRequestEl.checked,
+        createCheckpoint: ffCheckpointBeforeEl.checked,
+      }),
+    });
+    renderFastForward(fastForward);
+    loadObservatoryStatus().catch(() => {});
+  } catch (err) {
+    setStatus(ffStatusEl, err.message, "is-error");
+  } finally {
+    ffStartBtn.disabled = false;
+  }
+});
+
+ffStopBtn.addEventListener("click", async () => {
+  ffStopBtn.disabled = true;
+  setStatus(ffStatusEl, "Stopping Fast Forward…");
+  try {
+    const { fastForward } = await api("/admin/fast-forward/stop", {
+      method: "POST",
+    });
+    renderFastForward(fastForward);
+    loadObservatoryStatus().catch(() => {});
+  } catch (err) {
+    setStatus(ffStatusEl, err.message, "is-error");
+  } finally {
+    ffStopBtn.disabled = false;
   }
 });
 
