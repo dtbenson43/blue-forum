@@ -338,6 +338,138 @@ async function handleAdminRoute(
     }
   }
 
+  // Checkpoints & Rollback (Observatory-only)
+  if (request.method === "GET" && url.pathname === "/api/admin/checkpoints") {
+    const result = await observatoryStub(env).listCheckpoints(60);
+    return Response.json(result);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/checkpoints") {
+    const body = (await request.json().catch(() => ({}))) as {
+      label?: string;
+      note?: string;
+    };
+    const result = await observatoryStub(env).createCheckpoint({
+      kind: "manual",
+      label: body.label,
+      note: body.note,
+    });
+    if (!result.ok) {
+      return Response.json(result, { status: 400 });
+    }
+    return Response.json(result, { status: 201 });
+  }
+
+  if (
+    request.method === "PATCH" &&
+    url.pathname === "/api/admin/checkpoints/schedule"
+  ) {
+    const body = (await request.json().catch(() => ({}))) as {
+      intervalMinutes?: number;
+      maxScheduledKeep?: number;
+    };
+    const intervalMinutes = Number(body.intervalMinutes ?? 0);
+    if (!Number.isFinite(intervalMinutes) || intervalMinutes < 0) {
+      return Response.json(
+        { error: "intervalMinutes must be 0 (off) or between 15 and 1440" },
+        { status: 400 },
+      );
+    }
+    const schedule = await observatoryStub(env).updateCheckpointSchedule({
+      intervalMinutes,
+      maxScheduledKeep:
+        body.maxScheduledKeep !== undefined
+          ? Number(body.maxScheduledKeep)
+          : undefined,
+    });
+    return Response.json({ ok: true, schedule });
+  }
+
+  if (
+    request.method === "POST" &&
+    url.pathname === "/api/admin/checkpoints/import"
+  ) {
+    const body = (await request.json().catch(() => ({}))) as {
+      label?: string;
+      note?: string;
+      payload?: unknown;
+    };
+    const result = await observatoryStub(env).importCheckpoint({
+      label: body.label,
+      note: body.note,
+      payload: body.payload as import("./shared/types").CheckpointPayload,
+    });
+    if (!result.ok) {
+      return Response.json(result, { status: 400 });
+    }
+    return Response.json(result, { status: 201 });
+  }
+
+  const checkpointRollbackMatch = url.pathname.match(
+    /^\/api\/admin\/checkpoints\/(\d+)\/rollback$/,
+  );
+  if (request.method === "POST" && checkpointRollbackMatch) {
+    const cpId = Number(checkpointRollbackMatch[1]);
+    const body = (await request.json().catch(() => ({}))) as {
+      restoreConfig?: boolean;
+    };
+    const result = await observatoryStub(env).rollbackToCheckpoint(cpId, {
+      restoreConfig: body.restoreConfig === true,
+    });
+    if (!result.ok) {
+      return Response.json(result, {
+        status: result.error.includes("not found") ? 404 : 400,
+      });
+    }
+    return Response.json(result);
+  }
+
+  const checkpointExportMatch = url.pathname.match(
+    /^\/api\/admin\/checkpoints\/(\d+)\/export$/,
+  );
+  if (request.method === "GET" && checkpointExportMatch) {
+    const cpId = Number(checkpointExportMatch[1]);
+    const exported = await observatoryStub(env).exportCheckpoint(cpId);
+    if (!exported) {
+      return Response.json({ error: "Checkpoint not found" }, { status: 404 });
+    }
+    const safeSlug = exported.summary.label
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40);
+    const filename = `blue-signal-checkpoint-${cpId}${safeSlug ? `-${safeSlug}` : ""}.json`;
+    return new Response(
+      JSON.stringify(
+        {
+          checkpoint: exported.summary,
+          payload: exported.payload,
+        },
+        null,
+        2,
+      ),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${filename}"`,
+        },
+      },
+    );
+  }
+
+  const checkpointItemMatch = url.pathname.match(
+    /^\/api\/admin\/checkpoints\/(\d+)$/,
+  );
+  if (request.method === "DELETE" && checkpointItemMatch) {
+    const cpId = Number(checkpointItemMatch[1]);
+    const deleted = await observatoryStub(env).deleteCheckpoint(cpId);
+    return Response.json(
+      { ok: deleted, id: cpId },
+      { status: deleted ? 200 : 404 },
+    );
+  }
+
   // Full event payload lookup directly from the owning Agent DO
   const eventDetailMatch = url.pathname.match(
     /^\/api\/admin\/agents\/([a-z0-9_-]+)\/events\/([a-z0-9-]+)$/i,
@@ -691,6 +823,20 @@ async function handleAdminRoute(
       AGENT_NAMES.map((name) => env.AGENTS.getByName(name).resetCaps(name)),
     );
     return Response.json({ ok: true, agents: AGENT_NAMES });
+  }
+
+  if (
+    request.method === "POST" &&
+    url.pathname === "/api/admin/agents/pause-all"
+  ) {
+    const body = (await request.json().catch(() => ({}))) as {
+      paused?: boolean;
+    };
+    const paused = body.paused !== false;
+    await Promise.all(
+      AGENT_NAMES.map((name) => env.AGENTS.getByName(name).setPaused(name, paused)),
+    );
+    return Response.json({ ok: true, paused, agents: AGENT_NAMES });
   }
 
   const resetCapsMatch = url.pathname.match(

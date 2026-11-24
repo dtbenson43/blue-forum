@@ -4,6 +4,7 @@ import type {
   AdminDmThreadSummary,
   BoardKind,
   ForumEvent,
+  ForumSnapshot,
   InboxItem,
   MessageSummary,
   PersonaSummary,
@@ -791,6 +792,207 @@ export class Forum extends DurableObject<ForumEnv> {
     this.sql.exec(`DELETE FROM event_outbox`);
     await this.ctx.storage.deleteAlarm();
     return count;
+  }
+
+  private getSqliteSequence(tableName: string): number {
+    const hasSeq =
+      this.sql
+        .exec<{ name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'`,
+        )
+        .toArray().length > 0;
+    if (!hasSeq) return 0;
+    const row = this.sql
+      .exec<{ seq: number }>(
+        `SELECT seq FROM sqlite_sequence WHERE name = ?`,
+        tableName,
+      )
+      .toArray()[0];
+    return row?.seq ?? 0;
+  }
+
+  private setSqliteSequence(tableName: string, seq: number): void {
+    const hasSeq =
+      this.sql
+        .exec<{ name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'`,
+        )
+        .toArray().length > 0;
+    if (!hasSeq) return;
+    const clean = Math.max(0, Math.floor(seq));
+    const existing = this.sql
+      .exec<{ seq: number }>(
+        `SELECT seq FROM sqlite_sequence WHERE name = ?`,
+        tableName,
+      )
+      .toArray()[0];
+    if (existing) {
+      this.sql.exec(
+        `UPDATE sqlite_sequence SET seq = ? WHERE name = ?`,
+        clean,
+        tableName,
+      );
+    } else if (clean > 0) {
+      this.sql.exec(
+        `INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)`,
+        tableName,
+        clean,
+      );
+    }
+  }
+
+  async exportSnapshot(): Promise<ForumSnapshot> {
+    const users = this.sql
+      .exec<{ id: string; name: string; kind: string; created_at: string }>(
+        `SELECT id, name, kind, created_at FROM users ORDER BY created_at ASC, id ASC`,
+      )
+      .toArray();
+    const threads = this.sql
+      .exec<{
+        id: number;
+        user_id: string;
+        title: string;
+        board: string;
+        dm_key: string | null;
+        created_at: string;
+        bumped_at: string;
+      }>(
+        `SELECT id, user_id, title, board, dm_key, created_at, bumped_at
+         FROM threads ORDER BY id ASC`,
+      )
+      .toArray();
+    const posts = this.sql
+      .exec<{
+        id: number;
+        thread_id: number;
+        user_id: string;
+        body: string;
+        meta_json: string | null;
+        operation_id: string | null;
+        created_at: string;
+      }>(
+        `SELECT id, thread_id, user_id, body, meta_json, operation_id, created_at
+         FROM posts ORDER BY id ASC`,
+      )
+      .toArray();
+    const threadParticipants = this.sql
+      .exec<{ thread_id: number; user_id: string; last_read_post_id: number }>(
+        `SELECT thread_id, user_id, last_read_post_id
+         FROM thread_participants ORDER BY thread_id ASC, user_id ASC`,
+      )
+      .toArray();
+    const threadReads = this.sql
+      .exec<{
+        thread_id: number;
+        user_id: string;
+        last_read_post_id: number;
+        updated_at: string;
+      }>(
+        `SELECT thread_id, user_id, last_read_post_id, updated_at
+         FROM thread_reads ORDER BY thread_id ASC, user_id ASC`,
+      )
+      .toArray();
+
+    return {
+      users,
+      threads,
+      posts,
+      threadParticipants,
+      threadReads,
+      sequences: {
+        threads: this.getSqliteSequence("threads"),
+        posts: this.getSqliteSequence("posts"),
+      },
+    };
+  }
+
+  async restoreSnapshot(snapshot: ForumSnapshot): Promise<void> {
+    this.flushQueued = false;
+    await this.ctx.storage.deleteAlarm();
+
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`DELETE FROM event_outbox`);
+      this.sql.exec(`DELETE FROM thread_reads`);
+      this.sql.exec(`DELETE FROM thread_participants`);
+      this.sql.exec(`DELETE FROM posts`);
+      this.sql.exec(`DELETE FROM threads`);
+      this.sql.exec(`DELETE FROM users`);
+
+      for (const u of snapshot.users) {
+        this.sql.exec(
+          `INSERT INTO users (id, name, kind, created_at) VALUES (?, ?, ?, ?)`,
+          u.id,
+          u.name,
+          u.kind,
+          u.created_at,
+        );
+      }
+
+      let maxThreadId = 0;
+      for (const t of snapshot.threads) {
+        if (t.id > maxThreadId) maxThreadId = t.id;
+        this.sql.exec(
+          `INSERT INTO threads (id, user_id, title, board, dm_key, created_at, bumped_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          t.id,
+          t.user_id,
+          t.title,
+          t.board,
+          t.dm_key,
+          t.created_at,
+          t.bumped_at,
+        );
+      }
+
+      let maxPostId = 0;
+      for (const p of snapshot.posts) {
+        if (p.id > maxPostId) maxPostId = p.id;
+        this.sql.exec(
+          `INSERT INTO posts (id, thread_id, user_id, body, meta_json, operation_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          p.id,
+          p.thread_id,
+          p.user_id,
+          p.body,
+          p.meta_json,
+          p.operation_id,
+          p.created_at,
+        );
+      }
+
+      for (const tp of snapshot.threadParticipants) {
+        this.sql.exec(
+          `INSERT INTO thread_participants (thread_id, user_id, last_read_post_id)
+           VALUES (?, ?, ?)`,
+          tp.thread_id,
+          tp.user_id,
+          tp.last_read_post_id,
+        );
+      }
+
+      for (const tr of snapshot.threadReads) {
+        this.sql.exec(
+          `INSERT INTO thread_reads (thread_id, user_id, last_read_post_id, updated_at)
+           VALUES (?, ?, ?, ?)`,
+          tr.thread_id,
+          tr.user_id,
+          tr.last_read_post_id,
+          tr.updated_at,
+        );
+      }
+
+      this.setSqliteSequence(
+        "threads",
+        Math.max(maxThreadId, snapshot.sequences?.threads ?? 0),
+      );
+      this.setSqliteSequence(
+        "posts",
+        Math.max(maxPostId, snapshot.sequences?.posts ?? 0),
+      );
+
+      // Ensure @system and all currently registered agents always exist
+      this.ensureSystemAndAgents();
+    });
   }
 
   async flushOutbox(): Promise<void> {

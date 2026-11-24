@@ -1308,6 +1308,64 @@
     color: var(--ice);
   }
 
+  /* —— Checkpoints & Rollback —— */
+  .req-pill.is-cp-manual {
+    border-color: var(--crystal);
+    color: var(--crystal);
+  }
+
+  .req-pill.is-cp-pre_rollback {
+    border-color: var(--warning);
+    color: var(--warning);
+  }
+
+  .req-pill.is-cp-scheduled {
+    border-color: var(--signal);
+    color: var(--signal);
+  }
+
+  .req-pill.is-cp-imported {
+    border-color: var(--neon);
+    color: var(--neon);
+  }
+
+  .cp-stats-line {
+    margin: 0;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .cp-rollback-confirm {
+    margin-top: 0.35lh;
+    padding: 0.55lh 1ch;
+    border: 1px solid color-mix(in srgb, var(--warning) 60%, var(--line));
+    background: var(--void);
+    display: grid;
+    gap: 0.45lh;
+  }
+
+  .cp-rollback-warn {
+    margin: 0;
+    font-size: 12px;
+    color: var(--warning);
+    line-height: 1.45;
+  }
+
+  .cp-schedule-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 1ch;
+  }
+
+  .cp-inline-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6ch;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
   .req-title {
     font-size: 14px;
     color: var(--text);

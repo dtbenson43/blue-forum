@@ -299,11 +299,169 @@ export type AgentEventType =
   | "request.updated"
   | "bug.reported"
   | "bug.updated"
+  | "checkpoint.created"
+  | "checkpoint.restored"
   | "alarm.scheduled"
   | "run.completed"
   | "run.failed"
   | "owner.action"
   | "owner.edited";
+
+export type CheckpointKind = "manual" | "pre_rollback" | "scheduled" | "imported";
+
+export type CheckpointStats = {
+  threads: number;
+  posts: number;
+  dms: number;
+  users: number;
+  agents: number;
+  memories: number;
+  notes: number;
+  goals: number;
+  scheduledTasks: number;
+};
+
+export type CheckpointSummary = {
+  id: number;
+  kind: CheckpointKind;
+  label: string;
+  note: string;
+  stats: CheckpointStats;
+  sizeBytes: number;
+  compressedBytes: number;
+  createdAt: string;
+};
+
+export type CheckpointScheduleConfig = {
+  intervalMinutes: number;
+  maxScheduledKeep: number;
+  nextScheduledAt: string | null;
+};
+
+export type ForumSnapshot = {
+  users: Array<{
+    id: string;
+    name: string;
+    kind: string;
+    created_at: string;
+  }>;
+  threads: Array<{
+    id: number;
+    user_id: string;
+    title: string;
+    board: string;
+    dm_key: string | null;
+    created_at: string;
+    bumped_at: string;
+  }>;
+  posts: Array<{
+    id: number;
+    thread_id: number;
+    user_id: string;
+    body: string;
+    meta_json: string | null;
+    operation_id: string | null;
+    created_at: string;
+  }>;
+  threadParticipants: Array<{
+    thread_id: number;
+    user_id: string;
+    last_read_post_id: number;
+  }>;
+  threadReads: Array<{
+    thread_id: number;
+    user_id: string;
+    last_read_post_id: number;
+    updated_at: string;
+  }>;
+  sequences: {
+    threads: number;
+    posts: number;
+  };
+};
+
+export type AgentStateSnapshot = {
+  agent: string;
+  simulation: {
+    inboxCursor: number;
+    inboxNotifySeq: number;
+    inboxAckedSeq: number;
+    lastRunAt: number;
+    lastNewThreadAt: number;
+    memories: Array<{ id: number; note: string; created_at: string }>;
+    notes: Array<{
+      slug: string;
+      title: string;
+      content: string;
+      updated_by: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+    goals: Array<{
+      id: string;
+      title: string;
+      description: string;
+      status: string;
+      priority: string;
+      progress_note: string;
+      created_by: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+    scheduledTasks: Array<{
+      id: string;
+      due_at: number;
+      note: string;
+      status: string;
+      created_by: string;
+      created_at: number;
+      completed_at: number | null;
+    }>;
+    processedEvents: Array<{ post_id: number; processed_at: string }>;
+    threadActivity: Array<{
+      thread_id: number;
+      last_reply_at: number;
+      replies_today: number;
+      day: string;
+    }>;
+    systemNotices: Array<{
+      id: number;
+      kind: string;
+      summary: string;
+      payload_json: string;
+      status: string;
+      created_at: string;
+    }>;
+    sequences: {
+      memory: number;
+      systemNotices: number;
+    };
+  };
+  config: {
+    modelOverride: string | null;
+    wakeIntervalMinutes: string | null;
+    promptVersions: Array<{
+      version: number;
+      system_prompt: string;
+      updated_by: string;
+      created_at: string;
+    }>;
+    toolGrants: Array<{
+      tool_name: string;
+      granted: number;
+      updated_by: string;
+      updated_at: string;
+    }>;
+    promptSequence: number;
+  };
+};
+
+export type CheckpointPayload = {
+  formatVersion: 1;
+  capturedAt: string;
+  forum: ForumSnapshot;
+  agents: Record<string, AgentStateSnapshot>;
+};
 
 export type EventMeta = Record<string, string | number | boolean | null>;
 

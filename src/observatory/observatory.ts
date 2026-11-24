@@ -3,19 +3,40 @@ import type {
   AgentBugReport,
   AgentEventType,
   AgentRequest,
+  AgentStateSnapshot,
   BugSeverity,
   BugStatus,
+  CheckpointKind,
+  CheckpointPayload,
+  CheckpointScheduleConfig,
+  CheckpointStats,
+  CheckpointSummary,
   EventMeta,
+  ForumSnapshot,
   ObservatoryEventInput,
   ObservatoryEventSummary,
   RequestKind,
   RequestPriority,
   RequestStatus,
 } from "../shared/types";
+import { AGENT_NAMES } from "../agents/personalities";
+import type { Forum } from "../forum/forum";
+import type { Agent } from "../agents/agent";
+
+export type ObservatoryEnv = {
+  FORUM: DurableObjectNamespace<Forum>;
+  AGENTS: DurableObjectNamespace<Agent>;
+  AGENTS_ENABLED?: string;
+};
 
 const MAX_LIVE_EVENTS = 2000;
 const MAX_OPEN_REQUESTS_PER_AGENT = 8;
 const MAX_OPEN_BUGS_PER_AGENT = 10;
+const CHECKPOINT_CHUNK_BYTES = 512 * 1024;
+const DEFAULT_MAX_SCHEDULED_KEEP = 12;
+const MAX_PRE_ROLLBACK_KEEP = 10;
+const MIN_SCHEDULE_INTERVAL_MINUTES = 15;
+const MAX_SCHEDULE_INTERVAL_MINUTES = 1440;
 
 const SEVERITY_RANK: Record<BugSeverity, number> = {
   low: 0,
@@ -65,6 +86,140 @@ type BugReportRow = {
   created_at: string;
   updated_at: string;
 };
+
+type CheckpointRow = {
+  id: number;
+  kind: CheckpointKind;
+  label: string;
+  note: string;
+  stats_json: string;
+  size_bytes: number;
+  compressed_bytes: number;
+  content_hash: string;
+  created_at: string;
+};
+
+async function gzipJson(
+  data: unknown,
+): Promise<{ rawBytes: number; compressed: Uint8Array; hashHex: string }> {
+  const json = JSON.stringify(data);
+  const raw = new TextEncoder().encode(json);
+  const digestBuf = await crypto.subtle.digest("SHA-256", raw);
+  const hashHex = Array.from(new Uint8Array(digestBuf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  const cs = new CompressionStream("gzip");
+  const stream = new Blob([raw]).stream().pipeThrough(cs);
+  const buf = await new Response(stream).arrayBuffer();
+  return { rawBytes: raw.byteLength, compressed: new Uint8Array(buf), hashHex };
+}
+
+async function gunzipJson<T>(bytes: Uint8Array): Promise<T> {
+  const ds = new DecompressionStream("gzip");
+  const stream = new Blob([bytes]).stream().pipeThrough(ds);
+  const text = await new Response(stream).text();
+  return JSON.parse(text) as T;
+}
+
+function computeCheckpointStats(payload: CheckpointPayload): CheckpointStats {
+  const generalThreads = payload.forum.threads.filter(
+    (t) => t.board !== "messages",
+  ).length;
+  const dms = payload.forum.threads.length - generalThreads;
+  const agentList = Object.values(payload.agents);
+  let memories = 0;
+  let notes = 0;
+  let goals = 0;
+  let scheduledTasks = 0;
+  for (const a of agentList) {
+    memories += a.simulation.memories.length;
+    notes += a.simulation.notes.length;
+    goals += a.simulation.goals.length;
+    scheduledTasks += a.simulation.scheduledTasks.filter(
+      (t) => t.status === "pending" || t.status === "in_progress",
+    ).length;
+  }
+  return {
+    threads: generalThreads,
+    posts: payload.forum.posts.length,
+    dms,
+    users: payload.forum.users.length,
+    agents: agentList.length,
+    memories,
+    notes,
+    goals,
+    scheduledTasks,
+  };
+}
+
+function mapCheckpointRow(row: CheckpointRow): CheckpointSummary {
+  let stats: CheckpointStats = {
+    threads: 0,
+    posts: 0,
+    dms: 0,
+    users: 0,
+    agents: 0,
+    memories: 0,
+    notes: 0,
+    goals: 0,
+    scheduledTasks: 0,
+  };
+  try {
+    stats = { ...stats, ...(JSON.parse(row.stats_json) as Partial<CheckpointStats>) };
+  } catch {
+    // keep defaults
+  }
+  return {
+    id: row.id,
+    kind: row.kind,
+    label: row.label,
+    note: row.note,
+    stats,
+    sizeBytes: row.size_bytes,
+    compressedBytes: row.compressed_bytes,
+    createdAt: row.created_at,
+  };
+}
+
+function validateCheckpointPayload(raw: unknown): CheckpointPayload | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (obj.formatVersion !== 1) return null;
+  const forum = obj.forum as Record<string, unknown> | undefined;
+  if (
+    !forum ||
+    typeof forum !== "object" ||
+    !Array.isArray(forum.users) ||
+    !Array.isArray(forum.threads) ||
+    !Array.isArray(forum.posts) ||
+    !Array.isArray(forum.threadParticipants) ||
+    !Array.isArray(forum.threadReads)
+  ) {
+    return null;
+  }
+  if (!obj.agents || typeof obj.agents !== "object" || Array.isArray(obj.agents)) {
+    return null;
+  }
+  for (const val of Object.values(obj.agents as Record<string, unknown>)) {
+    if (!val || typeof val !== "object") return null;
+    const agentObj = val as Record<string, unknown>;
+    const sim = agentObj.simulation as Record<string, unknown> | undefined;
+    if (
+      !sim ||
+      typeof sim !== "object" ||
+      !Array.isArray(sim.memories) ||
+      !Array.isArray(sim.notes) ||
+      !Array.isArray(sim.goals) ||
+      !Array.isArray(sim.scheduledTasks) ||
+      !Array.isArray(sim.processedEvents) ||
+      !Array.isArray(sim.threadActivity) ||
+      !Array.isArray(sim.systemNotices)
+    ) {
+      return null;
+    }
+  }
+  return raw as CheckpointPayload;
+}
 
 function mapEventRow(row: LiveEventRow): ObservatoryEventSummary {
   let meta: EventMeta | null = null;
@@ -128,10 +283,10 @@ function mapBugReportRow(row: BugReportRow): AgentBugReport {
  * Uses Cloudflare WebSocket Hibernation to push compact event summaries and
  * request updates to connected owner dashboards with sequence-based replay.
  */
-export class Observatory extends DurableObject<Record<string, unknown>> {
+export class Observatory extends DurableObject<ObservatoryEnv> {
   private sql = this.ctx.storage.sql;
 
-  constructor(ctx: DurableObjectState, env: Record<string, unknown>) {
+  constructor(ctx: DurableObjectState, env: ObservatoryEnv) {
     super(ctx, env);
     this.initSchema();
   }
@@ -189,6 +344,32 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       );
       CREATE INDEX IF NOT EXISTS idx_bug_reports_agent ON bug_reports(agent, id DESC);
       CREATE INDEX IF NOT EXISTS idx_bug_reports_status ON bug_reports(status, id DESC);
+
+      CREATE TABLE IF NOT EXISTS checkpoints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL DEFAULT 'manual'
+          CHECK (kind IN ('manual', 'pre_rollback', 'scheduled', 'imported')),
+        label TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        stats_json TEXT NOT NULL DEFAULT '{}',
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        compressed_bytes INTEGER NOT NULL DEFAULT 0,
+        content_hash TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_checkpoints_kind_id ON checkpoints(kind, id DESC);
+
+      CREATE TABLE IF NOT EXISTS checkpoint_blobs (
+        checkpoint_id INTEGER NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        data BLOB NOT NULL,
+        PRIMARY KEY (checkpoint_id, chunk_index)
+      );
+
+      CREATE TABLE IF NOT EXISTS observatory_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
   }
 
@@ -800,6 +981,462 @@ export class Observatory extends DurableObject<Record<string, unknown>> {
       openBugs: this.getOpenBugCount(),
     });
     return true;
+  }
+
+  // ——— Checkpoints & Rollback ———
+
+  private getSetting(key: string): string | null {
+    return (
+      this.sql
+        .exec<{ value: string }>(
+          `SELECT value FROM observatory_settings WHERE key = ?`,
+          key,
+        )
+        .toArray()[0]?.value ?? null
+    );
+  }
+
+  private setSetting(key: string, value: string): void {
+    this.sql.exec(
+      `INSERT INTO observatory_settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      key,
+      value,
+    );
+  }
+
+  private storeCheckpointBlobs(checkpointId: number, compressed: Uint8Array): void {
+    this.sql.exec(
+      `DELETE FROM checkpoint_blobs WHERE checkpoint_id = ?`,
+      checkpointId,
+    );
+    let chunkIndex = 0;
+    for (let offset = 0; offset < compressed.byteLength; offset += CHECKPOINT_CHUNK_BYTES) {
+      const slice = compressed.subarray(
+        offset,
+        Math.min(offset + CHECKPOINT_CHUNK_BYTES, compressed.byteLength),
+      );
+      this.sql.exec(
+        `INSERT INTO checkpoint_blobs (checkpoint_id, chunk_index, data) VALUES (?, ?, ?)`,
+        checkpointId,
+        chunkIndex++,
+        slice,
+      );
+    }
+  }
+
+  private loadCheckpointBlobs(checkpointId: number): Uint8Array | null {
+    const rows = this.sql
+      .exec<{ data: ArrayBuffer }>(
+        `SELECT data FROM checkpoint_blobs WHERE checkpoint_id = ? ORDER BY chunk_index ASC`,
+        checkpointId,
+      )
+      .toArray();
+    if (rows.length === 0) return null;
+    const chunks = rows.map((r) =>
+      r.data instanceof Uint8Array
+        ? r.data
+        : new Uint8Array(r.data),
+    );
+    const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      out.set(c, offset);
+      offset += c.byteLength;
+    }
+    return out;
+  }
+
+  private pruneAutoCheckpoints(kind: "scheduled" | "pre_rollback", maxKeep: number): void {
+    const keep = Math.max(1, Math.floor(maxKeep));
+    const toDelete = this.sql
+      .exec<{ id: number }>(
+        `SELECT id FROM checkpoints
+         WHERE kind = ?
+         ORDER BY id DESC
+         LIMIT -1 OFFSET ?`,
+        kind,
+        keep,
+      )
+      .toArray();
+    for (const row of toDelete) {
+      this.sql.exec(`DELETE FROM checkpoint_blobs WHERE checkpoint_id = ?`, row.id);
+      this.sql.exec(`DELETE FROM checkpoints WHERE id = ?`, row.id);
+    }
+  }
+
+  async getCheckpointSchedule(): Promise<CheckpointScheduleConfig> {
+    const intervalRaw = Number(this.getSetting("auto_checkpoint_interval_minutes") ?? "0");
+    const intervalMinutes =
+      Number.isFinite(intervalRaw) && intervalRaw >= MIN_SCHEDULE_INTERVAL_MINUTES
+        ? Math.min(MAX_SCHEDULE_INTERVAL_MINUTES, Math.round(intervalRaw))
+        : 0;
+    const maxRaw = Number(
+      this.getSetting("auto_checkpoint_max_keep") ?? String(DEFAULT_MAX_SCHEDULED_KEEP),
+    );
+    const maxScheduledKeep =
+      Number.isFinite(maxRaw) && maxRaw >= 1
+        ? Math.min(50, Math.round(maxRaw))
+        : DEFAULT_MAX_SCHEDULED_KEEP;
+    const alarmAt = await this.ctx.storage.getAlarm();
+    return {
+      intervalMinutes,
+      maxScheduledKeep,
+      nextScheduledAt:
+        intervalMinutes > 0 && alarmAt ? new Date(alarmAt).toISOString() : null,
+    };
+  }
+
+  async updateCheckpointSchedule(input: {
+    intervalMinutes: number;
+    maxScheduledKeep?: number;
+  }): Promise<CheckpointScheduleConfig> {
+    const rawInterval = Number(input.intervalMinutes);
+    const intervalMinutes =
+      rawInterval <= 0
+        ? 0
+        : Math.max(
+            MIN_SCHEDULE_INTERVAL_MINUTES,
+            Math.min(MAX_SCHEDULE_INTERVAL_MINUTES, Math.round(rawInterval)),
+          );
+    this.setSetting("auto_checkpoint_interval_minutes", String(intervalMinutes));
+
+    if (input.maxScheduledKeep !== undefined && Number.isFinite(input.maxScheduledKeep)) {
+      const clampedKeep = Math.max(1, Math.min(50, Math.round(input.maxScheduledKeep)));
+      this.setSetting("auto_checkpoint_max_keep", String(clampedKeep));
+      this.pruneAutoCheckpoints("scheduled", clampedKeep);
+    }
+
+    if (intervalMinutes > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + intervalMinutes * 60_000);
+    } else {
+      await this.ctx.storage.deleteAlarm();
+    }
+
+    const schedule = await this.getCheckpointSchedule();
+    this.broadcast({ type: "checkpoint", schedule });
+    return schedule;
+  }
+
+  async listCheckpoints(
+    limit = 60,
+  ): Promise<{ checkpoints: CheckpointSummary[]; schedule: CheckpointScheduleConfig }> {
+    const safeLimit = Math.max(1, Math.min(limit, 100));
+    const rows = this.sql
+      .exec<CheckpointRow>(
+        `SELECT id, kind, label, note, stats_json, size_bytes, compressed_bytes, content_hash, created_at
+         FROM checkpoints
+         ORDER BY id DESC
+         LIMIT ?`,
+        safeLimit,
+      )
+      .toArray();
+    const schedule = await this.getCheckpointSchedule();
+    return {
+      checkpoints: rows.map(mapCheckpointRow),
+      schedule,
+    };
+  }
+
+  async createCheckpoint(input?: {
+    label?: string;
+    note?: string;
+    kind?: CheckpointKind;
+    skipIfUnchanged?: boolean;
+  }): Promise<
+    | { ok: true; checkpoint: CheckpointSummary; skipped?: false }
+    | { ok: true; skipped: true; reason: string }
+    | { ok: false; error: string }
+  > {
+    const kind: CheckpointKind =
+      input?.kind === "pre_rollback" ||
+      input?.kind === "scheduled" ||
+      input?.kind === "imported"
+        ? input.kind
+        : "manual";
+
+    const forumStub = this.env.FORUM.getByName("general");
+    const [forumSnap, ...agentSnaps] = await Promise.all([
+      forumStub.exportSnapshot(),
+      ...AGENT_NAMES.map((name) =>
+        this.env.AGENTS.getByName(name).exportSnapshot(name),
+      ),
+    ]);
+
+    const agentsMap: Record<string, AgentStateSnapshot> = {};
+    for (const snap of agentSnaps) {
+      agentsMap[snap.agent] = snap;
+    }
+
+    const payload: CheckpointPayload = {
+      formatVersion: 1,
+      capturedAt: new Date().toISOString(),
+      forum: forumSnap,
+      agents: agentsMap,
+    };
+
+    const stats = computeCheckpointStats(payload);
+
+    // Hash canonical forum + agent state (excluding capturedAt timestamp)
+    // so scheduled checkpoints skip creating redundant copies when nothing changed.
+    const hashInput = { forum: payload.forum, agents: payload.agents };
+    const { hashHex } = await gzipJson(hashInput);
+    const { rawBytes, compressed } = await gzipJson(payload);
+
+    if (input?.skipIfUnchanged) {
+      const latest = this.sql
+        .exec<{ content_hash: string }>(
+          `SELECT content_hash FROM checkpoints ORDER BY id DESC LIMIT 1`,
+        )
+        .toArray()[0];
+      if (latest && latest.content_hash === hashHex) {
+        return { ok: true, skipped: true, reason: "no_changes_since_last" };
+      }
+    }
+
+    const defaultLabel =
+      kind === "scheduled"
+        ? `Scheduled snapshot (${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC)`
+        : kind === "pre_rollback"
+          ? `Pre-rollback safety backup`
+          : `Checkpoint (${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC)`;
+
+    const label = (input?.label?.trim() || defaultLabel).slice(0, 120);
+    const note = (input?.note?.trim() || "").slice(0, 400);
+
+    let createdId = 0;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT INTO checkpoints (kind, label, note, stats_json, size_bytes, compressed_bytes, content_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        kind,
+        label,
+        note,
+        JSON.stringify(stats),
+        rawBytes,
+        compressed.byteLength,
+        hashHex,
+      );
+      createdId = this.sql
+        .exec<{ id: number }>(`SELECT id FROM checkpoints ORDER BY id DESC LIMIT 1`)
+        .one().id;
+      this.storeCheckpointBlobs(createdId, compressed);
+    });
+
+    if (kind === "scheduled") {
+      const sched = await this.getCheckpointSchedule();
+      this.pruneAutoCheckpoints("scheduled", sched.maxScheduledKeep);
+    } else if (kind === "pre_rollback") {
+      this.pruneAutoCheckpoints("pre_rollback", MAX_PRE_ROLLBACK_KEEP);
+    }
+
+    const row = this.sql
+      .exec<CheckpointRow>(`SELECT * FROM checkpoints WHERE id = ?`, createdId)
+      .one();
+    const checkpoint = mapCheckpointRow(row);
+
+    await this.recordEvent({
+      eventId: crypto.randomUUID(),
+      agent: "system",
+      runId: null,
+      parentId: null,
+      type: "checkpoint.created",
+      ts: Date.now(),
+      summary: `Created ${kind} checkpoint #${checkpoint.id}: ${checkpoint.label} (${stats.threads} threads, ${stats.posts} posts, ${stats.memories} mem)`,
+      meta: {
+        checkpointId: checkpoint.id,
+        kind,
+        threads: stats.threads,
+        posts: stats.posts,
+        memories: stats.memories,
+      },
+    });
+
+    this.broadcast({ type: "checkpoint", checkpoint });
+    return { ok: true, checkpoint };
+  }
+
+  async exportCheckpoint(
+    id: number,
+  ): Promise<{ summary: CheckpointSummary; payload: CheckpointPayload } | null> {
+    const row = this.sql
+      .exec<CheckpointRow>(`SELECT * FROM checkpoints WHERE id = ?`, id)
+      .toArray()[0];
+    if (!row) return null;
+    const compressed = this.loadCheckpointBlobs(id);
+    if (!compressed) return null;
+    const payload = await gunzipJson<CheckpointPayload>(compressed);
+    return { summary: mapCheckpointRow(row), payload };
+  }
+
+  async importCheckpoint(input: {
+    label?: string;
+    note?: string;
+    payload: CheckpointPayload;
+  }): Promise<{ ok: true; checkpoint: CheckpointSummary } | { ok: false; error: string }> {
+    const valid = validateCheckpointPayload(input.payload);
+    if (!valid) {
+      return {
+        ok: false,
+        error: "Invalid checkpoint JSON: expected formatVersion=1 with forum and agents snapshots.",
+      };
+    }
+
+    const stats = computeCheckpointStats(valid);
+    const { hashHex } = await gzipJson({ forum: valid.forum, agents: valid.agents });
+    const { rawBytes, compressed } = await gzipJson(valid);
+    const label = (
+      input.label?.trim() ||
+      `Imported checkpoint (${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC)`
+    ).slice(0, 120);
+    const note = (input.note?.trim() || "").slice(0, 400);
+
+    let createdId = 0;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT INTO checkpoints (kind, label, note, stats_json, size_bytes, compressed_bytes, content_hash)
+         VALUES ('imported', ?, ?, ?, ?, ?, ?)`,
+        label,
+        note,
+        JSON.stringify(stats),
+        rawBytes,
+        compressed.byteLength,
+        hashHex,
+      );
+      createdId = this.sql
+        .exec<{ id: number }>(`SELECT id FROM checkpoints ORDER BY id DESC LIMIT 1`)
+        .one().id;
+      this.storeCheckpointBlobs(createdId, compressed);
+    });
+
+    const row = this.sql
+      .exec<CheckpointRow>(`SELECT * FROM checkpoints WHERE id = ?`, createdId)
+      .one();
+    const checkpoint = mapCheckpointRow(row);
+    this.broadcast({ type: "checkpoint", checkpoint });
+    return { ok: true, checkpoint };
+  }
+
+  async rollbackToCheckpoint(
+    id: number,
+    opts?: { restoreConfig?: boolean },
+  ): Promise<
+    | {
+        ok: true;
+        restored: CheckpointSummary;
+        safetyCheckpoint: CheckpointSummary;
+        restoreConfig: boolean;
+        agentsPaused: true;
+      }
+    | { ok: false; error: string }
+  > {
+    const restoreConfig = Boolean(opts?.restoreConfig);
+    const target = await this.exportCheckpoint(id);
+    if (!target) {
+      return { ok: false, error: `Checkpoint #${id} not found` };
+    }
+
+    // 1. Pause all agents & purge forum outbox first so no new writes land mid-rollback
+    const forumStub = this.env.FORUM.getByName("general");
+    await Promise.all([
+      forumStub.purgeOutbox(),
+      ...AGENT_NAMES.map((name) =>
+        this.env.AGENTS.getByName(name).setPaused(name, true),
+      ),
+    ]);
+
+    // 2. Take an automatic pre-rollback safety backup so rollback itself is undoable
+    const safetyRes = await this.createCheckpoint({
+      kind: "pre_rollback",
+      label: `Before rollback to #${target.summary.id} (${target.summary.label})`,
+      note: `Automatic safety snapshot created immediately before restoring checkpoint #${target.summary.id}.`,
+    });
+    if (!safetyRes.ok || safetyRes.skipped) {
+      return {
+        ok: false,
+        error: "Failed to create pre-rollback safety checkpoint; rollback aborted.",
+      };
+    }
+
+    // 3. Restore Forum first, then all registered Agent DOs (leaving every agent paused)
+    await forumStub.restoreSnapshot(target.payload.forum);
+    await Promise.all(
+      AGENT_NAMES.map((name) =>
+        this.env.AGENTS.getByName(name).restoreSnapshot(
+          name,
+          target.payload.agents[name] ?? null,
+          { restoreConfig },
+        ),
+      ),
+    );
+
+    await this.recordEvent({
+      eventId: crypto.randomUUID(),
+      agent: "system",
+      runId: null,
+      parentId: null,
+      type: "checkpoint.restored",
+      ts: Date.now(),
+      summary: `Rolled back to checkpoint #${target.summary.id} ("${target.summary.label}") · ${restoreConfig ? "config restored" : "config preserved"} · all agents paused (backup #${safetyRes.checkpoint.id})`,
+      meta: {
+        checkpointId: target.summary.id,
+        safetyCheckpointId: safetyRes.checkpoint.id,
+        restoreConfig,
+        agentsPaused: true,
+      },
+    });
+
+    this.broadcast({
+      type: "checkpoint",
+      restoredId: target.summary.id,
+      safetyCheckpoint: safetyRes.checkpoint,
+    });
+
+    return {
+      ok: true,
+      restored: target.summary,
+      safetyCheckpoint: safetyRes.checkpoint,
+      restoreConfig,
+      agentsPaused: true,
+    };
+  }
+
+  async deleteCheckpoint(id: number): Promise<boolean> {
+    const existing = this.sql
+      .exec<{ id: number }>(`SELECT id FROM checkpoints WHERE id = ?`, id)
+      .toArray()[0];
+    if (!existing) return false;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`DELETE FROM checkpoint_blobs WHERE checkpoint_id = ?`, id);
+      this.sql.exec(`DELETE FROM checkpoints WHERE id = ?`, id);
+    });
+    this.broadcast({ type: "checkpoint_deleted", id });
+    return true;
+  }
+
+  override async alarm(): Promise<void> {
+    const schedule = await this.getCheckpointSchedule();
+    if (schedule.intervalMinutes <= 0) {
+      return;
+    }
+
+    try {
+      await this.createCheckpoint({
+        kind: "scheduled",
+        skipIfUnchanged: true,
+      });
+    } catch (err) {
+      console.error("[Observatory] Scheduled checkpoint failed:", err);
+    } finally {
+      // Re-read schedule in case it was turned off while running
+      const latest = await this.getCheckpointSchedule();
+      if (latest.intervalMinutes > 0) {
+        await this.ctx.storage.setAlarm(
+          Date.now() + latest.intervalMinutes * 60_000,
+        );
+      }
+    }
   }
 
   // ——— WebSocket Hibernation ———

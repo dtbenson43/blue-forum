@@ -11,6 +11,7 @@ import type {
   AgentNoteSummary,
   AgentRequest,
   AgentRunLogEntry,
+  AgentStateSnapshot,
   AgentStatusSnapshot,
   EventMeta,
   ForumEvent,
@@ -241,6 +242,7 @@ function mapGoalRow(row: GoalRow): AgentGoal {
  */
 export class Agent extends DurableObject<AgentEnv> {
   private sql = this.ctx.storage.sql;
+  private stateEpoch = 0;
 
   constructor(ctx: DurableObjectState, env: AgentEnv) {
     super(ctx, env);
@@ -1822,6 +1824,401 @@ export class Agent extends DurableObject<AgentEnv> {
     }
   }
 
+  private getSqliteSequence(tableName: string): number {
+    const hasSeq =
+      this.sql
+        .exec<{ name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'`,
+        )
+        .toArray().length > 0;
+    if (!hasSeq) return 0;
+    const row = this.sql
+      .exec<{ seq: number }>(
+        `SELECT seq FROM sqlite_sequence WHERE name = ?`,
+        tableName,
+      )
+      .toArray()[0];
+    return row?.seq ?? 0;
+  }
+
+  private setSqliteSequence(tableName: string, seq: number): void {
+    const hasSeq =
+      this.sql
+        .exec<{ name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'`,
+        )
+        .toArray().length > 0;
+    if (!hasSeq) return;
+    const clean = Math.max(0, Math.floor(seq));
+    const existing = this.sql
+      .exec<{ seq: number }>(
+        `SELECT seq FROM sqlite_sequence WHERE name = ?`,
+        tableName,
+      )
+      .toArray()[0];
+    if (existing) {
+      this.sql.exec(
+        `UPDATE sqlite_sequence SET seq = ? WHERE name = ?`,
+        clean,
+        tableName,
+      );
+    } else if (clean > 0) {
+      this.sql.exec(
+        `INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)`,
+        tableName,
+        clean,
+      );
+    }
+  }
+
+  async exportSnapshot(agentName: string): Promise<AgentStateSnapshot> {
+    const name = this.rememberIdentity(agentName);
+    const memories = this.sql
+      .exec<{ id: number; note: string; created_at: string }>(
+        `SELECT id, note, created_at FROM memory ORDER BY id ASC`,
+      )
+      .toArray();
+    const notes = this.sql
+      .exec<{
+        slug: string;
+        title: string;
+        content: string;
+        updated_by: string;
+        created_at: string;
+        updated_at: string;
+      }>(
+        `SELECT slug, title, content, updated_by, created_at, updated_at
+         FROM notes ORDER BY slug ASC`,
+      )
+      .toArray();
+    const goals = this.sql
+      .exec<{
+        id: string;
+        title: string;
+        description: string;
+        status: string;
+        priority: string;
+        progress_note: string;
+        created_by: string;
+        created_at: string;
+        updated_at: string;
+      }>(
+        `SELECT id, title, description, status, priority, progress_note, created_by, created_at, updated_at
+         FROM goals ORDER BY created_at ASC, id ASC`,
+      )
+      .toArray();
+    const scheduledTasks = this.sql
+      .exec<{
+        id: string;
+        due_at: number;
+        note: string;
+        status: string;
+        created_by: string;
+        created_at: number;
+        completed_at: number | null;
+      }>(
+        `SELECT id, due_at, note, status, created_by, created_at, completed_at
+         FROM scheduled_tasks ORDER BY created_at ASC, id ASC`,
+      )
+      .toArray();
+    const processedEvents = this.sql
+      .exec<{ post_id: number; processed_at: string }>(
+        `SELECT post_id, processed_at FROM processed_events ORDER BY post_id ASC`,
+      )
+      .toArray();
+    const threadActivity = this.sql
+      .exec<{
+        thread_id: number;
+        last_reply_at: number;
+        replies_today: number;
+        day: string;
+      }>(
+        `SELECT thread_id, last_reply_at, replies_today, day
+         FROM thread_activity ORDER BY thread_id ASC`,
+      )
+      .toArray();
+    const systemNotices = this.sql
+      .exec<{
+        id: number;
+        kind: string;
+        summary: string;
+        payload_json: string;
+        status: string;
+        created_at: string;
+      }>(
+        `SELECT id, kind, summary, payload_json, status, created_at
+         FROM system_notices ORDER BY id ASC`,
+      )
+      .toArray();
+    const promptVersions = this.sql
+      .exec<{
+        version: number;
+        system_prompt: string;
+        updated_by: string;
+        created_at: string;
+      }>(
+        `SELECT version, system_prompt, updated_by, created_at
+         FROM prompt_versions ORDER BY version ASC`,
+      )
+      .toArray();
+    const toolGrants = this.sql
+      .exec<{
+        tool_name: string;
+        granted: number;
+        updated_by: string;
+        updated_at: string;
+      }>(
+        `SELECT tool_name, granted, updated_by, updated_at
+         FROM tool_grants ORDER BY tool_name ASC`,
+      )
+      .toArray();
+
+    return {
+      agent: name,
+      simulation: {
+        inboxCursor: this.getNumberState("inbox_cursor", 0),
+        inboxNotifySeq: this.getNumberState("inbox_notify_seq", 0),
+        inboxAckedSeq: this.getNumberState("inbox_acked_seq", 0),
+        lastRunAt: this.getNumberState("last_run_at", 0),
+        lastNewThreadAt: this.getNumberState("last_new_thread_at", 0),
+        memories,
+        notes,
+        goals,
+        scheduledTasks,
+        processedEvents,
+        threadActivity,
+        systemNotices,
+        sequences: {
+          memory: this.getSqliteSequence("memory"),
+          systemNotices: this.getSqliteSequence("system_notices"),
+        },
+      },
+      config: {
+        modelOverride: this.getState("model_override"),
+        wakeIntervalMinutes: this.getState("wake_interval_minutes"),
+        promptVersions,
+        toolGrants,
+        promptSequence: this.getSqliteSequence("prompt_versions"),
+      },
+    };
+  }
+
+  async restoreSnapshot(
+    agentName: string,
+    snapshot: AgentStateSnapshot | null,
+    opts?: { restoreConfig?: boolean },
+  ): Promise<void> {
+    const name = this.rememberIdentity(agentName);
+    const restoreConfig = Boolean(opts?.restoreConfig);
+
+    // Bump epoch so any in-flight alarm() awaiting OpenRouter exits without writing.
+    this.stateEpoch++;
+
+    this.ctx.storage.transactionSync(() => {
+      // Always discard any stale in-flight job checkpoints
+      this.sql.exec(`DELETE FROM active_job`);
+      this.sql.exec(`DELETE FROM job_writes`);
+
+      // Replace simulation tables
+      this.sql.exec(`DELETE FROM memory`);
+      this.sql.exec(`DELETE FROM notes`);
+      this.sql.exec(`DELETE FROM goals`);
+      this.sql.exec(`DELETE FROM scheduled_tasks`);
+      this.sql.exec(`DELETE FROM processed_events`);
+      this.sql.exec(`DELETE FROM thread_activity`);
+      this.sql.exec(`DELETE FROM system_notices`);
+
+      if (snapshot) {
+        const sim = snapshot.simulation;
+
+        let maxMemId = 0;
+        for (const m of sim.memories) {
+          if (m.id > maxMemId) maxMemId = m.id;
+          this.sql.exec(
+            `INSERT INTO memory (id, note, created_at) VALUES (?, ?, ?)`,
+            m.id,
+            m.note,
+            m.created_at,
+          );
+        }
+
+        for (const n of sim.notes) {
+          this.sql.exec(
+            `INSERT INTO notes (slug, title, content, updated_by, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            n.slug,
+            n.title,
+            n.content,
+            n.updated_by,
+            n.created_at,
+            n.updated_at,
+          );
+        }
+
+        for (const g of sim.goals) {
+          this.sql.exec(
+            `INSERT INTO goals (id, title, description, status, priority, progress_note, created_by, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            g.id,
+            g.title,
+            g.description,
+            g.status,
+            g.priority,
+            g.progress_note,
+            g.created_by,
+            g.created_at,
+            g.updated_at,
+          );
+        }
+
+        for (const t of sim.scheduledTasks) {
+          // Never leave a restored task stuck in_progress
+          const status = t.status === "in_progress" ? "pending" : t.status;
+          this.sql.exec(
+            `INSERT INTO scheduled_tasks (id, due_at, note, status, created_by, created_at, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            t.id,
+            t.due_at,
+            t.note,
+            status,
+            t.created_by,
+            t.created_at,
+            t.completed_at,
+          );
+        }
+
+        for (const pe of sim.processedEvents) {
+          this.sql.exec(
+            `INSERT INTO processed_events (post_id, processed_at) VALUES (?, ?)`,
+            pe.post_id,
+            pe.processed_at,
+          );
+        }
+
+        for (const ta of sim.threadActivity) {
+          this.sql.exec(
+            `INSERT INTO thread_activity (thread_id, last_reply_at, replies_today, day)
+             VALUES (?, ?, ?, ?)`,
+            ta.thread_id,
+            ta.last_reply_at,
+            ta.replies_today,
+            ta.day,
+          );
+        }
+
+        let maxNoticeId = 0;
+        for (const sn of sim.systemNotices) {
+          if (sn.id > maxNoticeId) maxNoticeId = sn.id;
+          const status = sn.status === "in_progress" ? "pending" : sn.status;
+          this.sql.exec(
+            `INSERT INTO system_notices (id, kind, summary, payload_json, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            sn.id,
+            sn.kind,
+            sn.summary,
+            sn.payload_json,
+            status,
+            sn.created_at,
+          );
+        }
+
+        this.setSqliteSequence(
+          "memory",
+          Math.max(maxMemId, sim.sequences?.memory ?? 0),
+        );
+        this.setSqliteSequence(
+          "system_notices",
+          Math.max(maxNoticeId, sim.sequences?.systemNotices ?? 0),
+        );
+
+        this.setState("inbox_cursor", String(sim.inboxCursor ?? 0));
+        this.setState("inbox_notify_seq", String(sim.inboxNotifySeq ?? 0));
+        this.setState("inbox_acked_seq", String(sim.inboxAckedSeq ?? 0));
+        this.setState("last_run_at", String(sim.lastRunAt ?? 0));
+        this.setState("last_new_thread_at", String(sim.lastNewThreadAt ?? 0));
+
+        if (restoreConfig && snapshot.config) {
+          const cfg = snapshot.config;
+          this.sql.exec(`DELETE FROM prompt_versions`);
+          let maxPromptVer = 0;
+          for (const pv of cfg.promptVersions) {
+            if (pv.version > maxPromptVer) maxPromptVer = pv.version;
+            this.sql.exec(
+              `INSERT INTO prompt_versions (version, system_prompt, updated_by, created_at)
+               VALUES (?, ?, ?, ?)`,
+              pv.version,
+              pv.system_prompt,
+              pv.updated_by,
+              pv.created_at,
+            );
+          }
+          this.setSqliteSequence(
+            "prompt_versions",
+            Math.max(maxPromptVer, cfg.promptSequence ?? 0),
+          );
+
+          this.sql.exec(`DELETE FROM tool_grants`);
+          for (const tg of cfg.toolGrants) {
+            this.sql.exec(
+              `INSERT INTO tool_grants (tool_name, granted, updated_by, updated_at)
+               VALUES (?, ?, ?, ?)`,
+              tg.tool_name,
+              tg.granted,
+              tg.updated_by,
+              tg.updated_at,
+            );
+          }
+
+          if (cfg.modelOverride !== null && cfg.modelOverride !== undefined) {
+            this.setState("model_override", cfg.modelOverride);
+          } else {
+            this.deleteState("model_override");
+          }
+
+          if (
+            cfg.wakeIntervalMinutes !== null &&
+            cfg.wakeIntervalMinutes !== undefined
+          ) {
+            this.setState("wake_interval_minutes", cfg.wakeIntervalMinutes);
+          } else {
+            this.deleteState("wake_interval_minutes");
+          }
+        }
+      } else {
+        // Agent did not exist when snapshot was taken: reset simulation state cleanly
+        this.setSqliteSequence("memory", 0);
+        this.setSqliteSequence("system_notices", 0);
+        this.setState("inbox_cursor", "0");
+        this.setState("inbox_notify_seq", "0");
+        this.setState("inbox_acked_seq", "0");
+        this.setState("last_run_at", "0");
+        this.setState("last_new_thread_at", "0");
+      }
+
+      // Always keep agent paused after rollback and clear transient timers/backoff.
+      // Daily API budget counters (budget_day / calls_today / web_calls_today) are preserved.
+      this.setState("paused", "1");
+      this.setState("force_browse", "0");
+      this.setState("backoff_until", "0");
+      this.setState("next_wake_interval_at", "0");
+      this.setState("next_idle_at", "0");
+    });
+
+    await this.ctx.storage.deleteAlarm();
+
+    this.emitEvent({
+      agent: name,
+      type: "owner.action",
+      summary: `Rolled back state (${restoreConfig ? "config restored" : "config preserved"}; paused)`,
+      payload: {
+        action: "rollback",
+        restoreConfig,
+        hadSnapshot: Boolean(snapshot),
+      },
+      meta: { action: "rollback", restoreConfig },
+    });
+  }
+
   // ——— Owner Mind Control Room RPCs ———
 
   async getMindSnapshot(agentName: string): Promise<AgentMindSnapshot> {
@@ -2586,6 +2983,7 @@ export class Agent extends DurableObject<AgentEnv> {
   // ——— Main execution cycle ———
 
   override async alarm(): Promise<void> {
+    const runEpoch = this.stateEpoch;
     const name = this.resolveIdentity();
     if (!name) return;
 
@@ -3010,6 +3408,7 @@ export class Agent extends DurableObject<AgentEnv> {
           siteUrl: this.env.SITE_URL,
           sessionId: `agent:${name}`,
         });
+        if (this.stateEpoch !== runEpoch) return;
         const llmDurationMs = Date.now() - llmStart;
 
         promptTokens += completion.promptTokens;
@@ -3453,6 +3852,7 @@ export class Agent extends DurableObject<AgentEnv> {
               }
             },
           });
+          if (this.stateEpoch !== runEpoch) return;
           const toolDurationMs = Date.now() - toolStartMs;
 
           this.emitEvent({
@@ -3493,6 +3893,7 @@ export class Agent extends DurableObject<AgentEnv> {
         completed = true;
       }
     } catch (err) {
+      if (this.stateEpoch !== runEpoch) return;
       runError = err instanceof Error ? err.message : String(err);
       if (err instanceof OpenRouterError && !err.retryable) {
         this.setState("backoff_until", String(Date.now() + 15 * 60_000));
@@ -3500,6 +3901,8 @@ export class Agent extends DurableObject<AgentEnv> {
         this.setState("backoff_until", String(Date.now() + 60_000));
       }
     }
+
+    if (this.stateEpoch !== runEpoch) return;
 
     const runDurationMs = Date.now() - runStartMs;
     this.setState("last_run_at", String(Date.now()));

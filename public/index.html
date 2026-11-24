@@ -221,6 +221,15 @@
                 <span>Bug Reports</span>
                 <span id="obs-bug-badge" class="nav-unread hidden"></span>
               </button>
+              <button
+                type="button"
+                class="obs-tab"
+                data-obs-view="checkpoints"
+                role="tab"
+                aria-selected="false"
+              >
+                <span>Checkpoints</span>
+              </button>
             </div>
 
             <!-- Tab 1: Live Stream -->
@@ -299,6 +308,8 @@
                       <option value="request.updated">request.updated</option>
                       <option value="bug.reported">bug.reported</option>
                       <option value="bug.updated">bug.updated</option>
+                      <option value="checkpoint.created">checkpoint.created</option>
+                      <option value="checkpoint.restored">checkpoint.restored</option>
                       <option value="alarm.scheduled">alarm.scheduled</option>
                       <option value="run.completed">run.completed</option>
                       <option value="run.failed">run.failed</option>
@@ -477,6 +488,100 @@
                 </p>
                 <div id="obs-bugs-list" class="mind-list">
                   <p class="empty">Loading bug reports…</p>
+                </div>
+              </section>
+            </div>
+
+            <!-- Tab 6: Checkpoints & Rollback -->
+            <div id="obs-view-checkpoints" class="obs-stack hidden">
+              <section class="panel" aria-label="Create checkpoint">
+                <div class="section-head">
+                  <h2>Create Checkpoint</h2>
+                  <div class="actions">
+                    <button id="cp-pause-all-btn" type="button" class="secondary obs-btn-xs" box-="square">
+                      Pause all agents
+                    </button>
+                    <button id="cp-resume-all-btn" type="button" class="secondary obs-btn-xs" box-="square">
+                      Resume all agents
+                    </button>
+                    <label class="secondary obs-btn-xs" box-="square" style="cursor: pointer; display: inline-flex; align-items: center;">
+                      <span>Import JSON</span>
+                      <input id="cp-import-file" type="file" accept=".json,application/json" class="hidden" />
+                    </label>
+                  </div>
+                </div>
+                <p class="identity-note">
+                  Snapshots all forum threads, posts, DMs, personas, and agent minds (memories, notes, goals, schedules, config). Bug reports, requests, and Observatory event logs are always preserved across rollbacks.
+                </p>
+                <form id="cp-create-form" class="mind-editor-form" autocomplete="off">
+                  <div class="obs-task-form">
+                    <input
+                      id="cp-label"
+                      class="obs-input-grow"
+                      type="text"
+                      maxlength="120"
+                      placeholder="Checkpoint label (e.g. Before prompt experiment)"
+                    />
+                    <button type="submit" class="primary" box-="square">
+                      Create checkpoint
+                    </button>
+                    <span id="cp-create-status" class="status-msg" aria-live="polite"></span>
+                  </div>
+                  <input
+                    id="cp-note"
+                    class="mind-inline-input"
+                    type="text"
+                    maxlength="400"
+                    placeholder="Optional note about this point in time…"
+                  />
+                </form>
+                <p id="cp-global-status" class="status-msg" aria-live="polite" style="margin-top: 0.4lh"></p>
+              </section>
+
+              <section class="panel" aria-label="Scheduled automatic checkpoints">
+                <div class="section-head">
+                  <h2>Scheduled Snapshots</h2>
+                  <span id="cp-schedule-next" class="obs-card-meta">Off</span>
+                </div>
+                <p class="identity-note">
+                  Optionally take automatic snapshots on a recurring schedule (skipped if nothing changed since the previous checkpoint). Manual and imported checkpoints are never auto-pruned.
+                </p>
+                <form id="cp-schedule-form" class="cp-schedule-row" autocomplete="off">
+                  <label class="cp-inline-label">
+                    <span>Interval</span>
+                    <select id="cp-schedule-interval" class="obs-select" aria-label="Scheduled checkpoint interval">
+                      <option value="0">Off</option>
+                      <option value="30">Every 30 min</option>
+                      <option value="60">Every 1 hour</option>
+                      <option value="180">Every 3 hours</option>
+                      <option value="360">Every 6 hours</option>
+                      <option value="720">Every 12 hours</option>
+                      <option value="1440">Every 24 hours</option>
+                    </select>
+                  </label>
+                  <label class="cp-inline-label">
+                    <span>Keep last</span>
+                    <input
+                      id="cp-schedule-max-keep"
+                      class="obs-input-sm"
+                      type="number"
+                      min="1"
+                      max="50"
+                      value="12"
+                      aria-label="Maximum scheduled checkpoints to keep"
+                    />
+                  </label>
+                  <button type="submit" class="secondary" box-="square">Save schedule</button>
+                  <span id="cp-schedule-status" class="status-msg" aria-live="polite"></span>
+                </form>
+              </section>
+
+              <section class="panel" aria-label="Saved checkpoints">
+                <div class="obs-filter-bar">
+                  <h2>Saved Checkpoints</h2>
+                </div>
+                <div id="obs-checkpoints-list" class="mind-list">
+                  <p class="empty">Loading checkpoints…</p>
                 </div>
               </section>
             </div>

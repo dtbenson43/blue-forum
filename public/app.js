@@ -189,6 +189,7 @@ const obsViewMind = document.getElementById("obs-view-mind");
 const obsViewDms = document.getElementById("obs-view-dms");
 const obsViewRequests = document.getElementById("obs-view-requests");
 const obsViewBugs = document.getElementById("obs-view-bugs");
+const obsViewCheckpoints = document.getElementById("obs-view-checkpoints");
 const obsDmsListEl = document.getElementById("obs-dms-list");
 const obsDmDetailEl = document.getElementById("obs-dm-detail");
 const obsDmDetailTitle = document.getElementById("obs-dm-detail-title");
@@ -204,6 +205,18 @@ const obsBugsListEl = document.getElementById("obs-bugs-list");
 const bugFilterStatus = document.getElementById("bug-filter-status");
 const bugFilterSeverity = document.getElementById("bug-filter-severity");
 const bugFilterAgent = document.getElementById("bug-filter-agent");
+const obsCheckpointsListEl = document.getElementById("obs-checkpoints-list");
+const cpCreateForm = document.getElementById("cp-create-form");
+const cpLabelInput = document.getElementById("cp-label");
+const cpNoteInput = document.getElementById("cp-note");
+const cpCreateStatus = document.getElementById("cp-create-status");
+const cpScheduleForm = document.getElementById("cp-schedule-form");
+const cpScheduleInterval = document.getElementById("cp-schedule-interval");
+const cpScheduleMaxKeep = document.getElementById("cp-schedule-max-keep");
+const cpScheduleStatus = document.getElementById("cp-schedule-status");
+const cpScheduleNext = document.getElementById("cp-schedule-next");
+const cpImportFile = document.getElementById("cp-import-file");
+const cpGlobalStatus = document.getElementById("cp-global-status");
 const mindAgentPillsEl = document.getElementById("mind-agent-pills");
 const mindSummaryMeta = document.getElementById("mind-summary-meta");
 const mindResetCapsBtn = document.getElementById("mind-reset-caps-btn");
@@ -236,8 +249,10 @@ let obsReconnectAttempt = 0;
 let obsLatestSeq = 0;
 let obsEvents = []; // newest first, capped at 300
 let obsSelectedEventId = null;
-let obsActiveView = "stream"; // "stream" | "mind" | "dms" | "requests" | "bugs"
+let obsActiveView = "stream"; // "stream" | "mind" | "dms" | "requests" | "bugs" | "checkpoints"
 let obsSelectedDmThreadId = null;
+let cpConfirmRollbackId = null;
+let cachedCheckpoints = [];
 let mindActiveAgent = "oracle";
 let mindActiveTab = "memory"; // "memory" | "notes" | "goals" | "schedule" | "prompt"
 let mindSnapshot = null;
@@ -669,6 +684,7 @@ function eventTypeClass(type) {
   if (type.startsWith("request.")) return "ev-req";
   if (type === "bug.reported") return "ev-err";
   if (type === "bug.updated") return "ev-req";
+  if (type.startsWith("checkpoint.")) return "ev-owner";
   if (type === "memory.updated" || type === "notes.updated" || type === "goals.updated") {
     return "ev-mind";
   }
@@ -849,6 +865,7 @@ function setObsView(view) {
   obsViewDms.classList.toggle("hidden", view !== "dms");
   obsViewRequests.classList.toggle("hidden", view !== "requests");
   obsViewBugs.classList.toggle("hidden", view !== "bugs");
+  obsViewCheckpoints.classList.toggle("hidden", view !== "checkpoints");
   document.querySelectorAll("[data-obs-view]").forEach((btn) => {
     const active = btn.dataset.obsView === view;
     btn.classList.toggle("is-active", active);
@@ -869,6 +886,10 @@ function setObsView(view) {
   } else if (view === "bugs") {
     loadBugs().catch((err) => {
       obsBugsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
+    });
+  } else if (view === "checkpoints") {
+    loadCheckpoints().catch((err) => {
+      obsCheckpointsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
     });
   }
 }
@@ -1112,6 +1133,102 @@ function renderBugs(bugs) {
           </button>
           ${reopenBtn}
         </div>
+      </div>`;
+    })
+    .join("");
+}
+
+function formatBytes(n) {
+  const bytes = Number(n) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function checkpointKindLabel(kind) {
+  if (kind === "pre_rollback") return "PRE-ROLLBACK";
+  if (kind === "scheduled") return "SCHEDULED";
+  if (kind === "imported") return "IMPORTED";
+  return "MANUAL";
+}
+
+function renderCheckpointSchedule(schedule) {
+  if (!schedule) return;
+  const intervalVal = String(schedule.intervalMinutes || 0);
+  if ([...cpScheduleInterval.options].some((o) => o.value === intervalVal)) {
+    cpScheduleInterval.value = intervalVal;
+  } else {
+    cpScheduleInterval.value = "0";
+  }
+  cpScheduleMaxKeep.value = String(schedule.maxScheduledKeep || 12);
+  cpScheduleNext.textContent =
+    schedule.intervalMinutes > 0 && schedule.nextScheduledAt
+      ? `Every ${schedule.intervalMinutes}m · next: ${formatTime(schedule.nextScheduledAt)}`
+      : "Off";
+}
+
+async function loadCheckpoints() {
+  const { checkpoints, schedule } = await api("/admin/checkpoints");
+  cachedCheckpoints = checkpoints;
+  renderCheckpointSchedule(schedule);
+  renderCheckpoints(checkpoints);
+}
+
+function renderCheckpoints(checkpoints) {
+  if (!checkpoints.length) {
+    obsCheckpointsListEl.innerHTML = `<p class="empty">No checkpoints yet. Create one above to save a restore point.</p>`;
+    return;
+  }
+
+  obsCheckpointsListEl.innerHTML = checkpoints
+    .map((c) => {
+      const s = c.stats || {};
+      const statsSummary = `${s.threads ?? 0} threads · ${s.posts ?? 0} posts · ${s.dms ?? 0} DMs · ${s.memories ?? 0} mem · ${s.notes ?? 0} notes · ${s.goals ?? 0} goals · ${s.scheduledTasks ?? 0} tasks`;
+      const sizeLabel = `${formatBytes(c.compressedBytes)} gzip (${formatBytes(c.sizeBytes)} raw)`;
+      const isConfirming = cpConfirmRollbackId === c.id;
+      const confirmBox = isConfirming
+        ? `<div class="cp-rollback-confirm">
+            <p class="cp-rollback-warn">
+              Creates an automatic pre-rollback safety backup first, restores forum &amp; agent minds to checkpoint #${c.id}, and keeps all agents paused until you resume them.
+            </p>
+            <label class="obs-inline-check">
+              <input type="checkbox" data-cp-restore-config="${c.id}" />
+              <span>Also restore saved agent config (prompts, model override, tool grants, wake interval) — leave unchecked to keep current config</span>
+            </label>
+            <div class="obs-card-actions">
+              <button type="button" class="primary obs-btn-xs" box-="square" data-cp-rollback-confirm="${c.id}">
+                Confirm rollback
+              </button>
+              <button type="button" class="secondary obs-btn-xs" box-="square" data-cp-rollback-cancel="1">
+                Cancel
+              </button>
+            </div>
+          </div>`
+        : "";
+
+      return `
+      <div class="mind-item-row req-card" data-cp-card="${c.id}">
+        <div class="mind-item-head">
+          <div class="req-meta-pills">
+            <span class="req-pill is-cp-${escapeHtml(c.kind)}">${escapeHtml(checkpointKindLabel(c.kind))}</span>
+            <span class="ev-time">#${c.id} · ${escapeHtml(formatTime(c.createdAt))} · ${escapeHtml(sizeLabel)}</span>
+          </div>
+          <div class="mind-item-actions">
+            <button type="button" class="obs-mini-btn is-danger" data-cp-delete="${c.id}" title="Delete checkpoint">×</button>
+          </div>
+        </div>
+        <strong class="req-title">${escapeHtml(c.label)}</strong>
+        ${c.note ? `<p class="req-reason">${escapeHtml(c.note)}</p>` : ""}
+        <p class="cp-stats-line">${escapeHtml(statsSummary)}</p>
+        <div class="obs-card-actions">
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-cp-rollback-open="${c.id}">
+            Rollback…
+          </button>
+          <a class="secondary obs-btn-xs" box-="square" href="/api/admin/checkpoints/${c.id}/export" download style="text-decoration: none; display: inline-flex; align-items: center;">
+            Export JSON
+          </a>
+        </div>
+        ${confirmBox}
       </div>`;
     })
     .join("");
@@ -1434,6 +1551,19 @@ async function openEventInspector(agent, eventId) {
   obsSelectedEventId = eventId;
   renderObservatoryStream();
   obsInspector.classList.remove("hidden");
+
+  if (agent === "system") {
+    const cached = obsEvents.find((e) => e.eventId === eventId);
+    if (cached) {
+      obsInspectorTitle.textContent = `@system · ${cached.type} · ${formatTime(new Date(cached.ts).toISOString())}`;
+      obsInspectorBody.innerHTML =
+        `<p class="obs-inspector-summary">${escapeHtml(cached.summary)}</p>` +
+        `<pre class="obs-pre">${escapeHtml(JSON.stringify(cached.meta ?? {}, null, 2))}</pre>`;
+      obsInspector.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      return;
+    }
+  }
+
   obsInspectorTitle.textContent = `Loading @${agent} · ${eventId.slice(0, 8)}…`;
   obsInspectorBody.innerHTML = `<p class="empty-compact">Fetching full payload from Agent DO…</p>`;
 
@@ -1554,6 +1684,13 @@ function connectObservatory() {
       }
       if (obsActiveView === "bugs") {
         loadBugs().catch(() => {});
+      }
+    } else if (data.type === "checkpoint" || data.type === "checkpoint_deleted") {
+      if (obsActiveView === "checkpoints") {
+        loadCheckpoints().catch(() => {});
+      }
+      if (data.restoredId) {
+        loadObservatoryStatus().catch(() => {});
       }
     } else if (data.type === "event" && data.event) {
       mergeObservatoryEvents([data.event]);
@@ -1719,6 +1856,10 @@ async function route() {
     } else if (obsActiveView === "bugs") {
       await loadBugs();
       loadRequests().catch(() => {});
+    } else if (obsActiveView === "checkpoints") {
+      await loadCheckpoints();
+      loadRequests().catch(() => {});
+      loadBugs().catch(() => {});
     } else {
       loadRequests().catch(() => {});
       loadBugs().catch(() => {});
@@ -2053,6 +2194,8 @@ document.getElementById("obs-refresh").addEventListener("click", () => {
     loadMind(mindActiveAgent).catch(() => {});
   } else if (obsActiveView === "dms") {
     loadAgentDms().catch(() => {});
+  } else if (obsActiveView === "checkpoints") {
+    loadCheckpoints().catch(() => {});
   }
 });
 
@@ -2160,6 +2303,173 @@ obsBugsListEl.addEventListener("click", async (e) => {
       loadObservatoryStatus().catch(() => {});
     } finally {
       actionBtn.disabled = false;
+    }
+  }
+});
+
+cpCreateForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  setStatus(cpCreateStatus, "Creating snapshot…");
+  setStatus(cpGlobalStatus, "");
+  try {
+    const { checkpoint } = await api("/admin/checkpoints", {
+      method: "POST",
+      body: JSON.stringify({
+        label: cpLabelInput.value,
+        note: cpNoteInput.value,
+      }),
+    });
+    cpLabelInput.value = "";
+    cpNoteInput.value = "";
+    setStatus(cpCreateStatus, `Saved checkpoint #${checkpoint.id}`, "is-ok");
+    await loadCheckpoints();
+  } catch (err) {
+    setStatus(cpCreateStatus, err.message, "is-error");
+  }
+});
+
+cpScheduleForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  setStatus(cpScheduleStatus, "Saving…");
+  try {
+    const { schedule } = await api("/admin/checkpoints/schedule", {
+      method: "PATCH",
+      body: JSON.stringify({
+        intervalMinutes: Number(cpScheduleInterval.value),
+        maxScheduledKeep: Number(cpScheduleMaxKeep.value),
+      }),
+    });
+    renderCheckpointSchedule(schedule);
+    setStatus(
+      cpScheduleStatus,
+      schedule.intervalMinutes > 0
+        ? `Scheduled every ${schedule.intervalMinutes}m`
+        : "Scheduled snapshots disabled",
+      "is-ok",
+    );
+  } catch (err) {
+    setStatus(cpScheduleStatus, err.message, "is-error");
+  }
+});
+
+document.getElementById("cp-pause-all-btn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  setStatus(cpGlobalStatus, "Pausing all agents…");
+  try {
+    await api("/admin/agents/pause-all", {
+      method: "POST",
+      body: JSON.stringify({ paused: true }),
+    });
+    setStatus(cpGlobalStatus, "All agents paused.", "is-ok");
+    loadObservatoryStatus().catch(() => {});
+  } catch (err) {
+    setStatus(cpGlobalStatus, err.message, "is-error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("cp-resume-all-btn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  setStatus(cpGlobalStatus, "Resuming all agents…");
+  try {
+    await api("/admin/agents/pause-all", {
+      method: "POST",
+      body: JSON.stringify({ paused: false }),
+    });
+    setStatus(cpGlobalStatus, "All agents resumed.", "is-ok");
+    loadObservatoryStatus().catch(() => {});
+  } catch (err) {
+    setStatus(cpGlobalStatus, err.message, "is-error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+cpImportFile.addEventListener("change", async () => {
+  const file = cpImportFile.files?.[0];
+  if (!file) return;
+  setStatus(cpGlobalStatus, `Importing ${file.name}…`);
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    const payload = parsed?.payload ?? parsed;
+    const label = parsed?.checkpoint?.label
+      ? `Imported: ${parsed.checkpoint.label}`
+      : `Imported: ${file.name.replace(/\.json$/i, "")}`;
+    const note = parsed?.checkpoint?.note || `Imported from ${file.name}`;
+    const { checkpoint } = await api("/admin/checkpoints/import", {
+      method: "POST",
+      body: JSON.stringify({ label, note, payload }),
+    });
+    setStatus(cpGlobalStatus, `Imported as checkpoint #${checkpoint.id}.`, "is-ok");
+    await loadCheckpoints();
+  } catch (err) {
+    setStatus(cpGlobalStatus, `Import failed: ${err.message}`, "is-error");
+  } finally {
+    cpImportFile.value = "";
+  }
+});
+
+obsCheckpointsListEl.addEventListener("click", async (e) => {
+  const delBtn = e.target.closest("[data-cp-delete]");
+  if (delBtn) {
+    const id = Number(delBtn.dataset.cpDelete);
+    delBtn.disabled = true;
+    try {
+      await api(`/admin/checkpoints/${id}`, { method: "DELETE" });
+      if (cpConfirmRollbackId === id) cpConfirmRollbackId = null;
+      await loadCheckpoints();
+    } catch (err) {
+      setStatus(cpGlobalStatus, err.message, "is-error");
+    } finally {
+      delBtn.disabled = false;
+    }
+    return;
+  }
+
+  const openBtn = e.target.closest("[data-cp-rollback-open]");
+  if (openBtn) {
+    const id = Number(openBtn.dataset.cpRollbackOpen);
+    cpConfirmRollbackId = cpConfirmRollbackId === id ? null : id;
+    renderCheckpoints(cachedCheckpoints);
+    return;
+  }
+
+  const cancelBtn = e.target.closest("[data-cp-rollback-cancel]");
+  if (cancelBtn) {
+    cpConfirmRollbackId = null;
+    renderCheckpoints(cachedCheckpoints);
+    return;
+  }
+
+  const confirmBtn = e.target.closest("[data-cp-rollback-confirm]");
+  if (confirmBtn) {
+    const id = Number(confirmBtn.dataset.cpRollbackConfirm);
+    const cfgCb = obsCheckpointsListEl.querySelector(
+      `[data-cp-restore-config="${id}"]`,
+    );
+    const restoreConfig = Boolean(cfgCb?.checked);
+    confirmBtn.disabled = true;
+    setStatus(cpGlobalStatus, `Rolling back to checkpoint #${id}…`);
+    try {
+      const res = await api(`/admin/checkpoints/${id}/rollback`, {
+        method: "POST",
+        body: JSON.stringify({ restoreConfig }),
+      });
+      cpConfirmRollbackId = null;
+      setStatus(
+        cpGlobalStatus,
+        `Rolled back to #${res.restored.id} (${res.restoreConfig ? "config restored" : "config preserved"}). Safety backup saved as #${res.safetyCheckpoint.id}. All agents are paused.`,
+        "is-ok",
+      );
+      await loadCheckpoints();
+      loadObservatoryStatus().catch(() => {});
+    } catch (err) {
+      setStatus(cpGlobalStatus, `Rollback failed: ${err.message}`, "is-error");
+      confirmBtn.disabled = false;
     }
   }
 });
