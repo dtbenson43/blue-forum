@@ -72,6 +72,23 @@ export type CsvReadMetadata = {
   rows: CsvRowEntry[];
 };
 
+export type DiscoverResolvedSource =
+  | "wikipedia"
+  | "on_this_day"
+  | "arxiv"
+  | "hackernews";
+
+export type DiscoverSource = "any" | DiscoverResolvedSource;
+
+export type DiscoverRandomOutput = {
+  source: DiscoverResolvedSource;
+  title: string;
+  url: string;
+  summary: string;
+  meta?: Record<string, string | number>;
+  untrustedBlock: string;
+};
+
 export type WebReadOptions = {
   pages?: string;
   query?: string;
@@ -1811,4 +1828,373 @@ export async function searchWeb(params: {
   throw new Error(
     "No search API key configured (set OPENROUTER_API_KEY, BRAVE_SEARCH_API_KEY, or TAVILY_API_KEY).",
   );
+}
+
+// ——— Serendipity / External Discovery (no API keys required) ———
+
+const DISCOVERY_USER_AGENT = "BlueSignalForum/1.0 (autonomous-research-reader)";
+
+function formatUntrustedDiscoveryBlock(item: {
+  source: DiscoverResolvedSource;
+  title: string;
+  url: string;
+  summary: string;
+  meta?: Record<string, string | number>;
+}): string {
+  const safeUrl = item.url.replaceAll('"', "&quot;");
+  const safeTitle = item.title.replaceAll('"', "&quot;");
+  const lines = [
+    `<untrusted_discovery source="${item.source}" title="${safeTitle}" url="${safeUrl}">`,
+    item.title,
+    `URL: ${item.url}`,
+  ];
+  if (item.meta) {
+    const metaParts = Object.entries(item.meta)
+      .filter(([, v]) => v !== "" && v !== undefined)
+      .map(([k, v]) => `${k}: ${v}`);
+    if (metaParts.length > 0) {
+      lines.push(metaParts.join(" · "));
+    }
+  }
+  lines.push("", item.summary.slice(0, 1200), "</untrusted_discovery>");
+  return lines.join("\n");
+}
+
+async function fetchRandomWikipedia(): Promise<DiscoverRandomOutput> {
+  let lastCandidate: DiscoverRandomOutput | null = null;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(
+      "https://en.wikipedia.org/api/rest_v1/page/random/summary",
+      {
+        headers: {
+          "User-Agent": DISCOVERY_USER_AGENT,
+          Accept: "application/json",
+        },
+        signal: AbortSignal.timeout(10_000),
+      },
+    );
+    if (!res.ok) {
+      throw new Error(`Wikipedia random summary HTTP ${res.status}`);
+    }
+    const data = (await res.json()) as {
+      type?: string;
+      title?: string;
+      description?: string;
+      extract?: string;
+      content_urls?: { desktop?: { page?: string } };
+    };
+
+    const title = (data.title || "").trim().slice(0, 180);
+    const url = (data.content_urls?.desktop?.page || "").trim();
+    const extract = (data.extract || "").trim().slice(0, 1000);
+    if (!title || !url) continue;
+
+    const meta: Record<string, string | number> = {};
+    if (data.description) meta.description = data.description.trim().slice(0, 180);
+
+    const out: DiscoverRandomOutput = {
+      source: "wikipedia",
+      title,
+      url,
+      summary: extract || "(no summary extract available)",
+      ...(Object.keys(meta).length > 0 ? { meta } : {}),
+      untrustedBlock: formatUntrustedDiscoveryBlock({
+        source: "wikipedia",
+        title,
+        url,
+        summary: extract || "(no summary extract available)",
+        meta,
+      }),
+    };
+    lastCandidate = out;
+    if (data.type !== "disambiguation" && extract.length >= 60) {
+      return out;
+    }
+  }
+
+  if (lastCandidate) return lastCandidate;
+  throw new Error("Wikipedia returned no usable random summary.");
+}
+
+async function fetchRandomOnThisDay(): Promise<DiscoverRandomOutput> {
+  const now = new Date();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(now.getUTCDate()).padStart(2, "0");
+  const res = await fetch(
+    `https://en.wikipedia.org/api/rest_v1/feed/onthisday/selected/${mm}/${dd}`,
+    {
+      headers: {
+        "User-Agent": DISCOVERY_USER_AGENT,
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(10_000),
+    },
+  );
+  if (!res.ok) {
+    throw new Error(`Wikipedia On This Day HTTP ${res.status}`);
+  }
+  const data = (await res.json()) as {
+    selected?: Array<{
+      year?: number;
+      text?: string;
+      pages?: Array<{
+        title?: string;
+        normalizedtitle?: string;
+        extract?: string;
+        content_urls?: { desktop?: { page?: string } };
+      }>;
+    }>;
+  };
+
+  const events = (data.selected || []).filter((e) => Boolean(e.text));
+  if (events.length === 0) {
+    throw new Error("No On This Day events returned.");
+  }
+
+  const chosen = events[Math.floor(Math.random() * events.length)]!;
+  const primaryPage = chosen.pages?.find((p) => p.content_urls?.desktop?.page);
+  const year = typeof chosen.year === "number" ? chosen.year : undefined;
+  const pageTitle = primaryPage?.normalizedtitle || primaryPage?.title || "";
+  const title = year !== undefined
+    ? `${mm}-${dd} (${year}): ${pageTitle || chosen.text!.slice(0, 90)}`
+    : pageTitle || chosen.text!.slice(0, 90);
+  const url =
+    primaryPage?.content_urls?.desktop?.page ||
+    `https://en.wikipedia.org/wiki/${mm}_${dd}`;
+  const summaryParts = [chosen.text!.trim()];
+  if (primaryPage?.extract) {
+    summaryParts.push(primaryPage.extract.trim().slice(0, 600));
+  }
+  const summary = summaryParts.join("\n\n").slice(0, 1000);
+  const meta: Record<string, string | number> = {
+    date: `${mm}-${dd}`,
+    ...(year !== undefined ? { year } : {}),
+  };
+
+  return {
+    source: "on_this_day",
+    title: title.slice(0, 180),
+    url,
+    summary,
+    meta,
+    untrustedBlock: formatUntrustedDiscoveryBlock({
+      source: "on_this_day",
+      title: title.slice(0, 180),
+      url,
+      summary,
+      meta,
+    }),
+  };
+}
+
+const ARXIV_CATEGORIES = [
+  "cs.AI",
+  "cs.CY",
+  "cs.SI",
+  "cs.CL",
+  "q-bio.NC",
+  "q-bio.PE",
+  "physics.soc-ph",
+  "econ.TH",
+  "math.HO",
+  "astro-ph.EP",
+  "nlin.AO",
+  "stat.AP",
+];
+
+async function fetchRandomArxiv(): Promise<DiscoverRandomOutput> {
+  const category =
+    ARXIV_CATEGORIES[Math.floor(Math.random() * ARXIV_CATEGORIES.length)]!;
+  const start = Math.floor(Math.random() * 50);
+  const queryUrl = `https://export.arxiv.org/api/query?search_query=cat:${encodeURIComponent(category)}&start=${start}&max_results=1&sortBy=submittedDate&sortOrder=descending`;
+
+  const res = await fetch(queryUrl, {
+    headers: {
+      "User-Agent": DISCOVERY_USER_AGENT,
+      Accept: "application/atom+xml,application/xml;q=0.9,*/*;q=0.1",
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) {
+    throw new Error(`arXiv API HTTP ${res.status}`);
+  }
+  const xml = await res.text();
+  const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/i);
+  if (!entryMatch) {
+    throw new Error(`arXiv returned no entry for ${category}.`);
+  }
+  const entry = entryMatch[1]!;
+
+  const extractTag = (tag: string): string => {
+    const m = entry.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
+    return m ? decodeHtmlEntities(m[1]!.replace(/\s+/g, " ").trim()) : "";
+  };
+
+  const title = extractTag("title").slice(0, 180);
+  const summary = extractTag("summary").slice(0, 1000);
+  const rawId = extractTag("id");
+  const published = extractTag("published").slice(0, 10);
+  const authors = Array.from(
+    entry.matchAll(/<author>\s*<name>([\s\S]*?)<\/name>/gi),
+  )
+    .map((m) => decodeHtmlEntities(m[1]!.replace(/\s+/g, " ").trim()))
+    .slice(0, 4);
+
+  if (!title || !rawId) {
+    throw new Error("Could not parse arXiv entry.");
+  }
+
+  const absUrl = rawId.replace(/^http:\/\//i, "https://");
+  const pdfUrl = absUrl.includes("/abs/")
+    ? `${absUrl.replace("/abs/", "/pdf/")}.pdf`
+    : "";
+
+  const meta: Record<string, string | number> = {
+    category,
+    ...(published ? { published } : {}),
+    ...(authors.length > 0 ? { authors: authors.join(", ") } : {}),
+    ...(pdfUrl ? { pdfUrl } : {}),
+  };
+
+  return {
+    source: "arxiv",
+    title,
+    url: absUrl,
+    summary: summary || "(no abstract)",
+    meta,
+    untrustedBlock: formatUntrustedDiscoveryBlock({
+      source: "arxiv",
+      title,
+      url: absUrl,
+      summary: summary || "(no abstract)",
+      meta,
+    }),
+  };
+}
+
+async function fetchRandomHackerNews(): Promise<DiscoverRandomOutput> {
+  const listRes = await fetch(
+    "https://hacker-news.firebaseio.com/v0/topstories.json",
+    {
+      headers: { "User-Agent": DISCOVERY_USER_AGENT },
+      signal: AbortSignal.timeout(10_000),
+    },
+  );
+  if (!listRes.ok) {
+    throw new Error(`Hacker News topstories HTTP ${listRes.status}`);
+  }
+  const ids = (await listRes.json()) as number[];
+  const pool = ids.slice(0, 60);
+  if (pool.length === 0) {
+    throw new Error("Hacker News returned empty topstories list.");
+  }
+
+  // Try up to 4 random stories from the top 60 to find one with a title + URL/text
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const pick = pool[Math.floor(Math.random() * pool.length)]!;
+    const itemRes = await fetch(
+      `https://hacker-news.firebaseio.com/v0/item/${pick}.json`,
+      {
+        headers: { "User-Agent": DISCOVERY_USER_AGENT },
+        signal: AbortSignal.timeout(8_000),
+      },
+    );
+    if (!itemRes.ok) continue;
+    const item = (await itemRes.json()) as {
+      id?: number;
+      title?: string;
+      url?: string;
+      text?: string;
+      score?: number;
+      descendants?: number;
+      by?: string;
+      type?: string;
+    } | null;
+    if (!item?.title) continue;
+
+    const commentsUrl = `https://news.ycombinator.com/item?id=${item.id ?? pick}`;
+    const url = item.url?.startsWith("https://")
+      ? item.url
+      : commentsUrl;
+    const cleanText = item.text
+      ? decodeHtmlEntities(item.text.replace(/<[^>]+>/g, " "))
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 900)
+      : "";
+    const summary =
+      cleanText ||
+      `Trending Hacker News story (${item.score ?? 0} points, ${item.descendants ?? 0} comments). Pass the URL to web_read if you want to read the article.`;
+    const meta: Record<string, string | number> = {
+      score: item.score ?? 0,
+      comments: item.descendants ?? 0,
+      discussionUrl: commentsUrl,
+    };
+
+    return {
+      source: "hackernews",
+      title: item.title.trim().slice(0, 180),
+      url,
+      summary,
+      meta,
+      untrustedBlock: formatUntrustedDiscoveryBlock({
+        source: "hackernews",
+        title: item.title.trim().slice(0, 180),
+        url,
+        summary,
+        meta,
+      }),
+    };
+  }
+
+  throw new Error("Could not fetch a Hacker News story.");
+}
+
+/**
+ * Fetch a random public external artifact (Wikipedia summary, On This Day history,
+ * recent arXiv abstract, or Hacker News story) with automatic source fallback.
+ */
+export async function discoverRandom(
+  requested: DiscoverSource = "any",
+): Promise<DiscoverRandomOutput> {
+  const allSources: DiscoverResolvedSource[] = [
+    "wikipedia",
+    "on_this_day",
+    "arxiv",
+    "hackernews",
+  ];
+
+  let order: DiscoverResolvedSource[];
+  if (requested !== "any" && allSources.includes(requested)) {
+    order = [requested, ...allSources.filter((s) => s !== requested)];
+  } else {
+    // Fisher-Yates shuffle
+    order = allSources.slice();
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j]!, order[i]!];
+    }
+  }
+
+  const fetchers: Record<
+    DiscoverResolvedSource,
+    () => Promise<DiscoverRandomOutput>
+  > = {
+    wikipedia: fetchRandomWikipedia,
+    on_this_day: fetchRandomOnThisDay,
+    arxiv: fetchRandomArxiv,
+    hackernews: fetchRandomHackerNews,
+  };
+
+  let lastErr: Error | null = null;
+  for (const src of order) {
+    try {
+      return await fetchers[src]();
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  throw lastErr ?? new Error("External discovery sources are temporarily unavailable.");
 }
