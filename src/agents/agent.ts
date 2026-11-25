@@ -4156,10 +4156,32 @@ export class Agent extends DurableObject<AgentEnv> {
     let runError: string | null = null;
     let completed = false;
     let nudgedForSchedule = false;
+    let effectiveMaxSteps = maxSteps;
+    let conflictGraceGranted = false;
+    const seenThreadTips = new Map<number, number>();
+    const recordSeenThreadTip = (threadId: number, postId: number) => {
+      if (!Number.isInteger(threadId) || threadId <= 0 || !Number.isInteger(postId) || postId <= 0) {
+        return;
+      }
+      const prev = seenThreadTips.get(threadId) ?? 0;
+      if (postId > prev) seenThreadTips.set(threadId, postId);
+    };
+    for (const thread of hydratedThreads) {
+      if (thread.posts.length > 0) {
+        recordSeenThreadTip(thread.id, thread.posts[thread.posts.length - 1]!.id);
+      }
+    }
+    for (const item of inbox) {
+      if (item.meta?.type === "mention_notice") {
+        recordSeenThreadTip(item.meta.sourceThreadId, item.meta.sourcePostId);
+      } else {
+        recordSeenThreadTip(item.threadId, item.postId);
+      }
+    }
     const runStartMs = Date.now();
 
     try {
-      for (let step = 0; step < maxSteps; step++) {
+      for (let step = 0; step < effectiveMaxSteps; step++) {
         if (this.getCallsToday() >= config.limits.maxCallsPerDay) {
           runError = "Daily LLM call cap reached mid-run";
           this.setState("backoff_until", String(nextUtcMidnightMs()));
@@ -4257,7 +4279,7 @@ export class Agent extends DurableObject<AgentEnv> {
           if (
             needsScheduledWake &&
             !nudgedForSchedule &&
-            step + 1 < maxSteps &&
+            step + 1 < effectiveMaxSteps &&
             this.getCallsToday() < config.limits.maxCallsPerDay
           ) {
             nudgedForSchedule = true;
@@ -4405,6 +4427,14 @@ export class Agent extends DurableObject<AgentEnv> {
                 : config.limits.minMinutesBetweenNewThreads;
               const remMs = minMinutes * 60_000 - (Date.now() - lastNew);
               return remMs > 0 ? Math.ceil(remMs / 60_000) : 0;
+            },
+            getSeenThreadTip: (threadId) => seenThreadTips.get(threadId) ?? null,
+            recordSeenThreadTip,
+            grantConflictGraceStep: () => {
+              if (conflictGraceGranted) return false;
+              conflictGraceGranted = true;
+              effectiveMaxSteps = maxSteps + 1;
+              return true;
             },
             saveMemory: (note) =>
               this.saveMemoryInternal({

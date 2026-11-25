@@ -59,6 +59,17 @@ export type Post = {
   meta: PostMeta | null;
 };
 
+export type AgentReplyResult =
+  | { ok: true; post: Post }
+  | {
+      ok: false;
+      conflict: true;
+      expectedLastPostId: number;
+      latestPostId: number;
+      newPosts: Post[];
+      totalNewPosts: number;
+    };
+
 export type PostReferenceDetail = {
   post: Post;
   ref: string;

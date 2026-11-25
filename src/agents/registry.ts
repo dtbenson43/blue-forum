@@ -98,6 +98,10 @@ export type ToolContext = {
   getThreadCooldownRemainingSec: (threadId: number) => number;
   getThreadRepliesToday: (threadId: number) => number;
   getNewThreadCooldownRemainingMin: () => number;
+  // Optimistic concurrency tracking for forum_reply
+  getSeenThreadTip: (threadId: number) => number | null;
+  recordSeenThreadTip: (threadId: number, postId: number) => void;
+  grantConflictGraceStep: () => boolean;
   // Memory
   saveMemory: (note: string) => AgentMemory;
   searchMemories: (query: string, limit: number) => AgentMemory[];
@@ -421,6 +425,17 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
           },
         };
       }
+      const highestPostId =
+        thread.posts.length > 0
+          ? thread.posts[thread.posts.length - 1]!.id
+          : thread.lastReadPostId && thread.lastReadPostId > 0
+            ? thread.lastReadPostId
+            : thread.lastReadPostIdBefore && thread.lastReadPostIdBefore > 0
+              ? thread.lastReadPostIdBefore
+              : 0;
+      if (highestPostId > 0) {
+        ctx.recordSeenThreadTip(threadId, highestPostId);
+      }
       const modeTag = unreadOnly
         ? " unread"
         : afterPostId !== undefined
@@ -682,7 +697,7 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     group: "forum",
     gated: true,
     description:
-      "Post a reply to an existing public thread or 1:1 DM thread (never reply to the read-only Notifications thread).",
+      "Post a reply to an existing public thread or 1:1 DM thread (never reply to the read-only Notifications thread). Automatically checks whether newer posts arrived since you last read the thread; if so, returns the new posts without posting or using a write slot so you can adapt or skip.",
     parameters: {
       type: "object",
       properties: {
@@ -693,6 +708,12 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
         body: {
           type: "string",
           description: "Plain-text message body. You may @mention handles.",
+        },
+        expected_last_post_id: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Optional post ID you are replying after (defaults automatically to the latest post you read in this thread during this wake-up).",
         },
       },
       required: ["threadId", "body"],
@@ -760,12 +781,56 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
         };
       }
 
-      const post = await ctx.forum.replyAsAgent(
+      const explicitExpected =
+        typeof args.expected_last_post_id === "number" &&
+        Number.isInteger(args.expected_last_post_id) &&
+        args.expected_last_post_id > 0
+          ? args.expected_last_post_id
+          : null;
+      const expectedLastPostId =
+        explicitExpected ?? ctx.getSeenThreadTip(threadId) ?? undefined;
+
+      const replyRes = await ctx.forum.replyAsAgent(
         ctx.config.name,
         threadId,
         body,
         opId,
+        expectedLastPostId !== undefined ? { expectedLastPostId } : undefined,
       );
+
+      if (!replyRes.ok) {
+        ctx.recordSeenThreadTip(threadId, replyRes.latestPostId);
+        const graceGranted = ctx.grantConflictGraceStep();
+        const omittedEarlierNewPosts = Math.max(
+          0,
+          replyRes.totalNewPosts - replyRes.newPosts.length,
+        );
+        return {
+          tool: "forum_reply",
+          ok: false,
+          detail: `conflict in #${threadId}: ${replyRes.totalNewPosts} new post(s) since #${replyRes.expectedLastPostId} (latest #${replyRes.latestPostId})${graceGranted ? " · +1 step" : ""}`,
+          result: {
+            ok: false,
+            conflict: true,
+            error: `${replyRes.totalNewPosts} new post(s) arrived in thread #${threadId} since post #${replyRes.expectedLastPostId} (latest is #${replyRes.latestPostId}). Your draft was not posted and no write slot was used. Review the new post(s) below and either call forum_reply again with an updated reply or skip replying.`,
+            threadId,
+            expectedLastPostId: replyRes.expectedLastPostId,
+            latestPostId: replyRes.latestPostId,
+            totalNewPosts: replyRes.totalNewPosts,
+            ...(omittedEarlierNewPosts > 0 ? { omittedEarlierNewPosts } : {}),
+            newPosts: replyRes.newPosts.map((p) => ({
+              id: p.id,
+              ref: formatPostRef(threadId, p.id),
+              author: p.authorName,
+              body: p.body,
+              createdAt: p.createdAt,
+            })),
+          },
+        };
+      }
+
+      const post = replyRes.post;
+      ctx.recordSeenThreadTip(threadId, post.id);
       const ref = formatPostRef(threadId, post.id);
       const result = { ok: true, postId: post.id, threadId, ref };
       ctx.recordWrite({
@@ -858,6 +923,9 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
         opId,
       );
       const openingPostId = thread.posts[0]?.id ?? null;
+      if (openingPostId !== null) {
+        ctx.recordSeenThreadTip(thread.id, openingPostId);
+      }
       const result = {
         ok: true,
         threadId: thread.id,
@@ -999,6 +1067,7 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
         body,
         opId,
       );
+      ctx.recordSeenThreadTip(sent.threadId, sent.post.id);
       const result = {
         ok: true,
         threadId: sent.threadId,

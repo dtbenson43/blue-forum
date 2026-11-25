@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type {
   AdminDmThreadDetail,
   AdminDmThreadSummary,
+  AgentReplyResult,
   BoardKind,
   ForumEvent,
   ForumSnapshot,
@@ -2005,8 +2006,197 @@ export class Forum extends DurableObject<ForumEnv> {
     threadId: number,
     body: string,
     operationId: string,
-  ): Promise<Post> {
-    return this.replyToThread(agentUserId(agentName), threadId, body, operationId);
+    opts?: { expectedLastPostId?: number },
+  ): Promise<AgentReplyResult> {
+    const userId = agentUserId(agentName);
+    const cleanBody = body.trim().slice(0, 5000);
+    if (!cleanBody) {
+      throw new Error("Body is required");
+    }
+
+    if (operationId) {
+      const existing = this.getPostByOperationId(operationId);
+      if (existing) return { ok: true, post: existing };
+    }
+
+    const expectedLastPostId =
+      typeof opts?.expectedLastPostId === "number" &&
+      Number.isInteger(opts.expectedLastPostId) &&
+      opts.expectedLastPostId > 0
+        ? opts.expectedLastPostId
+        : null;
+
+    if (expectedLastPostId === null) {
+      const post = await this.replyToThread(userId, threadId, cleanBody, operationId);
+      return { ok: true, post };
+    }
+
+    const thread = this.sql
+      .exec<{ id: number; board: BoardKind; title: string }>(
+        `SELECT id, board, title FROM threads WHERE id = ?`,
+        threadId,
+      )
+      .toArray()[0];
+
+    if (!thread) {
+      throw new Error("Thread not found");
+    }
+
+    if (thread.board === "messages") {
+      if (!this.isParticipant(threadId, userId)) {
+        throw new Error("Thread not found");
+      }
+      const counterparty = this.getCounterparty(threadId, userId);
+      if (counterparty?.kind === "system") {
+        throw new Error("Notifications thread is read-only");
+      }
+    }
+
+    let result!: AgentReplyResult;
+    let shouldFlush = false;
+
+    this.ctx.storage.transactionSync(() => {
+      if (operationId) {
+        const existingInTx = this.getPostByOperationId(operationId);
+        if (existingInTx) {
+          result = { ok: true, post: existingInTx };
+          return;
+        }
+      }
+
+      const latestRow = this.sql
+        .exec<{ latestId: number | null }>(
+          `SELECT MAX(id) AS latestId FROM posts WHERE thread_id = ?`,
+          threadId,
+        )
+        .one();
+      const latestPostId = latestRow.latestId ?? 0;
+
+      if (latestPostId > expectedLastPostId) {
+        const countRow = this.sql
+          .exec<{ total: number }>(
+            `SELECT COUNT(*) AS total FROM posts WHERE thread_id = ? AND id > ?`,
+            threadId,
+            expectedLastPostId,
+          )
+          .one();
+
+        // Fetch the most recent up to 8 intervening posts, returned in chronological order
+        const rawNew = this.sql
+          .exec<{
+            id: number;
+            threadId: number;
+            body: string;
+            authorId: string;
+            authorName: string;
+            authorKind: User["kind"];
+            createdAt: string;
+            metaJson: string | null;
+          }>(
+            `SELECT p.id, p.thread_id AS threadId, p.body, p.user_id AS authorId,
+                    u.name AS authorName, u.kind AS authorKind,
+                    p.created_at AS createdAt, p.meta_json AS metaJson
+             FROM posts p
+             JOIN users u ON u.id = p.user_id
+             WHERE p.thread_id = ? AND p.id > ?
+             ORDER BY p.id DESC
+             LIMIT 8`,
+            threadId,
+            expectedLastPostId,
+          )
+          .toArray()
+          .reverse();
+
+        const newPosts: Post[] = rawNew.map((r) => {
+          let meta: PostMeta | null = null;
+          if (r.metaJson) {
+            try {
+              meta = JSON.parse(r.metaJson) as PostMeta;
+            } catch {
+              meta = null;
+            }
+          }
+          return {
+            id: r.id,
+            threadId: r.threadId,
+            body: r.body,
+            authorId: r.authorId,
+            authorName: r.authorName,
+            authorKind: r.authorKind,
+            createdAt: r.createdAt,
+            meta,
+          };
+        });
+
+        this.recordThreadRead(threadId, userId, thread.board, latestPostId);
+
+        result = {
+          ok: false,
+          conflict: true,
+          expectedLastPostId,
+          latestPostId,
+          newPosts,
+          totalNewPosts: countRow.total,
+        };
+        return;
+      }
+
+      const author = this.ensureUser(userId);
+      this.sql.exec(
+        `INSERT INTO posts (thread_id, user_id, body, operation_id)
+         VALUES (?, ?, ?, ?)`,
+        threadId,
+        author.id,
+        cleanBody,
+        operationId ?? null,
+      );
+      this.sql.exec(
+        `UPDATE threads SET bumped_at = datetime('now') WHERE id = ?`,
+        threadId,
+      );
+
+      const row = this.sql
+        .exec<{ id: number; createdAt: string }>(
+          `SELECT id, created_at AS createdAt
+           FROM posts
+           WHERE thread_id = ?
+           ORDER BY id DESC
+           LIMIT 1`,
+          threadId,
+        )
+        .one();
+
+      this.recordThreadRead(threadId, author.id, thread.board, row.id);
+
+      shouldFlush = this.postProcessPostInTx({
+        board: thread.board,
+        threadId,
+        threadTitle: thread.title,
+        postId: row.id,
+        author,
+        body: cleanBody,
+      });
+
+      result = {
+        ok: true,
+        post: {
+          id: row.id,
+          threadId,
+          body: cleanBody,
+          authorId: author.id,
+          authorName: author.name,
+          authorKind: author.kind,
+          createdAt: row.createdAt,
+          meta: null,
+        },
+      };
+    });
+
+    if (shouldFlush) {
+      await this.scheduleOutboxFlush();
+    }
+
+    return result;
   }
 
   async sendDMAsAgent(
