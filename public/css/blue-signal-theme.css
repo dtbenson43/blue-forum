@@ -1312,6 +1312,12 @@
     color: var(--ice);
   }
 
+  .script-code-view {
+    max-height: 22lh;
+    white-space: pre;
+    overflow-x: auto;
+  }
+
   /* —— Checkpoints & Rollback —— */
   .req-pill.is-cp-manual {
     border-color: var(--crystal);

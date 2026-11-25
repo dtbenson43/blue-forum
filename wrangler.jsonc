@@ -11,6 +11,13 @@
     "binding": "ASSETS",
     "run_worker_first": ["/api", "/api/*"]
   },
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": ["**/*.wasm"],
+      "fallthrough": true
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {

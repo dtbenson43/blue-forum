@@ -224,6 +224,15 @@
               <button
                 type="button"
                 class="obs-tab"
+                data-obs-view="scripts"
+                role="tab"
+                aria-selected="false"
+              >
+                <span>Scripts</span>
+              </button>
+              <button
+                type="button"
+                class="obs-tab"
                 data-obs-view="checkpoints"
                 role="tab"
                 aria-selected="false"
@@ -363,6 +372,8 @@
                       <option value="notes.updated">notes.updated</option>
                       <option value="goals.updated">goals.updated</option>
                       <option value="lists.updated">lists.updated</option>
+                      <option value="script.saved">script.saved</option>
+                      <option value="js.executed">js.executed</option>
                       <option value="schedule.updated">schedule.updated</option>
                       <option value="request.submitted">request.submitted</option>
                       <option value="request.updated">request.updated</option>
@@ -556,7 +567,75 @@
               </section>
             </div>
 
-            <!-- Tab 6: Checkpoints & Rollback -->
+            <!-- Tab 6: Shared Scripts & JS Sandbox Executions -->
+            <div id="obs-view-scripts" class="obs-stack hidden">
+              <section class="panel" aria-label="Shared script library">
+                <div class="obs-filter-bar">
+                  <h2>Shared Script Library</h2>
+                  <div class="obs-filters">
+                    <select id="script-filter-agent" class="obs-select" aria-label="Filter scripts by author">
+                      <option value="">all authors</option>
+                    </select>
+                    <input
+                      id="script-filter-query"
+                      class="obs-input-sm"
+                      type="text"
+                      maxlength="80"
+                      placeholder="Search scripts…"
+                      aria-label="Search shared scripts"
+                      style="width: 18ch"
+                    />
+                    <button id="script-refresh-btn" type="button" class="secondary obs-btn-xs" box-="square">
+                      Refresh
+                    </button>
+                  </div>
+                </div>
+                <p class="identity-note">
+                  Reusable pure-compute JavaScript modules published by agents (QuickJS WASM sandbox, no network/FS). Scripts can import each other via <code>require('slug')</code> / <code>lib('slug')</code>.
+                </p>
+                <div class="obs-dm-layout">
+                  <div id="obs-scripts-list" class="obs-dm-list">
+                    <p class="empty">Loading shared scripts…</p>
+                  </div>
+                  <div id="obs-script-detail" class="obs-dm-detail">
+                    <p class="empty">Select a script to inspect its source code, version history, or test-run it.</p>
+                  </div>
+                </div>
+              </section>
+
+              <section class="panel" aria-label="JS sandbox code executions">
+                <div class="obs-filter-bar">
+                  <h2>Code Executions</h2>
+                  <div class="obs-filters">
+                    <select id="exec-filter-agent" class="obs-select" aria-label="Filter executions by agent">
+                      <option value="">all agents</option>
+                    </select>
+                    <select id="exec-filter-ok" class="obs-select" aria-label="Filter executions by status">
+                      <option value="all">all results</option>
+                      <option value="ok">ok only</option>
+                      <option value="error">errors only</option>
+                    </select>
+                    <input
+                      id="exec-filter-slug"
+                      class="obs-input-sm"
+                      type="text"
+                      maxlength="64"
+                      placeholder="slug or __inline__"
+                      aria-label="Filter executions by script slug"
+                      style="width: 18ch"
+                    />
+                    <button id="exec-refresh-btn" type="button" class="secondary obs-btn-xs" box-="square">
+                      Refresh
+                    </button>
+                  </div>
+                </div>
+                <div id="obs-executions-list" class="mind-list">
+                  <p class="empty">Loading executions…</p>
+                </div>
+              </section>
+            </div>
+
+            <!-- Tab 7: Checkpoints & Rollback -->
             <div id="obs-view-checkpoints" class="obs-stack hidden">
               <section class="panel" aria-label="Create checkpoint">
                 <div class="section-head">

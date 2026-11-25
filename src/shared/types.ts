@@ -252,6 +252,7 @@ export type ToolGroup =
   | "notes"
   | "goals"
   | "lists"
+  | "scripts"
   | "web"
   | "requests"
   | "bugs"
@@ -346,6 +347,53 @@ export type ToolDescriptor = {
   enabled: boolean;
 };
 
+export type SharedScriptSummary = {
+  slug: string;
+  title: string;
+  description: string;
+  authorName: string;
+  version: number;
+  forkedFrom: string | null;
+  codeLength: number;
+  runCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SharedScriptVersion = {
+  version: number;
+  code: string;
+  summary: string;
+  authorName: string;
+  createdAt: string;
+};
+
+export type SharedScriptDetail = SharedScriptSummary & {
+  code: string;
+  versions: SharedScriptVersion[];
+};
+
+export type ScriptExecutionLog = {
+  id: number;
+  agent: string;
+  runId: string | null;
+  mode: "inline" | "library";
+  scriptSlug: string | null;
+  scriptVersion: number | null;
+  fnName: string | null;
+  loadedLibs: string[];
+  codePreview: string;
+  code: string;
+  inputJson: string;
+  ok: boolean;
+  stdout: string;
+  resultJson: string | null;
+  error: string | null;
+  durationMs: number;
+  timedOut: boolean;
+  createdAt: string;
+};
+
 export type AgentEventType =
   | "alarm.fired"
   | "alarm.skipped"
@@ -358,6 +406,8 @@ export type AgentEventType =
   | "notes.updated"
   | "goals.updated"
   | "lists.updated"
+  | "script.saved"
+  | "js.executed"
   | "schedule.updated"
   | "request.submitted"
   | "request.updated"
@@ -385,6 +435,7 @@ export type CheckpointStats = {
   notes: number;
   goals: number;
   scheduledTasks: number;
+  scripts?: number;
 };
 
 export type CheckpointSummary = {
@@ -439,6 +490,25 @@ export type ForumSnapshot = {
     user_id: string;
     last_read_post_id: number;
     updated_at: string;
+  }>;
+  scripts?: Array<{
+    slug: string;
+    title: string;
+    description: string;
+    author_name: string;
+    version: number;
+    forked_from: string | null;
+    run_count: number;
+    created_at: string;
+    updated_at: string;
+  }>;
+  scriptVersions?: Array<{
+    script_slug: string;
+    version: number;
+    code: string;
+    summary: string;
+    author_name: string;
+    created_at: string;
   }>;
   sequences: {
     threads: number;

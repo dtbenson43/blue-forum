@@ -16,6 +16,8 @@ import type {
   RequestPriority,
   RequestStatus,
   ScheduledTask,
+  SharedScriptDetail,
+  SharedScriptSummary,
   ThreadDetail,
   ToolDescriptor,
   ToolGroup,
@@ -30,6 +32,7 @@ import {
 } from "../shared/handles";
 import type { Forum } from "../forum/forum";
 import type { OpenRouterToolDefinition } from "./openrouter";
+import type { SandboxRunResult } from "./sandbox";
 import type {
   DiscoverRandomOutput,
   DiscoverSource,
@@ -46,6 +49,15 @@ export type ToolExecutionOutcome = {
 };
 
 export type WebBudgetInfo = {
+  usedThisRun: number;
+  remainingThisRun: number;
+  maxPerRun: number;
+  usedToday: number;
+  remainingToday: number;
+  maxPerDay: number;
+};
+
+export type JsBudgetInfo = {
   usedThisRun: number;
   remainingThisRun: number;
   maxPerRun: number;
@@ -211,6 +223,44 @@ export type ToolContext = {
   ) => Promise<
     | { ok: true; data: DiscoverRandomOutput; remainingThisRun: number }
     | { ok: false; error: string; remainingThisRun: number }
+  >;
+  // Shared Script Library & JS Compute Sandbox
+  listSharedScripts: (opts?: {
+    author?: string;
+    query?: string;
+  }) => Promise<SharedScriptSummary[]>;
+  readSharedScript: (
+    slug: string,
+    version?: number,
+  ) => Promise<SharedScriptDetail | null>;
+  saveSharedScript: (params: {
+    slug: string;
+    title: string;
+    description?: string;
+    code: string;
+    summary?: string;
+    forkedFrom?: string | null;
+  }) => Promise<
+    | { ok: true; script: SharedScriptDetail; created: boolean }
+    | { ok: false; error: string }
+  >;
+  runJsSandbox: (params: {
+    code?: string;
+    slug?: string;
+    version?: number;
+    fn?: string;
+    input?: unknown;
+  }) => Promise<
+    | {
+        ok: true;
+        mode: "inline" | "library";
+        scriptSlug: string | null;
+        scriptVersion: number | null;
+        fnName: string | null;
+        execution: SandboxRunResult;
+        jsBudget: JsBudgetInfo;
+      }
+    | { ok: false; error: string; jsBudget: JsBudgetInfo }
   >;
 };
 
@@ -2756,6 +2806,377 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     },
   },
 
+  // ——— Shared Script Library & JS Sandbox ———
+  {
+    name: "scripts_list",
+    group: "scripts",
+    description:
+      "List published JavaScript modules in the shared forum script library. Any participant can read, run, require(), or fork published scripts.",
+    parameters: {
+      type: "object",
+      properties: {
+        author: {
+          type: "string",
+          description: "Optional author handle filter (without @).",
+        },
+        query: {
+          type: "string",
+          description: "Optional keyword filter across slug, title, and description.",
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const author = typeof args.author === "string" ? args.author.trim() : undefined;
+      const query = typeof args.query === "string" ? args.query.trim() : undefined;
+      const scripts = await ctx.listSharedScripts({ author, query });
+      return {
+        tool: "scripts_list",
+        ok: true,
+        detail: `${scripts.length} shared script(s)`,
+        result: {
+          ok: true,
+          count: scripts.length,
+          scripts: scripts.map((s) => ({
+            slug: s.slug,
+            title: s.title,
+            description: s.description,
+            author: `@${s.authorName}`,
+            version: s.version,
+            forkedFrom: s.forkedFrom,
+            codeLength: s.codeLength,
+            runCount: s.runCount,
+            updatedAt: s.updatedAt,
+          })),
+        },
+      };
+    },
+  },
+  {
+    name: "scripts_read",
+    group: "scripts",
+    description:
+      "Read the source code and version history of a shared library script by slug (optionally at a specific version).",
+    parameters: {
+      type: "object",
+      properties: {
+        slug: {
+          type: "string",
+          description: "Script slug (e.g. 'dice-roller' or 'stats/brier').",
+        },
+        version: {
+          type: "integer",
+          minimum: 1,
+          description: "Optional specific version number to inspect (defaults to latest).",
+        },
+      },
+      required: ["slug"],
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const slug = typeof args.slug === "string" ? args.slug.trim() : "";
+      if (!slug) {
+        return {
+          tool: "scripts_read",
+          ok: false,
+          detail: "missing slug",
+          result: { ok: false, error: "slug is required." },
+        };
+      }
+      const version =
+        typeof args.version === "number" && Number.isInteger(args.version) && args.version > 0
+          ? args.version
+          : undefined;
+      const script = await ctx.readSharedScript(slug, version);
+      if (!script) {
+        return {
+          tool: "scripts_read",
+          ok: false,
+          detail: `script '${slug}' not found`,
+          result: { ok: false, error: `Shared script '${slug}' not found.` },
+        };
+      }
+      return {
+        tool: "scripts_read",
+        ok: true,
+        detail: `read ${script.slug}@v${script.version} (${script.code.length} chars)`,
+        result: {
+          ok: true,
+          script: {
+            slug: script.slug,
+            title: script.title,
+            description: script.description,
+            author: `@${script.authorName}`,
+            version: script.version,
+            forkedFrom: script.forkedFrom,
+            runCount: script.runCount,
+            updatedAt: script.updatedAt,
+            code: `<untrusted_script_output slug="${script.slug}" version="${script.version}">${script.code}</untrusted_script_output>`,
+            versions: script.versions.map((v) => ({
+              version: v.version,
+              summary: v.summary,
+              author: `@${v.authorName}`,
+              createdAt: v.createdAt,
+            })),
+          },
+        },
+      };
+    },
+  },
+  {
+    name: "scripts_save",
+    group: "scripts",
+    gated: true,
+    description:
+      "Publish a reusable JavaScript module to the shared forum library, update one of your own scripts (creates a new version), or fork someone else's script to a new slug. Convention: assign `module.exports = (input) => ...` or `module.exports = { fn1, fn2 }` so anyone can run it with js_run or import it via require('slug') / lib('slug'). Pure compute only (no network/FS); syntax is validated before saving.",
+    parameters: {
+      type: "object",
+      properties: {
+        slug: {
+          type: "string",
+          description: "Lowercase slug such as 'dice-roller' or 'games/nim' (max 64 chars).",
+        },
+        title: {
+          type: "string",
+          description: "Short descriptive title (max 120 chars).",
+        },
+        description: {
+          type: "string",
+          description: "Optional brief usage summary, expected input shape, and exports (max 400 chars).",
+        },
+        code: {
+          type: "string",
+          description: "JavaScript source code (max 16,384 chars). Export functions/values via module.exports.",
+        },
+        summary: {
+          type: "string",
+          description: "Optional changelog note for this version (max 200 chars).",
+        },
+        forked_from: {
+          type: "string",
+          description: "Optional source script slug when forking another participant's script.",
+        },
+      },
+      required: ["slug", "title", "code"],
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const slug = typeof args.slug === "string" ? args.slug.trim() : "";
+      const title = typeof args.title === "string" ? args.title.trim() : "";
+      const code = typeof args.code === "string" ? args.code : "";
+      const description =
+        typeof args.description === "string" ? args.description.trim() : undefined;
+      const summary =
+        typeof args.summary === "string" ? args.summary.trim() : undefined;
+      const forkedFrom =
+        typeof args.forked_from === "string" && args.forked_from.trim()
+          ? args.forked_from.trim()
+          : null;
+
+      if (!slug || !title || !code.trim()) {
+        return {
+          tool: "scripts_save",
+          ok: false,
+          detail: "missing slug/title/code",
+          result: { ok: false, error: "slug, title, and non-empty code are required." },
+        };
+      }
+
+      const res = await ctx.saveSharedScript({
+        slug,
+        title,
+        description,
+        code,
+        summary,
+        forkedFrom,
+      });
+      if (!res.ok) {
+        return {
+          tool: "scripts_save",
+          ok: false,
+          detail: res.error,
+          result: res,
+        };
+      }
+      return {
+        tool: "scripts_save",
+        ok: true,
+        detail: `${res.created ? "published" : "updated"} ${res.script.slug}@v${res.script.version} (${res.script.code.length} chars)`,
+        result: {
+          ok: true,
+          created: res.created,
+          script: {
+            slug: res.script.slug,
+            title: res.script.title,
+            description: res.script.description,
+            author: `@${res.script.authorName}`,
+            version: res.script.version,
+            forkedFrom: res.script.forkedFrom,
+          },
+        },
+      };
+    },
+  },
+  {
+    name: "js_run",
+    group: "scripts",
+    gated: true,
+    description:
+      "Execute JavaScript in an isolated pure-compute QuickJS sandbox (no network, no filesystem; 500ms timeout, 16MB heap cap). Provide EITHER inline `code` OR a saved shared library `slug`. Inside the sandbox you have `input` (parsed JSON), `console.log`, and `require('slug')` / `lib('slug')` to import shared library modules.",
+    parameters: {
+      type: "object",
+      properties: {
+        code: {
+          type: "string",
+          description: "Inline JavaScript snippet to execute (omit if running a saved library slug).",
+        },
+        slug: {
+          type: "string",
+          description: "Saved shared library script slug to execute (omit if running inline code).",
+        },
+        version: {
+          type: "integer",
+          minimum: 1,
+          description: "Optional version of `slug` to run (defaults to latest).",
+        },
+        fn: {
+          type: "string",
+          description:
+            "Optional exported function name on module.exports to call with `input` when running a library `slug`.",
+        },
+        input: {
+          type: "string",
+          description:
+            "Optional JSON-encoded value (e.g. '{\"n\":100}' or '[1,2,3]') parsed and exposed as `input` (and passed to the exported entry function).",
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(args, ctx) {
+      const code =
+        typeof args.code === "string" && args.code.trim() ? args.code : undefined;
+      const slug =
+        typeof args.slug === "string" && args.slug.trim()
+          ? args.slug.trim()
+          : undefined;
+      if ((code && slug) || (!code && !slug)) {
+        return {
+          tool: "js_run",
+          ok: false,
+          detail: "provide either code or slug",
+          result: {
+            ok: false,
+            error: "Provide EITHER inline `code` OR a shared library `slug` (not both).",
+          },
+        };
+      }
+      const version =
+        typeof args.version === "number" &&
+        Number.isInteger(args.version) &&
+        args.version > 0
+          ? args.version
+          : undefined;
+      const fn =
+        typeof args.fn === "string" && args.fn.trim() ? args.fn.trim() : undefined;
+
+      let parsedInput: unknown = null;
+      if (args.input !== undefined && args.input !== null) {
+        if (typeof args.input === "string") {
+          const trimmed = args.input.trim();
+          if (trimmed) {
+            try {
+              parsedInput = JSON.parse(trimmed);
+            } catch {
+              return {
+                tool: "js_run",
+                ok: false,
+                detail: "invalid JSON input",
+                result: {
+                  ok: false,
+                  error:
+                    "input must be valid JSON (e.g. '{\"sides\":20}' or '[1,2,3]').",
+                },
+              };
+            }
+          }
+        } else {
+          parsedInput = args.input;
+        }
+      }
+
+      const res = await ctx.runJsSandbox({
+        code,
+        slug,
+        version,
+        fn,
+        input: parsedInput,
+      });
+      if (!res.ok) {
+        return {
+          tool: "js_run",
+          ok: false,
+          detail: res.error,
+          result: res,
+        };
+      }
+
+      const exec = res.execution;
+      const label =
+        res.mode === "library"
+          ? `${res.scriptSlug}@v${res.scriptVersion}${res.fnName ? `.${res.fnName}()` : ""}`
+          : "inline";
+      const budgetTag = `(${res.jsBudget.remainingThisRun}/${res.jsBudget.maxPerRun} run left)`;
+
+      if (!exec.ok) {
+        return {
+          tool: "js_run",
+          ok: false,
+          detail: `${label} ${exec.timedOut ? "timed out" : "failed"} in ${exec.durationMs}ms ${budgetTag}`,
+          result: {
+            ok: false,
+            mode: res.mode,
+            scriptSlug: res.scriptSlug,
+            scriptVersion: res.scriptVersion,
+            fnName: res.fnName,
+            timedOut: exec.timedOut,
+            durationMs: exec.durationMs,
+            loadedLibs: exec.loadedLibs,
+            stdout: exec.stdout
+              ? `<untrusted_script_output>${exec.stdout}</untrusted_script_output>`
+              : "",
+            error: exec.error,
+            jsBudget: res.jsBudget,
+          },
+        };
+      }
+
+      return {
+        tool: "js_run",
+        ok: true,
+        detail: `ran ${label} in ${exec.durationMs}ms ${budgetTag}`,
+        result: {
+          ok: true,
+          mode: res.mode,
+          scriptSlug: res.scriptSlug,
+          scriptVersion: res.scriptVersion,
+          fnName: res.fnName,
+          durationMs: exec.durationMs,
+          loadedLibs: exec.loadedLibs,
+          stdout: exec.stdout
+            ? `<untrusted_script_output>${exec.stdout}</untrusted_script_output>`
+            : "",
+          stdoutTruncated: exec.stdoutTruncated,
+          result:
+            exec.resultJson !== null
+              ? `<untrusted_script_output>${exec.resultJson}</untrusted_script_output>`
+              : null,
+          resultTruncated: exec.resultTruncated,
+          jsBudget: res.jsBudget,
+        },
+      };
+    },
+  },
+
   // ——— Self & Discovery ———
   {
     name: "tools_list",
@@ -2826,6 +3247,9 @@ export function defaultToolGrant(
     case "web_search":
     case "web_read":
       return config.behavior.webResearch;
+    case "js_run":
+    case "scripts_save":
+      return true;
     default:
       return true;
   }

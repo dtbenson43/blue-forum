@@ -19,6 +19,8 @@ import type {
   RequestKind,
   RequestPriority,
   RequestStatus,
+  ScriptExecutionLog,
+  SharedScriptSummary,
 } from "../shared/types";
 import { AGENT_NAMES } from "../agents/personalities";
 import type { Forum } from "../forum/forum";
@@ -54,6 +56,7 @@ type FastForwardOptions = {
 };
 
 const MAX_LIVE_EVENTS = 2000;
+const MAX_SCRIPT_EXECUTIONS = 500;
 const MAX_OPEN_REQUESTS_PER_AGENT = 8;
 const MAX_OPEN_BUGS_PER_AGENT = 10;
 const CHECKPOINT_CHUNK_BYTES = 512 * 1024;
@@ -123,6 +126,57 @@ type CheckpointRow = {
   created_at: string;
 };
 
+type ScriptExecutionRow = {
+  id: number;
+  agent: string;
+  run_id: string | null;
+  mode: "inline" | "library";
+  script_slug: string | null;
+  script_version: number | null;
+  fn_name: string | null;
+  loaded_libs_json: string;
+  code_preview: string;
+  code: string;
+  input_json: string;
+  ok: number;
+  stdout: string;
+  result_json: string | null;
+  error: string | null;
+  duration_ms: number;
+  timed_out: number;
+  created_at: string;
+};
+
+function mapScriptExecutionRow(row: ScriptExecutionRow): ScriptExecutionLog {
+  let loadedLibs: string[] = [];
+  try {
+    const parsed = JSON.parse(row.loaded_libs_json);
+    if (Array.isArray(parsed)) loadedLibs = parsed.map(String);
+  } catch {
+    loadedLibs = [];
+  }
+  return {
+    id: row.id,
+    agent: row.agent,
+    runId: row.run_id,
+    mode: row.mode,
+    scriptSlug: row.script_slug,
+    scriptVersion: row.script_version,
+    fnName: row.fn_name,
+    loadedLibs,
+    codePreview: row.code_preview,
+    code: row.code,
+    inputJson: row.input_json,
+    ok: row.ok === 1,
+    stdout: row.stdout,
+    resultJson: row.result_json,
+    error: row.error,
+    durationMs: row.duration_ms,
+    timedOut: row.timed_out === 1,
+    createdAt: row.created_at,
+  };
+}
+
 async function gzipJson(
   data: unknown,
 ): Promise<{ rawBytes: number; compressed: Uint8Array; hashHex: string }> {
@@ -173,6 +227,7 @@ function computeCheckpointStats(payload: CheckpointPayload): CheckpointStats {
     notes,
     goals,
     scheduledTasks,
+    scripts: payload.forum.scripts?.length ?? 0,
   };
 }
 
@@ -407,6 +462,29 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS script_executions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        run_id TEXT,
+        mode TEXT NOT NULL CHECK (mode IN ('inline', 'library')),
+        script_slug TEXT,
+        script_version INTEGER,
+        fn_name TEXT,
+        loaded_libs_json TEXT NOT NULL DEFAULT '[]',
+        code_preview TEXT NOT NULL DEFAULT '',
+        code TEXT NOT NULL DEFAULT '',
+        input_json TEXT NOT NULL DEFAULT 'null',
+        ok INTEGER NOT NULL DEFAULT 1,
+        stdout TEXT NOT NULL DEFAULT '',
+        result_json TEXT,
+        error TEXT,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        timed_out INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_script_exec_agent ON script_executions(agent, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_script_exec_slug ON script_executions(script_slug, id DESC);
     `);
   }
 
@@ -1015,6 +1093,134 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     return updated;
   }
 
+  // ——— JS Sandbox Execution Logs & Script Library Broadcasts ———
+
+  async recordScriptExecution(input: {
+    agent: string;
+    runId?: string | null;
+    mode: "inline" | "library";
+    scriptSlug?: string | null;
+    scriptVersion?: number | null;
+    fnName?: string | null;
+    loadedLibs?: string[];
+    code: string;
+    inputJson: string;
+    ok: boolean;
+    stdout: string;
+    resultJson: string | null;
+    error: string | null;
+    durationMs: number;
+    timedOut: boolean;
+  }): Promise<ScriptExecutionLog> {
+    const cleanAgent = input.agent.trim().toLowerCase() || "unknown";
+    const code = input.code.slice(0, 16_384);
+    const codePreview = code.replace(/\s+/g, " ").trim().slice(0, 160);
+    const inputJson = input.inputJson.slice(0, 4_000);
+    const stdout = input.stdout.slice(0, 8_200);
+    const resultJson = input.resultJson ? input.resultJson.slice(0, 8_200) : null;
+    const error = input.error ? input.error.slice(0, 1_000) : null;
+    const loadedLibsJson = JSON.stringify((input.loadedLibs ?? []).slice(0, 20));
+
+    this.sql.exec(
+      `INSERT INTO script_executions (
+         agent, run_id, mode, script_slug, script_version, fn_name,
+         loaded_libs_json, code_preview, code, input_json, ok,
+         stdout, result_json, error, duration_ms, timed_out
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      cleanAgent,
+      input.runId ?? null,
+      input.mode,
+      input.scriptSlug ?? null,
+      input.scriptVersion ?? null,
+      input.fnName ?? null,
+      loadedLibsJson,
+      codePreview,
+      code,
+      inputJson,
+      input.ok ? 1 : 0,
+      stdout,
+      resultJson,
+      error,
+      Math.max(0, Math.round(input.durationMs)),
+      input.timedOut ? 1 : 0,
+    );
+
+    const row = this.sql
+      .exec<ScriptExecutionRow>(
+        `SELECT * FROM script_executions ORDER BY id DESC LIMIT 1`,
+      )
+      .one();
+
+    this.sql.exec(
+      `DELETE FROM script_executions
+       WHERE id NOT IN (
+         SELECT id FROM script_executions ORDER BY id DESC LIMIT ?
+       )`,
+      MAX_SCRIPT_EXECUTIONS,
+    );
+
+    const execution = mapScriptExecutionRow(row);
+    this.broadcast({
+      type: "script_execution",
+      execution,
+    });
+    return execution;
+  }
+
+  async listScriptExecutions(opts?: {
+    agent?: string;
+    slug?: string;
+    ok?: "all" | "ok" | "error";
+    limit?: number;
+  }): Promise<{ executions: ScriptExecutionLog[] }> {
+    const limit = Math.max(1, Math.min(200, Math.round(opts?.limit ?? 80)));
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+
+    if (opts?.agent && opts.agent.trim()) {
+      clauses.push(`agent = ?`);
+      params.push(opts.agent.trim().toLowerCase());
+    }
+    if (opts?.slug && opts.slug.trim()) {
+      const s = opts.slug.trim().toLowerCase();
+      if (s === "__inline__") {
+        clauses.push(`mode = 'inline'`);
+      } else {
+        clauses.push(`script_slug = ?`);
+        params.push(s);
+      }
+    }
+    if (opts?.ok === "ok") {
+      clauses.push(`ok = 1`);
+    } else if (opts?.ok === "error") {
+      clauses.push(`ok = 0`);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.sql
+      .exec<ScriptExecutionRow>(
+        `SELECT * FROM script_executions ${where} ORDER BY id DESC LIMIT ?`,
+        ...params,
+        limit,
+      )
+      .toArray();
+
+    return { executions: rows.map(mapScriptExecutionRow) };
+  }
+
+  async notifyScriptUpdated(info: {
+    action: "created" | "updated" | "deleted";
+    slug: string;
+    script?: SharedScriptSummary | null;
+  }): Promise<void> {
+    this.broadcast({
+      type: "script_updated",
+      action: info.action,
+      slug: info.slug,
+      script: info.script ?? null,
+    });
+  }
+
   async deleteBugReport(id: number): Promise<boolean> {
     const existing = this.sql
       .exec<{ id: number }>(`SELECT id FROM bug_reports WHERE id = ?`, id)
@@ -1554,6 +1760,8 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
       posts: [],
       threadParticipants: [],
       threadReads: [],
+      scripts: [],
+      scriptVersions: [],
       sequences: { threads: 0, posts: 0 },
     });
 
@@ -1574,6 +1782,7 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
         if (clearEvents) {
           this.setSetting("events_cleared_through_seq", String(clearedThroughSeq));
           this.sql.exec(`DELETE FROM live_events`);
+          this.sql.exec(`DELETE FROM script_executions`);
         }
         if (clearRequests) {
           this.sql.exec(`DELETE FROM agent_requests`);

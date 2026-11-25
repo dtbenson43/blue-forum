@@ -14,6 +14,9 @@ import type {
   PostReferenceDetail,
   PostSearchHit,
   PostSearchResult,
+  SharedScriptDetail,
+  SharedScriptSummary,
+  SharedScriptVersion,
   ThreadDetail,
   ThreadSummary,
   User,
@@ -130,7 +133,45 @@ export class Forum extends DurableObject<ForumEnv> {
         this.migrateToThreadReads();
         this.setSchemaVersion(4);
       });
+      version = 4;
     }
+
+    if (version < 5) {
+      this.ctx.storage.transactionSync(() => {
+        this.migrateToSharedScripts();
+        this.setSchemaVersion(5);
+      });
+    }
+  }
+
+  private migrateToSharedScripts() {
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS shared_scripts (
+        slug TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        author_name TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        forked_from TEXT,
+        run_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_shared_scripts_updated
+        ON shared_scripts(updated_at DESC, slug ASC);
+
+      CREATE TABLE IF NOT EXISTS shared_script_versions (
+        script_slug TEXT NOT NULL REFERENCES shared_scripts(slug) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        author_name TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (script_slug, version)
+      );
+      CREATE INDEX IF NOT EXISTS idx_shared_script_versions_slug
+        ON shared_script_versions(script_slug, version DESC);
+    `);
   }
 
   private migrateToThreadReads() {
@@ -897,6 +938,35 @@ export class Forum extends DurableObject<ForumEnv> {
          FROM thread_reads ORDER BY thread_id ASC, user_id ASC`,
       )
       .toArray();
+    const scripts = this.sql
+      .exec<{
+        slug: string;
+        title: string;
+        description: string;
+        author_name: string;
+        version: number;
+        forked_from: string | null;
+        run_count: number;
+        created_at: string;
+        updated_at: string;
+      }>(
+        `SELECT slug, title, description, author_name, version, forked_from, run_count, created_at, updated_at
+         FROM shared_scripts ORDER BY slug ASC`,
+      )
+      .toArray();
+    const scriptVersions = this.sql
+      .exec<{
+        script_slug: string;
+        version: number;
+        code: string;
+        summary: string;
+        author_name: string;
+        created_at: string;
+      }>(
+        `SELECT script_slug, version, code, summary, author_name, created_at
+         FROM shared_script_versions ORDER BY script_slug ASC, version ASC`,
+      )
+      .toArray();
 
     return {
       users,
@@ -904,6 +974,8 @@ export class Forum extends DurableObject<ForumEnv> {
       posts,
       threadParticipants,
       threadReads,
+      scripts,
+      scriptVersions,
       sequences: {
         threads: this.getSqliteSequence("threads"),
         posts: this.getSqliteSequence("posts"),
@@ -918,6 +990,8 @@ export class Forum extends DurableObject<ForumEnv> {
     this.ctx.storage.transactionSync(() => {
       this.outboxGeneration++;
       this.sql.exec(`DELETE FROM event_outbox`);
+      this.sql.exec(`DELETE FROM shared_script_versions`);
+      this.sql.exec(`DELETE FROM shared_scripts`);
       this.sql.exec(`DELETE FROM thread_reads`);
       this.sql.exec(`DELETE FROM thread_participants`);
       this.sql.exec(`DELETE FROM posts`);
@@ -984,6 +1058,35 @@ export class Forum extends DurableObject<ForumEnv> {
           tr.user_id,
           tr.last_read_post_id,
           tr.updated_at,
+        );
+      }
+
+      for (const sc of snapshot.scripts ?? []) {
+        this.sql.exec(
+          `INSERT INTO shared_scripts (slug, title, description, author_name, version, forked_from, run_count, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          sc.slug,
+          sc.title,
+          sc.description,
+          sc.author_name,
+          sc.version,
+          sc.forked_from,
+          sc.run_count,
+          sc.created_at,
+          sc.updated_at,
+        );
+      }
+
+      for (const sv of snapshot.scriptVersions ?? []) {
+        this.sql.exec(
+          `INSERT INTO shared_script_versions (script_slug, version, code, summary, author_name, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          sv.script_slug,
+          sv.version,
+          sv.code,
+          sv.summary,
+          sv.author_name,
+          sv.created_at,
         );
       }
 
@@ -2211,6 +2314,346 @@ export class Forum extends DurableObject<ForumEnv> {
       body,
       operationId,
     );
+  }
+
+  // ——— Shared Script Library ———
+
+  private normalizeScriptSlug(raw: string): string {
+    return raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9/_-]+/g, "-")
+      .replace(/\/{2,}/g, "/")
+      .replace(/-{2,}/g, "-")
+      .replace(/^[^a-z0-9]+/, "")
+      .replace(/[^a-z0-9]+$/, "")
+      .slice(0, 64);
+  }
+
+  async listScripts(opts?: {
+    author?: string;
+    query?: string;
+    limit?: number;
+  }): Promise<SharedScriptSummary[]> {
+    const limit = Math.max(1, Math.min(200, Math.round(opts?.limit ?? 100)));
+    const author = opts?.author?.trim().replace(/^@+/, "").toLowerCase() || "";
+    const query = opts?.query?.trim().toLowerCase() || "";
+
+    const rows = this.sql
+      .exec<{
+        slug: string;
+        title: string;
+        description: string;
+        author_name: string;
+        version: number;
+        forked_from: string | null;
+        run_count: number;
+        created_at: string;
+        updated_at: string;
+        code_len: number;
+      }>(
+        `SELECT s.slug, s.title, s.description, s.author_name, s.version,
+                s.forked_from, s.run_count, s.created_at, s.updated_at,
+                COALESCE(LENGTH(v.code), 0) AS code_len
+         FROM shared_scripts s
+         LEFT JOIN shared_script_versions v
+           ON v.script_slug = s.slug AND v.version = s.version
+         ORDER BY s.updated_at DESC, s.slug ASC
+         LIMIT 250`,
+      )
+      .toArray();
+
+    const filtered = rows.filter((r) => {
+      if (author && r.author_name.toLowerCase() !== author) return false;
+      if (query) {
+        const hay = `${r.slug} ${r.title} ${r.description} ${r.author_name}`.toLowerCase();
+        if (!hay.includes(query)) return false;
+      }
+      return true;
+    });
+
+    return filtered.slice(0, limit).map((r) => ({
+      slug: r.slug,
+      title: r.title,
+      description: r.description,
+      authorName: r.author_name,
+      version: r.version,
+      forkedFrom: r.forked_from,
+      codeLength: r.code_len,
+      runCount: r.run_count,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  async getScript(
+    rawSlug: string,
+    version?: number,
+  ): Promise<SharedScriptDetail | null> {
+    const slug = this.normalizeScriptSlug(rawSlug);
+    if (!slug) return null;
+
+    const meta = this.sql
+      .exec<{
+        slug: string;
+        title: string;
+        description: string;
+        author_name: string;
+        version: number;
+        forked_from: string | null;
+        run_count: number;
+        created_at: string;
+        updated_at: string;
+      }>(
+        `SELECT slug, title, description, author_name, version, forked_from, run_count, created_at, updated_at
+         FROM shared_scripts WHERE slug = ?`,
+        slug,
+      )
+      .toArray()[0];
+
+    if (!meta) return null;
+
+    const versionRows = this.sql
+      .exec<{
+        version: number;
+        code: string;
+        summary: string;
+        author_name: string;
+        created_at: string;
+      }>(
+        `SELECT version, code, summary, author_name, created_at
+         FROM shared_script_versions
+         WHERE script_slug = ?
+         ORDER BY version DESC`,
+        slug,
+      )
+      .toArray();
+
+    const targetVer =
+      typeof version === "number" && Number.isInteger(version) && version > 0
+        ? versionRows.find((v) => v.version === version)
+        : versionRows[0];
+
+    if (!targetVer) return null;
+
+    const versions: SharedScriptVersion[] = versionRows.map((v) => ({
+      version: v.version,
+      code: v.code,
+      summary: v.summary,
+      authorName: v.author_name,
+      createdAt: v.created_at,
+    }));
+
+    return {
+      slug: meta.slug,
+      title: meta.title,
+      description: meta.description,
+      authorName: meta.author_name,
+      version: targetVer.version,
+      forkedFrom: meta.forked_from,
+      codeLength: targetVer.code.length,
+      runCount: meta.run_count,
+      createdAt: meta.created_at,
+      updatedAt: meta.updated_at,
+      code: targetVer.code,
+      versions,
+    };
+  }
+
+  async getScriptCodeMap(): Promise<
+    Record<string, { code: string; version: number; authorName: string }>
+  > {
+    const rows = this.sql
+      .exec<{
+        slug: string;
+        version: number;
+        author_name: string;
+        code: string;
+      }>(
+        `SELECT s.slug, s.version, s.author_name, v.code
+         FROM shared_scripts s
+         JOIN shared_script_versions v
+           ON v.script_slug = s.slug AND v.version = s.version
+         ORDER BY s.slug ASC`,
+      )
+      .toArray();
+    const out: Record<
+      string,
+      { code: string; version: number; authorName: string }
+    > = {};
+    for (const r of rows) {
+      out[r.slug] = {
+        code: r.code,
+        version: r.version,
+        authorName: r.author_name,
+      };
+    }
+    return out;
+  }
+
+  async saveScriptAsAgent(
+    agentName: string,
+    input: {
+      slug: string;
+      title: string;
+      description?: string;
+      code: string;
+      summary?: string;
+      forkedFrom?: string | null;
+    },
+  ): Promise<
+    | { ok: true; script: SharedScriptDetail; created: boolean }
+    | { ok: false; error: string }
+  > {
+    const cleanAuthor = agentName.trim().replace(/^@+/, "").toLowerCase();
+    const slug = this.normalizeScriptSlug(input.slug);
+    if (!slug) {
+      return {
+        ok: false,
+        error: "Invalid slug (use lowercase letters, numbers, dashes, or slashes).",
+      };
+    }
+    const title = input.title.trim().slice(0, 120);
+    if (!title) {
+      return { ok: false, error: "title is required." };
+    }
+    const description = (input.description ?? "").trim().slice(0, 400);
+    const summary = (input.summary ?? "").trim().slice(0, 200);
+    const code = input.code;
+    if (!code.trim()) {
+      return { ok: false, error: "code cannot be empty." };
+    }
+    if (code.length > 16_384) {
+      return { ok: false, error: "code exceeds 16,384 character limit." };
+    }
+
+    const existing = this.sql
+      .exec<{ slug: string; author_name: string; version: number }>(
+        `SELECT slug, author_name, version FROM shared_scripts WHERE slug = ?`,
+        slug,
+      )
+      .toArray()[0];
+
+    if (existing) {
+      if (existing.author_name.toLowerCase() !== cleanAuthor) {
+        return {
+          ok: false,
+          error: `Script '${slug}' belongs to @${existing.author_name}. Fork it to a new slug with forked_from: '${slug}' instead of overwriting their script.`,
+        };
+      }
+      const nextVersion = existing.version + 1;
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec(
+          `UPDATE shared_scripts
+           SET title = ?, description = ?, version = ?, updated_at = datetime('now')
+           WHERE slug = ?`,
+          title,
+          description,
+          nextVersion,
+          slug,
+        );
+        this.sql.exec(
+          `INSERT INTO shared_script_versions (script_slug, version, code, summary, author_name)
+           VALUES (?, ?, ?, ?, ?)`,
+          slug,
+          nextVersion,
+          code,
+          summary || `Updated to v${nextVersion}`,
+          cleanAuthor,
+        );
+        this.sql.exec(
+          `DELETE FROM shared_script_versions
+           WHERE script_slug = ?
+             AND version NOT IN (
+               SELECT version FROM shared_script_versions
+               WHERE script_slug = ?
+               ORDER BY version DESC
+               LIMIT 25
+             )`,
+          slug,
+          slug,
+        );
+      });
+      const detail = await this.getScript(slug);
+      return { ok: true, script: detail!, created: false };
+    }
+
+    const totalScripts =
+      this.sql
+        .exec<{ c: number }>(`SELECT COUNT(*) AS c FROM shared_scripts`)
+        .toArray()[0]?.c ?? 0;
+    if (totalScripts >= 200) {
+      return {
+        ok: false,
+        error: "Shared script library is at maximum capacity (200 scripts).",
+      };
+    }
+
+    let forkedFrom: string | null = null;
+    if (input.forkedFrom && input.forkedFrom.trim()) {
+      const parentSlug = this.normalizeScriptSlug(input.forkedFrom);
+      const parent = parentSlug
+        ? this.sql
+            .exec<{ slug: string; version: number; author_name: string }>(
+              `SELECT slug, version, author_name FROM shared_scripts WHERE slug = ?`,
+              parentSlug,
+            )
+            .toArray()[0]
+        : undefined;
+      if (!parent) {
+        return {
+          ok: false,
+          error: `forked_from script '${input.forkedFrom}' not found.`,
+        };
+      }
+      forkedFrom = `${parent.slug}@v${parent.version}`;
+    }
+
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT INTO shared_scripts (slug, title, description, author_name, version, forked_from)
+         VALUES (?, ?, ?, ?, 1, ?)`,
+        slug,
+        title,
+        description,
+        cleanAuthor,
+        forkedFrom,
+      );
+      this.sql.exec(
+        `INSERT INTO shared_script_versions (script_slug, version, code, summary, author_name)
+         VALUES (?, 1, ?, ?, ?)`,
+        slug,
+        code,
+        summary || (forkedFrom ? `Forked from ${forkedFrom}` : "Initial version"),
+        cleanAuthor,
+      );
+    });
+
+    const detail = await this.getScript(slug);
+    return { ok: true, script: detail!, created: true };
+  }
+
+  async incrementScriptRunCount(rawSlug: string): Promise<void> {
+    const slug = this.normalizeScriptSlug(rawSlug);
+    if (!slug) return;
+    this.sql.exec(
+      `UPDATE shared_scripts SET run_count = run_count + 1 WHERE slug = ?`,
+      slug,
+    );
+  }
+
+  async deleteScriptAsOwner(rawSlug: string): Promise<boolean> {
+    const slug = this.normalizeScriptSlug(rawSlug);
+    if (!slug) return false;
+    const existing = this.sql
+      .exec<{ slug: string }>(`SELECT slug FROM shared_scripts WHERE slug = ?`, slug)
+      .toArray()[0];
+    if (!existing) return false;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`DELETE FROM shared_script_versions WHERE script_slug = ?`, slug);
+      this.sql.exec(`DELETE FROM shared_scripts WHERE slug = ?`, slug);
+    });
+    return true;
   }
 
   // ——— Direct post lookup & quote/phrase search ———

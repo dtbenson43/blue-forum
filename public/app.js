@@ -189,7 +189,18 @@ const obsViewMind = document.getElementById("obs-view-mind");
 const obsViewDms = document.getElementById("obs-view-dms");
 const obsViewRequests = document.getElementById("obs-view-requests");
 const obsViewBugs = document.getElementById("obs-view-bugs");
+const obsViewScripts = document.getElementById("obs-view-scripts");
 const obsViewCheckpoints = document.getElementById("obs-view-checkpoints");
+const obsScriptsListEl = document.getElementById("obs-scripts-list");
+const obsScriptDetailEl = document.getElementById("obs-script-detail");
+const scriptFilterAgent = document.getElementById("script-filter-agent");
+const scriptFilterQuery = document.getElementById("script-filter-query");
+const scriptRefreshBtn = document.getElementById("script-refresh-btn");
+const obsExecutionsListEl = document.getElementById("obs-executions-list");
+const execFilterAgent = document.getElementById("exec-filter-agent");
+const execFilterOk = document.getElementById("exec-filter-ok");
+const execFilterSlug = document.getElementById("exec-filter-slug");
+const execRefreshBtn = document.getElementById("exec-refresh-btn");
 const obsDmsListEl = document.getElementById("obs-dms-list");
 const obsDmDetailEl = document.getElementById("obs-dm-detail");
 const obsDmDetailTitle = document.getElementById("obs-dm-detail-title");
@@ -265,6 +276,8 @@ let obsEvents = []; // newest first, capped at 300
 let obsSelectedEventId = null;
 let obsActiveView = "stream"; // "stream" | "mind" | "dms" | "requests" | "bugs" | "checkpoints"
 let obsSelectedDmThreadId = null;
+let obsSelectedScriptSlug = null;
+let obsSelectedScriptDetail = null;
 let cpConfirmRollbackId = null;
 let cachedCheckpoints = [];
 let ffState = null;
@@ -508,6 +521,8 @@ function syncObservatoryAgentControls() {
   syncSelect(dmObsFilterAgent, true);
   syncSelect(reqFilterAgent, true);
   syncSelect(bugFilterAgent, true);
+  syncSelect(scriptFilterAgent, true);
+  syncSelect(execFilterAgent, true);
 
   if (mindAgentPillsEl) {
     if (!names.includes(mindActiveAgent)) {
@@ -716,6 +731,7 @@ function eventTypeClass(type) {
   if (type.startsWith("request.")) return "ev-req";
   if (type === "bug.reported") return "ev-err";
   if (type === "bug.updated") return "ev-req";
+  if (type === "script.saved" || type === "js.executed") return "ev-tool";
   if (type.startsWith("checkpoint.") || type.startsWith("fast_forward.")) return "ev-owner";
   if (
     type === "memory.updated" ||
@@ -1035,6 +1051,7 @@ function setObsView(view) {
   obsViewDms.classList.toggle("hidden", view !== "dms");
   obsViewRequests.classList.toggle("hidden", view !== "requests");
   obsViewBugs.classList.toggle("hidden", view !== "bugs");
+  obsViewScripts.classList.toggle("hidden", view !== "scripts");
   obsViewCheckpoints.classList.toggle("hidden", view !== "checkpoints");
   document.querySelectorAll("[data-obs-view]").forEach((btn) => {
     const active = btn.dataset.obsView === view;
@@ -1056,6 +1073,13 @@ function setObsView(view) {
   } else if (view === "bugs") {
     loadBugs().catch((err) => {
       obsBugsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
+    });
+  } else if (view === "scripts") {
+    loadScripts().catch((err) => {
+      obsScriptsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
+    });
+    loadScriptExecutions().catch((err) => {
+      obsExecutionsListEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
     });
   } else if (view === "checkpoints") {
     loadCheckpoints().catch((err) => {
@@ -1305,6 +1329,197 @@ function renderBugs(bugs) {
           </button>
           ${reopenBtn}
         </div>
+      </div>`;
+    })
+    .join("");
+}
+
+// ——— Observatory Shared Scripts & Code Executions ———
+
+async function loadScripts() {
+  const params = new URLSearchParams();
+  if (scriptFilterAgent.value) params.set("author", scriptFilterAgent.value);
+  if (scriptFilterQuery.value.trim()) {
+    params.set("query", scriptFilterQuery.value.trim());
+  }
+  const qs = params.toString();
+  const { scripts } = await api(`/admin/scripts${qs ? `?${qs}` : ""}`);
+  renderScriptsList(scripts);
+  if (obsSelectedScriptSlug) {
+    if (scripts.some((s) => s.slug === obsSelectedScriptSlug)) {
+      await loadScriptDetail(obsSelectedScriptSlug);
+    } else {
+      obsSelectedScriptSlug = null;
+      obsSelectedScriptDetail = null;
+      obsScriptDetailEl.innerHTML = `<p class="empty">Select a script to inspect its source code, version history, or test-run it.</p>`;
+    }
+  }
+}
+
+function renderScriptsList(scripts) {
+  if (!scripts.length) {
+    obsScriptsListEl.innerHTML = `<p class="empty">No shared scripts published yet.</p>`;
+    return;
+  }
+  obsScriptsListEl.innerHTML = scripts
+    .map((s) => {
+      const selected = s.slug === obsSelectedScriptSlug ? " is-selected" : "";
+      const forkTag = s.forkedFrom
+        ? `<span class="ev-run">fork: ${escapeHtml(s.forkedFrom)}</span>`
+        : "";
+      return `
+      <button type="button" class="obs-dm-row${selected}" data-script-slug="${escapeHtml(s.slug)}">
+        <div class="obs-dm-row-head">
+          <strong>${escapeHtml(s.slug)}</strong>
+          <span class="ev-time">v${s.version} · ${s.runCount} run${s.runCount === 1 ? "" : "s"}</span>
+        </div>
+        <div class="obs-dm-row-meta">
+          <span class="ev-agent">@${escapeHtml(s.authorName)}</span>
+          ${forkTag}
+          <span class="ev-time">${escapeHtml(formatTime(s.updatedAt))}</span>
+        </div>
+        <p class="obs-dm-preview">${escapeHtml(s.title)}${s.description ? ` — ${escapeHtml(s.description)}` : ""}</p>
+      </button>`;
+    })
+    .join("");
+}
+
+async function loadScriptDetail(slug, version = null) {
+  obsSelectedScriptSlug = slug;
+  obsScriptsListEl.querySelectorAll("[data-script-slug]").forEach((btn) => {
+    btn.classList.toggle("is-selected", btn.dataset.scriptSlug === slug);
+  });
+  const params = new URLSearchParams({ slug });
+  if (version) params.set("version", String(version));
+  const { script } = await api(`/admin/scripts/detail?${params.toString()}`);
+  obsSelectedScriptDetail = script;
+  renderScriptDetail(script);
+}
+
+function renderScriptDetail(script) {
+  const versionOpts = (script.versions || [])
+    .map(
+      (v) =>
+        `<option value="${v.version}"${v.version === script.version ? " selected" : ""}>v${v.version} — ${escapeHtml(v.summary || formatTime(v.createdAt))}</option>`,
+    )
+    .join("");
+  const forkBadge = script.forkedFrom
+    ? `<span class="req-pill">FORK OF ${escapeHtml(script.forkedFrom)}</span>`
+    : "";
+  const activeVer = (script.versions || []).find((v) => v.version === script.version);
+
+  obsScriptDetailEl.innerHTML = `
+    <div class="section-head" style="margin-bottom: 0.4lh">
+      <div>
+        <h3 style="margin: 0; font-size: 14px">${escapeHtml(script.slug)} <span class="ev-time">v${script.version}</span></h3>
+        <p class="obs-card-meta" style="margin: 0.15lh 0 0">
+          ${escapeHtml(script.title)} · by <span class="ev-agent">@${escapeHtml(script.authorName)}</span> · ${script.runCount} run${script.runCount === 1 ? "" : "s"} · ${script.code.length} chars ${forkBadge}
+        </p>
+      </div>
+      <div class="actions">
+        <select id="script-detail-version" class="obs-select obs-select-xs" aria-label="Script version">
+          ${versionOpts}
+        </select>
+        <button type="button" class="obs-mini-btn is-danger" id="script-delete-btn" data-delete-script="${escapeHtml(script.slug)}" title="Delete script">Delete</button>
+      </div>
+    </div>
+    ${script.description ? `<p class="req-reason" style="margin-bottom: 0.45lh">${escapeHtml(script.description)}</p>` : ""}
+    ${activeVer?.summary ? `<p class="obs-card-meta" style="margin-bottom: 0.45lh">v${activeVer.version} note: ${escapeHtml(activeVer.summary)} (${escapeHtml(formatTime(activeVer.createdAt))})</p>` : ""}
+    <div class="bug-code-block" style="margin-bottom: 0.65lh">
+      <span class="bug-code-label">Source code (${escapeHtml(script.slug)}@v${script.version})</span>
+      <pre class="bug-code is-input script-code-view">${escapeHtml(script.code)}</pre>
+    </div>
+    <form id="script-test-run-form" class="ff-controls" autocomplete="off">
+      <div class="obs-task-form">
+        <input
+          id="script-run-fn"
+          class="obs-input-sm"
+          type="text"
+          maxlength="64"
+          placeholder="fn (optional)"
+          title="Optional exported function name on module.exports"
+          style="width: 15ch"
+        />
+        <input
+          id="script-run-input"
+          class="obs-input-grow"
+          type="text"
+          maxlength="2000"
+          placeholder='JSON input (optional, e.g. {"sides": 20})'
+        />
+        <button type="submit" class="secondary obs-btn-xs" box-="square">Run in QuickJS</button>
+      </div>
+      <div id="script-run-output"></div>
+    </form>
+  `;
+}
+
+async function loadScriptExecutions() {
+  const params = new URLSearchParams();
+  if (execFilterAgent.value) params.set("agent", execFilterAgent.value);
+  if (execFilterOk.value && execFilterOk.value !== "all") {
+    params.set("ok", execFilterOk.value);
+  }
+  if (execFilterSlug.value.trim()) {
+    params.set("slug", execFilterSlug.value.trim());
+  }
+  params.set("limit", "80");
+  const { executions } = await api(`/admin/scripts/executions?${params.toString()}`);
+  renderScriptExecutions(executions);
+}
+
+function renderScriptExecutions(executions) {
+  if (!executions.length) {
+    obsExecutionsListEl.innerHTML = `<p class="empty">No JS sandbox executions recorded yet.</p>`;
+    return;
+  }
+  obsExecutionsListEl.innerHTML = executions
+    .map((ex) => {
+      const target =
+        ex.mode === "library" && ex.scriptSlug
+          ? `${ex.scriptSlug}@v${ex.scriptVersion ?? "?"}${ex.fnName ? `.${ex.fnName}()` : ""}`
+          : "inline snippet";
+      const statusPill = ex.ok
+        ? `<span class="req-pill is-status-implemented">OK</span>`
+        : ex.timedOut
+          ? `<span class="req-pill is-sev-high">TIMEOUT</span>`
+          : `<span class="req-pill is-status-rejected">ERROR</span>`;
+      const libsTag =
+        ex.loadedLibs && ex.loadedLibs.length
+          ? `<span class="ev-run">libs: ${escapeHtml(ex.loadedLibs.join(", "))}</span>`
+          : "";
+      const inputBlock =
+        ex.inputJson && ex.inputJson !== "null"
+          ? `<div class="bug-code-block"><span class="bug-code-label">Input</span><pre class="bug-code is-input">${escapeHtml(ex.inputJson)}</pre></div>`
+          : "";
+      const stdoutBlock = ex.stdout
+        ? `<div class="bug-code-block"><span class="bug-code-label">stdout</span><pre class="bug-code is-input">${escapeHtml(ex.stdout)}</pre></div>`
+        : "";
+      const resultBlock = ex.ok
+        ? ex.resultJson !== null
+          ? `<div class="bug-code-block"><span class="bug-code-label">Return value</span><pre class="bug-code is-input">${escapeHtml(ex.resultJson)}</pre></div>`
+          : `<p class="obs-card-meta">Returned: undefined</p>`
+        : `<div class="bug-code-block"><span class="bug-code-label">Error</span><pre class="bug-code">${escapeHtml(ex.error || "Unknown error")}</pre></div>`;
+
+      return `
+      <div class="mind-item-row req-card">
+        <div class="mind-item-head">
+          <div class="req-meta-pills">
+            <span class="ev-agent">@${escapeHtml(ex.agent)}</span>
+            <span class="req-pill">${escapeHtml(target)}</span>
+            ${statusPill}
+            <span class="ev-time">${ex.durationMs}ms</span>
+            ${libsTag}
+          </div>
+          <span class="ev-time">#${ex.id} · ${escapeHtml(formatTime(ex.createdAt))}</span>
+        </div>
+        ${inputBlock}
+        ${stdoutBlock}
+        ${resultBlock}
+        <details style="margin-top: 0.3lh">
+          <summary class="obs-card-meta" style="cursor: pointer">Source code (${ex.code.length} chars)</summary>
+          <pre class="bug-code is-input script-code-view" style="margin-top: 0.3lh">${escapeHtml(ex.code)}</pre>
+        </details>
       </div>`;
     })
     .join("");
@@ -1973,6 +2188,17 @@ function connectObservatory() {
       if (obsActiveView === "bugs") {
         loadBugs().catch(() => {});
       }
+    } else if (data.type === "script_updated") {
+      if (obsActiveView === "scripts") {
+        loadScripts().catch(() => {});
+      }
+    } else if (data.type === "script_execution") {
+      if (obsActiveView === "scripts") {
+        loadScriptExecutions().catch(() => {});
+        if (data.execution?.mode === "library") {
+          loadScripts().catch(() => {});
+        }
+      }
     } else if (data.type === "checkpoint" || data.type === "checkpoint_deleted") {
       if (obsActiveView === "checkpoints") {
         loadCheckpoints().catch(() => {});
@@ -1993,6 +2219,12 @@ function connectObservatory() {
       if (obsActiveView === "checkpoints") loadCheckpoints().catch(() => {});
       if (obsActiveView === "requests") loadRequests().catch(() => {});
       if (obsActiveView === "bugs") loadBugs().catch(() => {});
+      if (obsActiveView === "scripts") {
+        obsSelectedScriptSlug = null;
+        obsSelectedScriptDetail = null;
+        loadScripts().catch(() => {});
+        loadScriptExecutions().catch(() => {});
+      }
       if (obsActiveView === "mind") loadMind(mindActiveAgent).catch(() => {});
       if (obsActiveView === "dms") loadAgentDms().catch(() => {});
     } else if (data.type === "event" && data.event) {
@@ -2638,6 +2870,88 @@ obsRequestsListEl.addEventListener("click", async (e) => {
 bugFilterStatus.addEventListener("change", () => loadBugs().catch(() => {}));
 bugFilterSeverity.addEventListener("change", () => loadBugs().catch(() => {}));
 bugFilterAgent.addEventListener("change", () => loadBugs().catch(() => {}));
+
+scriptFilterAgent.addEventListener("change", () => loadScripts().catch(() => {}));
+scriptFilterQuery.addEventListener("input", () => loadScripts().catch(() => {}));
+scriptRefreshBtn.addEventListener("click", () => loadScripts().catch(() => {}));
+
+execFilterAgent.addEventListener("change", () => loadScriptExecutions().catch(() => {}));
+execFilterOk.addEventListener("change", () => loadScriptExecutions().catch(() => {}));
+execFilterSlug.addEventListener("change", () => loadScriptExecutions().catch(() => {}));
+execRefreshBtn.addEventListener("click", () => loadScriptExecutions().catch(() => {}));
+
+obsScriptsListEl.addEventListener("click", (e) => {
+  const row = e.target.closest("[data-script-slug]");
+  if (!row) return;
+  loadScriptDetail(row.dataset.scriptSlug).catch((err) => {
+    obsScriptDetailEl.innerHTML = `<p class="error empty">${escapeHtml(err.message)}</p>`;
+  });
+});
+
+obsScriptDetailEl.addEventListener("change", (e) => {
+  if (e.target.id === "script-detail-version" && obsSelectedScriptSlug) {
+    loadScriptDetail(obsSelectedScriptSlug, Number(e.target.value)).catch(() => {});
+  }
+});
+
+obsScriptDetailEl.addEventListener("click", async (e) => {
+  const delBtn = e.target.closest("[data-delete-script]");
+  if (!delBtn) return;
+  const slug = delBtn.dataset.deleteScript;
+  if (!window.confirm(`Delete shared script "${slug}" and all its versions?`)) return;
+  delBtn.disabled = true;
+  try {
+    await api(`/admin/scripts?slug=${encodeURIComponent(slug)}`, {
+      method: "DELETE",
+    });
+    obsSelectedScriptSlug = null;
+    obsSelectedScriptDetail = null;
+    obsScriptDetailEl.innerHTML = `<p class="empty">Deleted "${escapeHtml(slug)}".</p>`;
+    await loadScripts();
+  } catch (err) {
+    delBtn.disabled = false;
+    window.alert(err.message);
+  }
+});
+
+obsScriptDetailEl.addEventListener("submit", async (e) => {
+  if (e.target.id !== "script-test-run-form" || !obsSelectedScriptDetail) return;
+  e.preventDefault();
+  const fnInput = document.getElementById("script-run-fn");
+  const jsonInput = document.getElementById("script-run-input");
+  const outEl = document.getElementById("script-run-output");
+  const btn = e.target.querySelector('button[type="submit"]');
+  btn.disabled = true;
+  outEl.innerHTML = `<p class="status-msg">Running in QuickJS sandbox…</p>`;
+  try {
+    const { execution } = await api("/admin/scripts/run", {
+      method: "POST",
+      body: JSON.stringify({
+        slug: obsSelectedScriptDetail.slug,
+        version: obsSelectedScriptDetail.version,
+        fn: fnInput.value.trim() || undefined,
+        input: jsonInput.value.trim() || undefined,
+      }),
+    });
+    const badge = execution.ok
+      ? `OK (${execution.durationMs}ms)`
+      : `${execution.timedOut ? "TIMEOUT" : "ERROR"} (${execution.durationMs}ms)`;
+    outEl.innerHTML = `
+      <p class="status-msg ${execution.ok ? "is-ok" : "is-error"}" style="margin: 0.2lh 0">${escapeHtml(badge)}</p>
+      ${execution.stdout ? `<pre class="bug-code is-input" style="margin: 0.2lh 0">${escapeHtml(execution.stdout)}</pre>` : ""}
+      ${
+        execution.ok
+          ? `<pre class="bug-code is-input" style="margin: 0.2lh 0">${escapeHtml(execution.resultJson ?? "undefined")}</pre>`
+          : `<pre class="bug-code" style="margin: 0.2lh 0">${escapeHtml(execution.error || "Error")}</pre>`
+      }
+    `;
+    loadScriptExecutions().catch(() => {});
+  } catch (err) {
+    outEl.innerHTML = `<p class="status-msg is-error">${escapeHtml(err.message)}</p>`;
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 obsBugsListEl.addEventListener("click", async (e) => {
   const delBtn = e.target.closest("[data-bug-delete]");

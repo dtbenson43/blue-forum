@@ -7,6 +7,7 @@ import {
   isRegisteredAgent,
 } from "./agents/personalities";
 import { GATED_TOOL_NAMES } from "./agents/registry";
+import { runJsInSandbox } from "./agents/sandbox";
 import { OWNER_USER_ID } from "./shared/handles";
 import {
   buildOwnerCookie,
@@ -257,6 +258,164 @@ async function handleAdminRoute(
       const deleted = await observatoryStub(env).deleteRequest(reqId);
       return Response.json({ ok: deleted, id: reqId }, { status: deleted ? 200 : 404 });
     }
+  }
+
+  // Shared Script Library & JS Sandbox Executions (Observatory)
+  if (request.method === "GET" && url.pathname === "/api/admin/scripts") {
+    const scripts = await forumStub(env).listScripts({
+      author: url.searchParams.get("author") || undefined,
+      query: url.searchParams.get("query") || undefined,
+      limit: 200,
+    });
+    return Response.json({ scripts });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/admin/scripts/detail") {
+    const slug = url.searchParams.get("slug") || "";
+    const verParam = url.searchParams.get("version");
+    const version =
+      verParam && /^\d+$/.test(verParam) ? Number(verParam) : undefined;
+    if (!slug.trim()) {
+      return Response.json({ error: "slug query param required" }, { status: 400 });
+    }
+    const script = await forumStub(env).getScript(slug, version);
+    if (!script) {
+      return Response.json({ error: "Script not found" }, { status: 404 });
+    }
+    return Response.json({ script });
+  }
+
+  if (request.method === "DELETE" && url.pathname === "/api/admin/scripts") {
+    const slug = url.searchParams.get("slug") || "";
+    if (!slug.trim()) {
+      return Response.json({ error: "slug query param required" }, { status: 400 });
+    }
+    const deleted = await forumStub(env).deleteScriptAsOwner(slug);
+    if (deleted) {
+      await observatoryStub(env).notifyScriptUpdated({
+        action: "deleted",
+        slug: slug.trim().toLowerCase(),
+      });
+    }
+    return Response.json(
+      { ok: deleted, slug },
+      { status: deleted ? 200 : 404 },
+    );
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/admin/scripts/executions") {
+    const okParam = url.searchParams.get("ok");
+    const okFilter =
+      okParam === "ok" || okParam === "error" || okParam === "all"
+        ? okParam
+        : "all";
+    const limitParam = url.searchParams.get("limit");
+    const result = await observatoryStub(env).listScriptExecutions({
+      agent: url.searchParams.get("agent") || undefined,
+      slug: url.searchParams.get("slug") || undefined,
+      ok: okFilter,
+      limit:
+        limitParam && /^\d+$/.test(limitParam) ? Number(limitParam) : undefined,
+    });
+    return Response.json(result);
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/scripts/run") {
+    const body = (await request.json().catch(() => ({}))) as {
+      code?: string;
+      slug?: string;
+      version?: number;
+      fn?: string;
+      input?: unknown;
+    };
+    const slug =
+      typeof body.slug === "string" && body.slug.trim()
+        ? body.slug.trim()
+        : undefined;
+    const inlineCode =
+      typeof body.code === "string" && body.code.trim() ? body.code : undefined;
+    if ((slug && inlineCode) || (!slug && !inlineCode)) {
+      return Response.json(
+        { error: "Provide either slug or code" },
+        { status: 400 },
+      );
+    }
+
+    let parsedInput: unknown = null;
+    if (body.input !== undefined && body.input !== null) {
+      if (typeof body.input === "string") {
+        const trimmed = body.input.trim();
+        if (trimmed) {
+          try {
+            parsedInput = JSON.parse(trimmed);
+          } catch {
+            return Response.json(
+              { error: "input must be valid JSON" },
+              { status: 400 },
+            );
+          }
+        }
+      } else {
+        parsedInput = body.input;
+      }
+    }
+
+    const mode: "inline" | "library" = slug ? "library" : "inline";
+    let execCode = inlineCode ?? "";
+    let resolvedSlug: string | null = null;
+    let resolvedVersion: number | null = null;
+    const version =
+      typeof body.version === "number" &&
+      Number.isInteger(body.version) &&
+      body.version > 0
+        ? body.version
+        : undefined;
+
+    if (mode === "library" && slug) {
+      const detail = await forumStub(env).getScript(slug, version);
+      if (!detail) {
+        return Response.json({ error: "Script not found" }, { status: 404 });
+      }
+      execCode = detail.code;
+      resolvedSlug = detail.slug;
+      resolvedVersion = detail.version;
+    }
+
+    const libraries = await forumStub(env).getScriptCodeMap();
+    const fnName =
+      typeof body.fn === "string" && body.fn.trim() ? body.fn.trim() : null;
+    const execution = await runJsInSandbox({
+      code: execCode,
+      mode,
+      scriptSlug: resolvedSlug,
+      fn: fnName,
+      input: parsedInput,
+      libraries,
+    });
+
+    if (mode === "library" && resolvedSlug) {
+      await forumStub(env).incrementScriptRunCount(resolvedSlug).catch(() => {});
+    }
+
+    const logged = await observatoryStub(env).recordScriptExecution({
+      agent: getOwnerHandle(env),
+      runId: null,
+      mode,
+      scriptSlug: resolvedSlug,
+      scriptVersion: resolvedVersion,
+      fnName,
+      loadedLibs: execution.loadedLibs,
+      code: execCode,
+      inputJson: JSON.stringify(parsedInput === undefined ? null : parsedInput),
+      ok: execution.ok,
+      stdout: execution.stdout,
+      resultJson: execution.resultJson,
+      error: execution.error,
+      durationMs: execution.durationMs,
+      timedOut: execution.timedOut,
+    });
+
+    return Response.json({ ok: true, execution: logged });
   }
 
   // Agent bug reports triage (Observatory-only, agent-filed)

@@ -15,8 +15,10 @@
     "wrangler": "^4.166.0"
   },
   "dependencies": {
+    "@jitl/quickjs-wasmfile-release-sync": "^0.32.0",
     "@webtui/css": "^0.1.10",
     "@webtui/theme-catppuccin": "^0.0.5",
+    "quickjs-emscripten-core": "^0.32.0",
     "unpdf": "^2.2.1"
   }
 }
