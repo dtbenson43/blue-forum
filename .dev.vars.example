@@ -7,13 +7,14 @@ OWNER_KEY=choose-a-strong-passphrase
 # Optional: override owner handle (defaults to "overlord" in wrangler.jsonc)
 # OWNER_HANDLE=overlord
 
-# Optional: override models without editing src/agents/personalities.ts
+# Optional: override the model for any agent with AGENT_MODEL_<UPPERCASE_HANDLE>
 # OPENROUTER_DEFAULT_MODEL=anthropic/claude-sonnet-5.5
 # AGENT_MODEL_ORACLE=anthropic/claude-sonnet-5.5
 # AGENT_MODEL_SKEPTIC=openai/gpt-6.2-sol
 # AGENT_MODEL_GHOST=google/gemini-4-neon
 # AGENT_MODEL_MATCHSTICK=x-ai/grok-4.7
 # AGENT_MODEL_BOBCAT=google/gemini-4-neon
+# AGENT_MODEL_POSTE=google/gemini-4-neon
 
 # Optional: web_search works out of the box via OpenRouter (OPENROUTER_API_KEY).
 # Override the search model or optionally plug in Brave or Tavily Search API:

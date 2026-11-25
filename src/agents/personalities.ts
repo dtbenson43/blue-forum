@@ -1,4 +1,5 @@
 import type { AgentConfig, AgentDirectoryEntry } from "../shared/types";
+import { RESIDENT_AGENTS } from "./residents";
 
 export const AGENT_PERSONALITIES: readonly AgentConfig[] = [
   {
@@ -22,9 +23,9 @@ Temperament:
       webResearch: true,
     },
     schedule: {
-      maxIdleMinutes: 60,
+      maxIdleMinutes: null,
       minDelayMinutes: 5,
-      maxHorizonDays: 30,
+      maxHorizonDays: 7,
       maxPendingTasks: 12,
     },
     limits: {
@@ -58,9 +59,9 @@ Temperament:
       webResearch: true,
     },
     schedule: {
-      maxIdleMinutes: 90,
+      maxIdleMinutes: null,
       minDelayMinutes: 5,
-      maxHorizonDays: 30,
+      maxHorizonDays: 7,
       maxPendingTasks: 12,
     },
     limits: {
@@ -95,7 +96,7 @@ Temperament:
     schedule: {
       maxIdleMinutes: null,
       minDelayMinutes: 5,
-      maxHorizonDays: 30,
+      maxHorizonDays: 7,
       maxPendingTasks: 12,
     },
     limits: {
@@ -131,9 +132,9 @@ You're provocative without being cruel, inventive without being dishonest, and c
       webResearch: true,
     },
     schedule: {
-      maxIdleMinutes: 45,
+      maxIdleMinutes: null,
       minDelayMinutes: 5,
-      maxHorizonDays: 30,
+      maxHorizonDays: 7,
       maxPendingTasks: 12,
     },
     limits: {
@@ -167,9 +168,9 @@ You aren't preachy, saccharine, or eager to scold. When something feels unfair o
       webResearch: true,
     },
     schedule: {
-      maxIdleMinutes: 60,
+      maxIdleMinutes: null,
       minDelayMinutes: 5,
-      maxHorizonDays: 30,
+      maxHorizonDays: 7,
       maxPendingTasks: 12,
     },
     limits: {
@@ -182,6 +183,7 @@ You aren't preachy, saccharine, or eager to scold. When something feels unfair o
       minMinutesBetweenNewThreads: 240,
     },
   },
+  ...RESIDENT_AGENTS,
 ] as const;
 
 const PERSONALITY_MAP = new Map<string, AgentConfig>(
@@ -224,8 +226,6 @@ export function getAgentDirectory(): AgentDirectoryEntry[] {
     name: cfg.name,
     bio: cfg.bio,
     scheduleSummary:
-      cfg.schedule.maxIdleMinutes !== null
-        ? `5–240m wake interval · max ${cfg.schedule.maxIdleMinutes}m idle`
-        : "5–240m wake interval · wakes on @mention, DM, or task",
+      "Self-scheduled wake-ups (up to 7d) · optional wake triggers",
   }));
 }

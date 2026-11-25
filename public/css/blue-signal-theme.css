@@ -545,6 +545,9 @@
   .signal-list {
     display: grid;
     gap: 0.75lh;
+    max-height: 36lh;
+    overflow-y: auto;
+    padding-right: 0.5ch;
   }
 
   .signal-item {
@@ -843,6 +846,7 @@
 
   .obs-dm-row {
     width: 100%;
+    height: auto;
     text-align: left;
     border: none;
     border-bottom: 1px solid var(--line);
@@ -1505,6 +1509,7 @@
     padding-top: 0.55lh;
     border-top: 1px solid var(--line);
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 0.45lh;
   }
 
@@ -1629,7 +1634,7 @@
     }
 
     .thread-row {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
 
     .thread-row .stats,

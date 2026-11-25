@@ -30,6 +30,29 @@ export type ObservatoryEnv = {
   AGENTS_ENABLED?: string;
 };
 
+type CheckpointOptions = {
+  label?: string;
+  note?: string;
+  kind?: CheckpointKind;
+  skipIfUnchanged?: boolean;
+};
+
+type ResetOptions = {
+  createBackup?: boolean;
+  resetConfig?: boolean;
+  clearEvents?: boolean;
+  clearRequests?: boolean;
+  clearBugs?: boolean;
+};
+
+type FastForwardOptions = {
+  agents: string[];
+  durationMinutes?: number;
+  maxStepsPerWake?: number;
+  stopOnRequest?: boolean;
+  createCheckpoint?: boolean;
+};
+
 const MAX_LIVE_EVENTS = 2000;
 const MAX_OPEN_REQUESTS_PER_AGENT = 8;
 const MAX_OPEN_BUGS_PER_AGENT = 10;
@@ -286,6 +309,19 @@ function mapBugReportRow(row: BugReportRow): AgentBugReport {
  */
 export class Observatory extends DurableObject<ObservatoryEnv> {
   private sql = this.ctx.storage.sql;
+  private simulationOperation: string | null = null;
+
+  private async withSimulationOperation<T>(name: string, run: () => Promise<T>) {
+    if (this.simulationOperation) {
+      return { ok: false, busy: true, error: `A ${this.simulationOperation} is in progress.` } as const;
+    }
+    this.simulationOperation = name;
+    try {
+      return await run();
+    } finally {
+      this.simulationOperation = null;
+    }
+  }
 
   constructor(ctx: DurableObjectState, env: ObservatoryEnv) {
     super(ctx, env);
@@ -1178,12 +1214,11 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     };
   }
 
-  async createCheckpoint(input?: {
-    label?: string;
-    note?: string;
-    kind?: CheckpointKind;
-    skipIfUnchanged?: boolean;
-  }): Promise<
+  async createCheckpoint(input?: CheckpointOptions) {
+    return this.withSimulationOperation("checkpoint", () => this.captureCheckpoint(input));
+  }
+
+  private async captureCheckpoint(input?: CheckpointOptions): Promise<
     | { ok: true; checkpoint: CheckpointSummary; skipped?: false }
     | { ok: true; skipped: true; reason: string }
     | { ok: false; error: string }
@@ -1357,10 +1392,11 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     return { ok: true, checkpoint };
   }
 
-  async rollbackToCheckpoint(
-    id: number,
-    opts?: { restoreConfig?: boolean },
-  ): Promise<
+  async rollbackToCheckpoint(id: number, opts?: { restoreConfig?: boolean }) {
+    return this.withSimulationOperation("rollback", () => this.restoreCheckpoint(id, Boolean(opts?.restoreConfig)));
+  }
+
+  private async restoreCheckpoint(id: number, restoreConfig: boolean): Promise<
     | {
         ok: true;
         restored: CheckpointSummary;
@@ -1370,7 +1406,6 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
       }
     | { ok: false; error: string }
   > {
-    const restoreConfig = Boolean(opts?.restoreConfig);
     const target = await this.exportCheckpoint(id);
     if (!target) {
       return { ok: false, error: `Checkpoint #${id} not found` };
@@ -1381,17 +1416,16 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
       await this.stopFastForward("rollback");
     }
 
-    // 1. Pause all agents & purge forum outbox first so no new writes land mid-rollback
+    // Pause agents before the safety snapshot. restoreSnapshot clears the outbox on success.
     const forumStub = this.env.FORUM.getByName("general");
-    await Promise.all([
-      forumStub.purgeOutbox(),
-      ...AGENT_NAMES.map((name) =>
+    await Promise.all(
+      AGENT_NAMES.map((name) =>
         this.env.AGENTS.getByName(name).setPaused(name, true),
       ),
-    ]);
+    );
 
     // 2. Take an automatic pre-rollback safety backup so rollback itself is undoable
-    const safetyRes = await this.createCheckpoint({
+    const safetyRes = await this.captureCheckpoint({
       kind: "pre_rollback",
       label: `Before rollback to #${target.summary.id} (${target.summary.label})`,
       note: `Automatic safety snapshot created immediately before restoring checkpoint #${target.summary.id}.`,
@@ -1459,6 +1493,152 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     return true;
   }
 
+  async resetToBlankSlate(opts?: ResetOptions) {
+    return this.withSimulationOperation("reset", () => this.resetSimulation(opts));
+  }
+
+  private async resetSimulation(opts?: ResetOptions): Promise<
+    | {
+        ok: true;
+        safetyCheckpoint: CheckpointSummary | null;
+        clearedThroughSeq: number;
+        resetConfig: boolean;
+        clearEvents: boolean;
+        clearRequests: boolean;
+        clearBugs: boolean;
+        agentsPaused: true;
+      }
+    | { ok: false; error: string }
+  > {
+    const createBackup = opts?.createBackup !== false;
+    const resetConfig = Boolean(opts?.resetConfig);
+    const clearEvents = opts?.clearEvents !== false;
+    const clearRequests = opts?.clearRequests !== false;
+    const clearBugs = opts?.clearBugs !== false;
+
+    // 0. If Fast Forward is running, stop it cleanly first
+    if (this.readFastForwardState().active) {
+      await this.stopFastForward("reset");
+    }
+
+    // Keep the outbox until the optional backup succeeds and the forum is cleared.
+    const forumStub = this.env.FORUM.getByName("general");
+    await Promise.all(
+      AGENT_NAMES.map((name) =>
+        this.env.AGENTS.getByName(name).setPaused(name, true),
+      ),
+    );
+
+    // 2. Optional automatic safety checkpoint so the reset is undoable
+    let safetyCheckpoint: CheckpointSummary | null = null;
+    if (createBackup) {
+      const safetyRes = await this.captureCheckpoint({
+        kind: "pre_rollback",
+        label: "Before blank-slate reset",
+        note: "Automatic safety snapshot created immediately before resetting the forum to a blank slate.",
+      });
+      if (!safetyRes.ok || safetyRes.skipped) {
+        return {
+          ok: false,
+          error:
+            "Failed to create pre-reset safety checkpoint; blank-slate reset aborted.",
+        };
+      }
+      safetyCheckpoint = safetyRes.checkpoint;
+    }
+
+    // 3. Wipe Forum (restoring empty snapshot re-registers @system & all AGENT_NAMES)
+    await forumStub.restoreSnapshot({
+      users: [],
+      threads: [],
+      posts: [],
+      threadParticipants: [],
+      threadReads: [],
+      sequences: { threads: 0, posts: 0 },
+    });
+
+    // 4. Wipe all Agent DOs (leaving every agent paused with alarms cleared)
+    await Promise.all(
+      AGENT_NAMES.map((name) =>
+        this.env.AGENTS.getByName(name).resetToBlankSlate(name, {
+          resetConfig,
+          clearHistory: clearEvents,
+        }),
+      ),
+    );
+
+    // 5. Optionally wipe Observatory audit tables (checkpoints remain intact)
+    const clearedThroughSeq = clearEvents ? this.getLatestSeq() : 0;
+    if (clearEvents || clearRequests || clearBugs) {
+      this.ctx.storage.transactionSync(() => {
+        if (clearEvents) {
+          this.setSetting("events_cleared_through_seq", String(clearedThroughSeq));
+          this.sql.exec(`DELETE FROM live_events`);
+        }
+        if (clearRequests) {
+          this.sql.exec(`DELETE FROM agent_requests`);
+        }
+        if (clearBugs) {
+          this.sql.exec(`DELETE FROM bug_reports`);
+        }
+      });
+    }
+
+    const clearedParts = [
+      "forum & agent minds",
+      resetConfig ? "agent configs" : null,
+      clearEvents ? "events & run logs" : null,
+      clearRequests ? "requests" : null,
+      clearBugs ? "bug reports" : null,
+    ].filter(Boolean);
+    const backupTag = safetyCheckpoint
+      ? ` (backup #${safetyCheckpoint.id})`
+      : " (no backup)";
+
+    // Notify connected clients before recording the single fresh audit event
+    this.broadcast({
+      type: "reset",
+      clearEvents,
+      clearedThroughSeq,
+      clearRequests,
+      clearBugs,
+      resetConfig,
+      safetyCheckpoint,
+      openRequests: this.getOpenRequestCount(),
+      openBugs: this.getOpenBugCount(),
+    });
+
+    await this.recordEvent({
+      eventId: crypto.randomUUID(),
+      agent: "system",
+      runId: null,
+      parentId: null,
+      type: "owner.action",
+      ts: Date.now(),
+      summary: `Reset to blank slate (${clearedParts.join(", ")}) · all agents paused${backupTag}`,
+      meta: {
+        action: "reset_blank_slate",
+        resetConfig,
+        clearEvents,
+        clearRequests,
+        clearBugs,
+        safetyCheckpointId: safetyCheckpoint?.id ?? null,
+        agentsPaused: true,
+      },
+    });
+
+    return {
+      ok: true,
+      safetyCheckpoint,
+      clearedThroughSeq,
+      resetConfig,
+      clearEvents,
+      clearRequests,
+      clearBugs,
+      agentsPaused: true,
+    };
+  }
+
   // ——— Fast Forward simulation mode ———
 
   private readFastForwardState(): FastForwardState {
@@ -1500,13 +1680,11 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     return state;
   }
 
-  async startFastForward(input: {
-    agents: string[];
-    durationMinutes?: number;
-    maxStepsPerWake?: number;
-    stopOnRequest?: boolean;
-    createCheckpoint?: boolean;
-  }): Promise<
+  async startFastForward(input: FastForwardOptions) {
+    return this.withSimulationOperation("Fast Forward start", () => this.enterFastForward(input));
+  }
+
+  private async enterFastForward(input: FastForwardOptions): Promise<
     | { ok: true; fastForward: FastForwardState }
     | { ok: false; error: string }
   > {
@@ -1540,11 +1718,16 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     );
     const stopOnRequest = input.stopOnRequest !== false;
 
+    const whoLabel =
+      agents.length > 6
+        ? `${agents.length} agents`
+        : agents.map((a) => `@${a}`).join(", ");
+
     let checkpointId: number | null = null;
     if (input.createCheckpoint !== false) {
-      const cp = await this.createCheckpoint({
+      const cp = await this.captureCheckpoint({
         kind: "manual",
-        label: `Before Fast Forward (${durationMinutes}m · ${agents.map((a) => `@${a}`).join(", ")})`,
+        label: `Before Fast Forward (${durationMinutes}m · ${whoLabel})`,
         note: "Automatic checkpoint created right before starting Fast Forward mode.",
       });
       if (cp.ok && !cp.skipped) {
@@ -1569,10 +1752,10 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
     };
     this.saveFastForwardState(state);
 
-    // Stagger selected agents neatly across the 60s window so they don't all collide at t=0
+    // Stagger selected agents neatly across the 55s window so they don't collide
     const stepSpacingMs = Math.max(
-      3_000,
-      Math.min(12_000, Math.floor(50_000 / Math.max(1, agents.length))),
+      1_000,
+      Math.min(12_000, Math.floor(52_000 / Math.max(1, agents.length))),
     );
     await Promise.all(
       agents.map((name, idx) =>
@@ -1593,7 +1776,7 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
       parentId: null,
       type: "fast_forward.started",
       ts: now,
-      summary: `Started Fast Forward for ${durationMinutes}m (${agents.map((a) => `@${a}`).join(", ")}; 1m interval, ${maxStepsPerWake} turns/wake${stopOnRequest ? ", stop on request" : ""})`,
+      summary: `Started Fast Forward for ${durationMinutes}m (${whoLabel}; 1m interval, ${maxStepsPerWake} turns/wake${stopOnRequest ? ", stop on request" : ""})`,
       meta: {
         durationMinutes,
         maxStepsPerWake,
@@ -1718,6 +1901,7 @@ export class Observatory extends DurableObject<ObservatoryEnv> {
             type: "replay",
             events,
             latestSeq,
+            clearedThroughSeq: Number(this.getSetting("events_cleared_through_seq") ?? 0),
             openRequests: this.getOpenRequestCount(),
             openBugs: this.getOpenBugCount(),
             fastForward: await this.getFastForwardState(),

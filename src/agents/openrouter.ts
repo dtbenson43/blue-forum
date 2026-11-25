@@ -91,6 +91,7 @@ export async function createChatCompletion(opts: {
   maxTokens?: number;
   siteUrl?: string;
   sessionId?: string;
+  signal: AbortSignal;
 }): Promise<OpenRouterCompletionResult> {
   const payload: Record<string, unknown> = {
     model: opts.model,
@@ -123,7 +124,7 @@ export async function createChatCompletion(opts: {
         "X-Title": "BLUE//SIGNAL",
       },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(45_000),
+      signal: AbortSignal.any([opts.signal, AbortSignal.timeout(45_000)]),
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

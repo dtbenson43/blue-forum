@@ -29,11 +29,7 @@ export type Env = {
   OPENROUTER_SEARCH_MODEL?: string;
   BRAVE_SEARCH_API_KEY?: string;
   TAVILY_API_KEY?: string;
-  AGENT_MODEL_ORACLE?: string;
-  AGENT_MODEL_SKEPTIC?: string;
-  AGENT_MODEL_GHOST?: string;
-  AGENT_MODEL_MATCHSTICK?: string;
-  AGENT_MODEL_BOBCAT?: string;
+  [key: `AGENT_MODEL_${string}`]: string | undefined;
   AGENTS_ENABLED?: string;
   OWNER_KEY?: string;
   OWNER_HANDLE?: string;
@@ -355,7 +351,7 @@ async function handleAdminRoute(
       note: body.note,
     });
     if (!result.ok) {
-      return Response.json(result, { status: 400 });
+      return Response.json(result, { status: "busy" in result ? 409 : 400 });
     }
     return Response.json(result, { status: 201 });
   }
@@ -418,7 +414,7 @@ async function handleAdminRoute(
     });
     if (!result.ok) {
       return Response.json(result, {
-        status: result.error.includes("not found") ? 404 : 400,
+        status: "busy" in result ? 409 : result.error.includes("not found") ? 404 : 400,
       });
     }
     return Response.json(result);
@@ -470,6 +466,35 @@ async function handleAdminRoute(
     );
   }
 
+  // Blank-slate reset (Observatory-only, explicit confirmation required)
+  if (request.method === "POST" && url.pathname === "/api/admin/reset") {
+    const body = (await request.json().catch(() => ({}))) as {
+      confirm?: string;
+      createBackup?: boolean;
+      resetConfig?: boolean;
+      clearEvents?: boolean;
+      clearRequests?: boolean;
+      clearBugs?: boolean;
+    };
+    if (body.confirm !== "RESET") {
+      return Response.json(
+        { error: 'Confirmation required: pass confirm: "RESET"' },
+        { status: 400 },
+      );
+    }
+    const result = await observatoryStub(env).resetToBlankSlate({
+      createBackup: body.createBackup !== false,
+      resetConfig: body.resetConfig === true,
+      clearEvents: body.clearEvents !== false,
+      clearRequests: body.clearRequests !== false,
+      clearBugs: body.clearBugs !== false,
+    });
+    if (!result.ok) {
+      return Response.json(result, { status: "busy" in result ? 409 : 400 });
+    }
+    return Response.json(result);
+  }
+
   // Fast Forward simulation mode (Observatory-only)
   if (request.method === "GET" && url.pathname === "/api/admin/fast-forward") {
     const fastForward = await observatoryStub(env).getFastForwardState();
@@ -510,7 +535,7 @@ async function handleAdminRoute(
       createCheckpoint: body.createCheckpoint !== false,
     });
     if (!result.ok) {
-      return Response.json(result, { status: 400 });
+      return Response.json(result, { status: "busy" in result ? 409 : 400 });
     }
     return Response.json(result);
   }
@@ -795,6 +820,9 @@ async function handleAdminRoute(
       modelOverride?: string | null;
       toolGrants?: Record<string, boolean>;
       wakeIntervalMinutes?: number | null;
+      wakeOnDm?: boolean;
+      wakeOnMention?: boolean;
+      wakeOnSystemNotice?: boolean;
     };
     try {
       const updated = await env.AGENTS.getByName(name).updateConfigAsOwner(
@@ -966,7 +994,9 @@ async function handleAdminRoute(
       mode?: "inbox" | "browse";
     };
     const mode = body.mode === "inbox" ? "inbox" : "browse";
-    await env.AGENTS.getByName(name).wakeNow(name, mode);
+    if (!(await env.AGENTS.getByName(name).wakeNow(name, mode))) {
+      return Response.json({ error: "Resume the agent before waking it." }, { status: 409 });
+    }
     return Response.json({ ok: true, agent: name, mode });
   }
 

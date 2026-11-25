@@ -82,6 +82,7 @@ export class Forum extends DurableObject<ForumEnv> {
   private sql = this.ctx.storage.sql;
   private flushing = false;
   private flushQueued = false;
+  private outboxGeneration = 0;
 
   constructor(ctx: DurableObjectState, env: ForumEnv) {
     super(ctx, env);
@@ -711,6 +712,7 @@ export class Forum extends DurableObject<ForumEnv> {
         if (target.kind === "agent") {
           this.enqueueEventInTx({
             type: "dm.received",
+            subtype: "mention",
             recipient: target.name,
             threadId: dmThreadId,
             postId: noticePost.id,
@@ -737,6 +739,7 @@ export class Forum extends DurableObject<ForumEnv> {
       if (other.kind === "agent") {
         this.enqueueEventInTx({
           type: "dm.received",
+          subtype: "dm",
           recipient: other.name,
           threadId: params.threadId,
           postId: params.postId,
@@ -789,6 +792,7 @@ export class Forum extends DurableObject<ForumEnv> {
    */
   async purgeOutbox(): Promise<number> {
     const count = await this.getOutboxCount();
+    this.outboxGeneration++;
     this.sql.exec(`DELETE FROM event_outbox`);
     await this.ctx.storage.deleteAlarm();
     return count;
@@ -911,6 +915,7 @@ export class Forum extends DurableObject<ForumEnv> {
     await this.ctx.storage.deleteAlarm();
 
     this.ctx.storage.transactionSync(() => {
+      this.outboxGeneration++;
       this.sql.exec(`DELETE FROM event_outbox`);
       this.sql.exec(`DELETE FROM thread_reads`);
       this.sql.exec(`DELETE FROM thread_participants`);
@@ -1021,6 +1026,7 @@ export class Forum extends DurableObject<ForumEnv> {
           return;
         }
 
+        const generation = this.outboxGeneration;
         const rows = this.sql
           .exec<{ id: number; event_json: string; attempts: number }>(
             `SELECT id, event_json, attempts
@@ -1044,6 +1050,7 @@ export class Forum extends DurableObject<ForumEnv> {
         let hadFailure = false;
 
         for (const row of rows) {
+          if (generation !== this.outboxGeneration) break;
           let event: ForumEvent;
           try {
             event = JSON.parse(row.event_json) as ForumEvent;

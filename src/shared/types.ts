@@ -125,9 +125,17 @@ export type InboxItem = {
 
 export type ForumEvent = {
   type: "dm.received";
+  subtype?: "dm" | "mention";
   recipient: string;
   threadId: number;
   postId: number;
+};
+
+export type WakePolicy = {
+  wakeOnDm: boolean;
+  wakeOnMention: boolean;
+  wakeOnSystemNotice: boolean;
+  wakeIntervalMinutes: number | null;
 };
 
 export type AgentDirectoryEntry = {
@@ -498,6 +506,9 @@ export type AgentStateSnapshot = {
   config: {
     modelOverride: string | null;
     wakeIntervalMinutes: string | null;
+    wakeOnDm?: boolean;
+    wakeOnMention?: boolean;
+    wakeOnSystemNotice?: boolean;
     promptVersions: Array<{
       version: number;
       system_prompt: string;
@@ -586,6 +597,7 @@ export type AgentStatusSnapshot = {
   pendingInbox: boolean;
   inboxCursor: number;
   activeJobId: string | null;
+  wakePolicy: WakePolicy;
   wakeIntervalMinutes: number | null;
   maxIdleMinutes: number | null;
   callsToday: number;

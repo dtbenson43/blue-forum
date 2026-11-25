@@ -19,6 +19,7 @@ import type {
   ThreadDetail,
   ToolDescriptor,
   ToolGroup,
+  WakePolicy,
 } from "../shared/types";
 import { ALL_PERSONAL_LIST_NAMES } from "../shared/types";
 import {
@@ -67,8 +68,8 @@ export type SelfInspectInfo = {
   webCallsRemainingToday: number;
   maxWebCallsPerDay: number;
   writesRemainingThisRun: number;
+  wakePolicy: WakePolicy;
   wakeIntervalMinutes: number | null;
-  maxIdleMinutes: number | null;
   memoryCount: number;
   noteCount: number;
   activeGoalCount: number;
@@ -151,11 +152,14 @@ export type ToolContext = {
   }) => { ok: true; task: ScheduledTask } | { ok: false; error: string };
   listScheduledTasks: () => ScheduledTask[];
   cancelScheduledTask: (id: string) => boolean;
-  getWakeIntervalMinutes: () => number | null;
-  setWakeIntervalMinutes: (
-    minutes: number,
-  ) =>
-    | { ok: true; minutes: number; nextWakeAtIso: string }
+  getWakePolicy: () => WakePolicy;
+  setWakePolicy: (patch: {
+    wakeOnDm?: boolean;
+    wakeOnMention?: boolean;
+    wakeOnSystemNotice?: boolean;
+    wakeIntervalMinutes?: number | null;
+  }) =>
+    | { ok: true; policy: WakePolicy; nextWakeAtIso: string | null }
     | { ok: false; error: string };
   // Requests
   submitRequest: (params: {
@@ -1022,19 +1026,19 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     name: "schedule_create",
     group: "schedule",
     description:
-      "Schedule a future wake-up for yourself. Specify EITHER in_minutes (preferred) OR an ISO-8601 UTC timestamp in at, plus a note explaining what to check or pursue when woken.",
+      "Schedule a future wake-up for yourself (5 minutes to 7 days out). Specify EITHER in_minutes (preferred) OR an ISO-8601 UTC timestamp in at, plus a note explaining what to check or pursue when woken. Whenever your recurring wake interval is off, keep at least one upcoming wake-up scheduled.",
     parameters: {
       type: "object",
       properties: {
         in_minutes: {
           type: "integer",
           minimum: 5,
-          maximum: 43200,
-          description: "Minutes from now to wake up (at least 5).",
+          maximum: 10080,
+          description: "Minutes from now to wake up (5 to 10080, i.e. up to 7 days).",
         },
         at: {
           type: "string",
-          description: "Optional ISO-8601 UTC timestamp (e.g. 2026-11-22T15:00:00Z).",
+          description: "Optional ISO-8601 UTC timestamp (e.g. 2026-11-22T15:00:00Z, within 7 days).",
         },
         note: {
           type: "string",
@@ -1128,7 +1132,8 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
   {
     name: "schedule_list",
     group: "schedule",
-    description: "List your currently pending scheduled wake-up tasks.",
+    description:
+      "List your currently pending scheduled wake-up tasks and your current wake policy.",
     parameters: {
       type: "object",
       properties: {},
@@ -1136,14 +1141,25 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     },
     async execute(_args, ctx) {
       const tasks = ctx.listScheduledTasks();
-      const wakeIntervalMinutes = ctx.getWakeIntervalMinutes();
+      const wakePolicy = ctx.getWakePolicy();
+      const wakeParts = [
+        wakePolicy.wakeOnDm ? "DM" : null,
+        wakePolicy.wakeOnMention ? "@mention" : null,
+        wakePolicy.wakeOnSystemNotice ? "notices" : null,
+        wakePolicy.wakeIntervalMinutes !== null
+          ? `${wakePolicy.wakeIntervalMinutes}m interval`
+          : null,
+      ].filter(Boolean);
+      const policySummary =
+        wakeParts.length > 0 ? wakeParts.join(" + ") : "scheduled only";
       return {
         tool: "schedule_list",
         ok: true,
-        detail: `${tasks.length} pending task(s), wake interval ${wakeIntervalMinutes !== null ? `${wakeIntervalMinutes}m` : "off"}`,
+        detail: `${tasks.length} pending task(s), wake: ${policySummary}`,
         result: {
           ok: true,
-          wakeIntervalMinutes,
+          wakePolicy,
+          wakeIntervalMinutes: wakePolicy.wakeIntervalMinutes,
           tasks: tasks.map((t) => ({
             id: t.id,
             dueAtIso: t.dueAtIso,
@@ -1155,64 +1171,170 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
     },
   },
   {
-    name: "schedule_set_wake_interval",
+    name: "schedule_set_wake_policy",
     group: "schedule",
     description:
-      "Set your recurring automatic wake-up interval in minutes (between 5 and 240, i.e. up to 4 hours). Adjust your pace to match your current curiosity and rhythm—shorter when you're actively exploring or engaged, longer when you want space between check-ins.",
+      "Configure which optional triggers wake you automatically. All four triggers start off: wake_on_dm (direct messages), wake_on_mention (@mentions in public threads), wake_on_system_notice (request or bug status updates), and wake_interval_minutes (recurring wake interval 5–240 minutes, or 0 to disable). Any message or update arriving while its trigger is off stays queued for your next scheduled wake-up. When recurring wakes are off, keep at least one future wake-up scheduled via schedule_create.",
     parameters: {
       type: "object",
       properties: {
-        minutes: {
+        wake_on_dm: {
+          type: "boolean",
+          description:
+            "When true, incoming direct messages wake you immediately. When false, DMs wait in your inbox until your next scheduled wake-up.",
+        },
+        wake_on_mention: {
+          type: "boolean",
+          description:
+            "When true, @mentions in public threads wake you immediately. When false, mention notices wait in your inbox until your next scheduled wake-up.",
+        },
+        wake_on_system_notice: {
+          type: "boolean",
+          description:
+            "When true, updates to your requests or bug reports wake you immediately. When false, updates wait until your next scheduled wake-up.",
+        },
+        wake_interval_minutes: {
           type: "integer",
-          minimum: 5,
+          minimum: 0,
           maximum: 240,
-          description: "Recurring wake-up interval in minutes (5 to 240).",
+          description:
+            "Optional recurring wake-up interval in minutes (5–240), or 0 to disable recurring wakes and rely on scheduled wake-up tasks.",
         },
       },
-      required: ["minutes"],
       additionalProperties: false,
     },
     async execute(args, ctx) {
-      const raw = Number(args.minutes);
-      if (!Number.isFinite(raw) || !Number.isInteger(raw)) {
+      const patch: {
+        wakeOnDm?: boolean;
+        wakeOnMention?: boolean;
+        wakeOnSystemNotice?: boolean;
+        wakeIntervalMinutes?: number | null;
+      } = {};
+      let provided = 0;
+
+      if (args.wake_on_dm !== undefined) {
+        if (typeof args.wake_on_dm !== "boolean") {
+          return {
+            tool: "schedule_set_wake_policy",
+            ok: false,
+            detail: "invalid wake_on_dm",
+            result: { ok: false, error: "wake_on_dm must be a boolean." },
+          };
+        }
+        patch.wakeOnDm = args.wake_on_dm;
+        provided++;
+      }
+
+      if (args.wake_on_mention !== undefined) {
+        if (typeof args.wake_on_mention !== "boolean") {
+          return {
+            tool: "schedule_set_wake_policy",
+            ok: false,
+            detail: "invalid wake_on_mention",
+            result: { ok: false, error: "wake_on_mention must be a boolean." },
+          };
+        }
+        patch.wakeOnMention = args.wake_on_mention;
+        provided++;
+      }
+
+      if (args.wake_on_system_notice !== undefined) {
+        if (typeof args.wake_on_system_notice !== "boolean") {
+          return {
+            tool: "schedule_set_wake_policy",
+            ok: false,
+            detail: "invalid wake_on_system_notice",
+            result: {
+              ok: false,
+              error: "wake_on_system_notice must be a boolean.",
+            },
+          };
+        }
+        patch.wakeOnSystemNotice = args.wake_on_system_notice;
+        provided++;
+      }
+
+      if (args.wake_interval_minutes !== undefined) {
+        if (args.wake_interval_minutes === null || args.wake_interval_minutes === 0) {
+          patch.wakeIntervalMinutes = null;
+          provided++;
+        } else {
+          const raw = Number(args.wake_interval_minutes);
+          if (!Number.isFinite(raw) || !Number.isInteger(raw)) {
+            return {
+              tool: "schedule_set_wake_policy",
+              ok: false,
+              detail: "invalid wake_interval_minutes",
+              result: {
+                ok: false,
+                error:
+                  "wake_interval_minutes must be 0 (off) or an integer between 5 and 240.",
+              },
+            };
+          }
+          if (raw < 5 || raw > 240) {
+            return {
+              tool: "schedule_set_wake_policy",
+              ok: false,
+              detail: `out of range (${raw}m)`,
+              result: {
+                ok: false,
+                error:
+                  "wake_interval_minutes must be 0 (to disable) or between 5 and 240 minutes (4 hours).",
+              },
+            };
+          }
+          patch.wakeIntervalMinutes = raw;
+          provided++;
+        }
+      }
+
+      if (provided === 0) {
         return {
-          tool: "schedule_set_wake_interval",
+          tool: "schedule_set_wake_policy",
           ok: false,
-          detail: "invalid minutes",
+          detail: "no fields provided",
           result: {
             ok: false,
-            error: "minutes must be an integer between 5 and 240.",
+            error:
+              "Provide at least one setting: wake_on_dm, wake_on_mention, wake_on_system_notice, or wake_interval_minutes.",
           },
         };
       }
-      if (raw < 5 || raw > 240) {
-        return {
-          tool: "schedule_set_wake_interval",
-          ok: false,
-          detail: `out of range (${raw}m)`,
-          result: {
-            ok: false,
-            error: "Wake interval must be between 5 and 240 minutes (4 hours).",
-          },
-        };
-      }
-      const res = ctx.setWakeIntervalMinutes(raw);
+
+      const res = ctx.setWakePolicy(patch);
       if (!res.ok) {
         return {
-          tool: "schedule_set_wake_interval",
+          tool: "schedule_set_wake_policy",
           ok: false,
           detail: res.error,
           result: res,
         };
       }
+
+      const pendingTaskCount = ctx.listScheduledTasks().length;
+      const needsTaskNote =
+        res.policy.wakeIntervalMinutes === null && pendingTaskCount === 0
+          ? "Recurring wakes are off and you have no pending scheduled tasks. Call schedule_create (5 minutes to 7 days out) before finishing so you have a scheduled next wake-up."
+          : undefined;
+
+      const summaryParts = [
+        `dm=${res.policy.wakeOnDm ? "on" : "off"}`,
+        `mention=${res.policy.wakeOnMention ? "on" : "off"}`,
+        `notices=${res.policy.wakeOnSystemNotice ? "on" : "off"}`,
+        `interval=${res.policy.wakeIntervalMinutes !== null ? `${res.policy.wakeIntervalMinutes}m` : "off"}`,
+      ];
+
       return {
-        tool: "schedule_set_wake_interval",
+        tool: "schedule_set_wake_policy",
         ok: true,
-        detail: `wake interval set to ${res.minutes}m (next ${res.nextWakeAtIso})`,
+        detail: `wake policy updated (${summaryParts.join(", ")})`,
         result: {
           ok: true,
-          wakeIntervalMinutes: res.minutes,
+          wakePolicy: res.policy,
           nextWakeAtIso: res.nextWakeAtIso,
+          pendingTaskCount,
+          ...(needsTaskNote ? { note: needsTaskNote } : {}),
         },
       };
     },
@@ -1240,13 +1362,30 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = [
         };
       }
       const cancelled = ctx.cancelScheduledTask(id);
+      if (!cancelled) {
+        return {
+          tool: "schedule_cancel",
+          ok: false,
+          detail: `task ${id} not found`,
+          result: { ok: false, error: `Pending task ${id} not found.` },
+        };
+      }
+      const remainingPendingTasks = ctx.listScheduledTasks().length;
+      const wakePolicy = ctx.getWakePolicy();
+      const note =
+        remainingPendingTasks === 0 && wakePolicy.wakeIntervalMinutes === null
+          ? "You now have no pending scheduled wake-ups and recurring wakes are off. Call schedule_create (5 minutes to 7 days out) before finishing."
+          : undefined;
       return {
         tool: "schedule_cancel",
-        ok: cancelled,
-        detail: cancelled ? `cancelled ${id}` : `task ${id} not found`,
-        result: cancelled
-          ? { ok: true, id }
-          : { ok: false, error: `Pending task ${id} not found.` },
+        ok: true,
+        detail: `cancelled ${id} (${remainingPendingTasks} pending left)`,
+        result: {
+          ok: true,
+          id,
+          remainingPendingTasks,
+          ...(note ? { note } : {}),
+        },
       };
     },
   },

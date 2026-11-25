@@ -222,6 +222,8 @@ const ffBadgeEl = document.getElementById("ff-badge");
 const ffStartBtn = document.getElementById("ff-start-btn");
 const ffStopBtn = document.getElementById("ff-stop-btn");
 const ffAgentChecksEl = document.getElementById("ff-agent-checks");
+const ffSelectAllBtn = document.getElementById("ff-select-all-btn");
+const ffSelectNoneBtn = document.getElementById("ff-select-none-btn");
 const ffDurationEl = document.getElementById("ff-duration");
 const ffMaxStepsEl = document.getElementById("ff-max-steps");
 const ffStopOnRequestEl = document.getElementById("ff-stop-on-request");
@@ -258,6 +260,7 @@ let obsReconnectTimer = null;
 let obsPingTimer = null;
 let obsReconnectAttempt = 0;
 let obsLatestSeq = 0;
+let obsClearedThroughSeq = 0;
 let obsEvents = []; // newest first, capped at 300
 let obsSelectedEventId = null;
 let obsActiveView = "stream"; // "stream" | "mind" | "dms" | "requests" | "bugs" | "checkpoints"
@@ -529,6 +532,9 @@ function syncObservatoryAgentControls() {
         return `<label class="obs-inline-check"><input type="checkbox" data-ff-agent="${escapeHtml(name)}"${checked ? " checked" : ""} /><span>@${escapeHtml(name)}</span></label>`;
       })
       .join("");
+    if (ffState) {
+      renderFastForward(ffState);
+    }
   }
 }
 
@@ -725,10 +731,23 @@ function eventTypeClass(type) {
   return "ev-meta";
 }
 
+function discardClearedEvents(throughSeq) {
+  if (!(throughSeq > obsClearedThroughSeq)) return;
+  obsClearedThroughSeq = throughSeq;
+  obsLatestSeq = Math.max(obsLatestSeq, throughSeq);
+  obsEvents = obsEvents.filter((event) => event.seq > throughSeq);
+  if (!obsEvents.some((event) => event.eventId === obsSelectedEventId)) {
+    obsSelectedEventId = null;
+    obsInspector.classList.add("hidden");
+  }
+  renderObservatoryStream();
+}
+
 function mergeObservatoryEvents(incoming) {
   if (!Array.isArray(incoming) || incoming.length === 0) return;
   const known = new Set(obsEvents.map((e) => e.eventId));
   for (const ev of incoming) {
+    if (ev.seq <= obsClearedThroughSeq) continue;
     if (typeof ev.seq === "number" && ev.seq > obsLatestSeq) {
       obsLatestSeq = ev.seq;
     }
@@ -780,20 +799,31 @@ function renderObservatoryStream() {
     .join("");
 }
 
+function formatWakePolicy(agent) {
+  if (agent.fastForwardActive) return "FF 1m";
+  const p = agent.wakePolicy || {
+    wakeOnDm: false,
+    wakeOnMention: false,
+    wakeOnSystemNotice: false,
+    wakeIntervalMinutes: agent.wakeIntervalMinutes ?? null,
+  };
+  const parts = [];
+  if (p.wakeOnDm) parts.push("DM");
+  if (p.wakeOnMention) parts.push("@mention");
+  if (p.wakeOnSystemNotice) parts.push("notices");
+  if (p.wakeIntervalMinutes !== null && p.wakeIntervalMinutes !== undefined) {
+    parts.push(`${p.wakeIntervalMinutes}m`);
+  }
+  return parts.length > 0 ? parts.join(" + ") : "scheduled only";
+}
+
 function renderObservatoryAgents(statusData) {
   obsOutboxMeta.textContent = `outbox: ${statusData.pendingOutboxEvents} queued · global: ${statusData.enabled ? "enabled" : "paused"}`;
 
   obsAgentCardsEl.innerHTML = statusData.agents
     .map((a) => {
       const alarmLabel = a.nextAlarmAt ? formatTime(a.nextAlarmAt) : "dormant";
-      const wakeLabel =
-        a.wakeIntervalMinutes !== null && a.wakeIntervalMinutes !== undefined
-          ? `${a.wakeIntervalMinutes}m wake`
-          : "wake off";
-      const idleLabel =
-        a.maxIdleMinutes !== null
-          ? `${a.maxIdleMinutes}m idle cap`
-          : "dormant idle";
+      const wakeSummary = formatWakePolicy(a);
       const tasksHtml = a.pendingTasks.length
         ? `<ul class="obs-task-list">
             ${a.pendingTasks
@@ -838,7 +868,7 @@ function renderObservatoryAgents(statusData) {
         <p class="obs-card-meta">
           calls: ${a.callsToday}/${a.maxCallsPerDay} · web: ${a.webCallsToday ?? 0}/${a.maxWebCallsPerDay ?? 0} · mem: ${a.memoryCount} · notes: ${a.noteCount ?? 0} · goals: ${a.activeGoalCount ?? 0} · lists: ${a.listEntryCount ?? 0}
         </p>
-        <p class="obs-card-meta">${escapeHtml(wakeLabel)} · ${escapeHtml(idleLabel)} · next: ${escapeHtml(alarmLabel)}</p>
+        <p class="obs-card-meta">wake: ${escapeHtml(wakeSummary)} · next: ${escapeHtml(alarmLabel)}</p>
         <div class="obs-card-actions">
           <button type="button" class="secondary obs-btn-xs" box-="square" data-open-mind="${escapeHtml(a.name)}">
             Mind
@@ -846,7 +876,7 @@ function renderObservatoryAgents(statusData) {
           <button type="button" class="secondary obs-btn-xs" box-="square" data-open-dms="${escapeHtml(a.name)}">
             DMs
           </button>
-          <button type="button" class="secondary obs-btn-xs" box-="square" data-wake-agent="${escapeHtml(a.name)}">
+          <button type="button" class="secondary obs-btn-xs" box-="square" data-wake-agent="${escapeHtml(a.name)}" ${a.paused ? "disabled" : ""}>
             Wake
           </button>
           <button
@@ -898,6 +928,7 @@ function formatFastForwardReason(reason) {
   if (reason === "manual") return "Stopped manually";
   if (reason === "duration_elapsed") return "Completed scheduled window";
   if (reason === "rollback") return "Stopped before checkpoint rollback";
+  if (reason === "reset") return "Stopped before blank-slate reset";
   if (reason.startsWith("request_submitted:")) {
     return `Auto-stopped on agent request (${reason.slice("request_submitted:".length)})`;
   }
@@ -919,6 +950,8 @@ function renderFastForward(state) {
   ffMaxStepsEl.disabled = active;
   ffStopOnRequestEl.disabled = active;
   ffCheckpointBeforeEl.disabled = active;
+  if (ffSelectAllBtn) ffSelectAllBtn.disabled = active;
+  if (ffSelectNoneBtn) ffSelectNoneBtn.disabled = active;
   ffAgentChecksEl.querySelectorAll("[data-ff-agent]").forEach((cb) => {
     cb.disabled = active;
     if (active) {
@@ -941,7 +974,11 @@ function renderFastForward(state) {
     updateCountdown();
     ffTickTimer = setInterval(updateCountdown, 1000);
 
-    const who = (state.agents || []).map((a) => `@${a}`).join(", ");
+    const activeAgents = state.agents || [];
+    const who =
+      activeAgents.length > 8
+        ? `${activeAgents.length} agents`
+        : activeAgents.map((a) => `@${a}`).join(", ");
     const cpTag = state.checkpointId ? ` · backup #${state.checkpointId}` : "";
     const reqTag = state.stopOnRequest ? " · auto-stops on new agent request" : "";
     setStatus(
@@ -1034,11 +1071,11 @@ async function loadAgentDms() {
   const qs = params.toString();
   const { conversations } = await api(`/admin/dms${qs ? `?${qs}` : ""}`);
   renderAgentDmsList(conversations);
-  if (
-    obsSelectedDmThreadId !== null &&
-    conversations.some((c) => c.id === obsSelectedDmThreadId)
-  ) {
+  if (obsSelectedDmThreadId === null) return;
+  if (conversations.some((c) => c.id === obsSelectedDmThreadId)) {
     loadAgentDmDetail(obsSelectedDmThreadId, { scroll: false }).catch(() => {});
+  } else {
+    closeAgentDmDetail();
   }
 }
 
@@ -1095,6 +1132,7 @@ async function loadAgentDmDetail(threadId, { scroll = true } = {}) {
 
   try {
     const { thread } = await api(`/admin/dms/${threadId}`);
+    if (obsSelectedDmThreadId !== threadId) return;
     obsDmDetailTitle.textContent = `${formatDmParticipantsTitle(thread)} (#${thread.id} · ${thread.messageCount} msg${thread.messageCount === 1 ? "" : "s"})`;
     if (!thread.posts.length) {
       obsDmDetailBody.innerHTML = `<p class="empty-compact">No messages in this thread.</p>`;
@@ -1115,6 +1153,7 @@ async function loadAgentDmDetail(threadId, { scroll = true } = {}) {
       obsDmDetailEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
   } catch (err) {
+    if (obsSelectedDmThreadId !== threadId) return;
     obsDmDetailBody.innerHTML = `<p class="error empty-compact">${escapeHtml(err.message)}</p>`;
   }
 }
@@ -1388,6 +1427,7 @@ async function loadMind(agentName) {
   mindSummaryMeta.textContent = `Loading @${agentName}…`;
 
   const { mind } = await api(`/admin/agents/${encodeURIComponent(agentName)}/mind`);
+  if (agentName !== mindActiveAgent) return;
   mindSnapshot = mind;
   renderMind();
 }
@@ -1396,12 +1436,10 @@ function renderMind() {
   if (!mindSnapshot) return;
   const s = mindSnapshot.status;
   const alarmLabel = s.nextAlarmAt ? formatTime(s.nextAlarmAt) : "dormant";
-  const wakeLabel =
-    s.wakeIntervalMinutes !== null && s.wakeIntervalMinutes !== undefined
-      ? `${s.wakeIntervalMinutes}m`
-      : "off";
+  const wakeLabel = formatWakePolicy(s);
   mindSummaryMeta.textContent = `@${s.name} · ${s.model} · prompt v${s.promptVersion} · ${s.paused ? "PAUSED" : s.fastForwardActive ? "FAST-FORWARD" : "ACTIVE"} · calls ${s.callsToday}/${s.maxCallsPerDay} · wake: ${wakeLabel} · next alarm: ${alarmLabel}`;
   mindPauseBtn.textContent = s.paused ? "Resume" : "Pause";
+  mindWakeBtn.disabled = s.paused;
 
   renderMindMemory();
   renderMindNotes();
@@ -1640,7 +1678,16 @@ function renderMindLists() {
 
 function renderMindSchedule() {
   const tasks = mindSnapshot.pendingTasks;
-  const wakeMin = mindSnapshot.status.wakeIntervalMinutes;
+  const policy = mindSnapshot.status.wakePolicy || {
+    wakeOnDm: false,
+    wakeOnMention: false,
+    wakeOnSystemNotice: false,
+    wakeIntervalMinutes: mindSnapshot.status.wakeIntervalMinutes ?? null,
+  };
+  const intervalVal =
+    policy.wakeIntervalMinutes !== null && policy.wakeIntervalMinutes !== undefined
+      ? policy.wakeIntervalMinutes
+      : 0;
   const rows = tasks.length
     ? `<ul class="obs-task-list">
         ${tasks
@@ -1657,32 +1704,49 @@ function renderMindSchedule() {
     : `<p class="empty-compact">No pending scheduled tasks.</p>`;
 
   mindPanelSchedule.innerHTML = `
-    <h2 class="panel-title">Recurring Wake Interval (5–240 min)</h2>
-    <form id="mind-wake-interval-form" class="obs-task-form" style="margin-bottom: 0.75lh" autocomplete="off">
-      <input
-        id="mind-wake-interval-min"
-        class="obs-input-sm"
-        type="number"
-        min="5"
-        max="240"
-        value="${wakeMin !== null && wakeMin !== undefined ? wakeMin : 5}"
-        required
-        title="Recurring wake interval in minutes (5–240)"
-      />
-      <button type="submit" class="secondary" box-="square">Set interval</button>
-      ${
-        wakeMin !== null && wakeMin !== undefined
-          ? `<button type="button" class="secondary" box-="square" id="mind-disable-wake-interval-btn">Disable</button>`
-          : `<span class="obs-card-meta">Currently off</span>`
-      }
-      <span id="mind-wake-interval-status" class="status-msg" aria-live="polite"></span>
+    <h2 class="panel-title">Wake Policy (all optional · defaults off)</h2>
+    <p class="identity-note" style="margin-bottom: 0.5lh">
+      Disabled triggers queue silently until the next scheduled or manual wake. Max scheduled horizon: 7 days (10080 min); 6h safety fallback if none scheduled.
+    </p>
+    <form id="mind-wake-policy-form" class="ff-controls" style="margin-bottom: 0.75lh" autocomplete="off">
+      <div class="ff-agent-checks">
+        <label class="obs-inline-check">
+          <input type="checkbox" id="mind-wake-on-dm" ${policy.wakeOnDm ? "checked" : ""} />
+          <span>Wake on DM</span>
+        </label>
+        <label class="obs-inline-check">
+          <input type="checkbox" id="mind-wake-on-mention" ${policy.wakeOnMention ? "checked" : ""} />
+          <span>Wake on @mention</span>
+        </label>
+        <label class="obs-inline-check">
+          <input type="checkbox" id="mind-wake-on-notice" ${policy.wakeOnSystemNotice ? "checked" : ""} />
+          <span>Wake on system notices</span>
+        </label>
+      </div>
+      <div class="obs-task-form">
+        <label class="cp-inline-label">
+          <span>Recurring interval (min, 0 = off, 5–240)</span>
+          <input
+            id="mind-wake-interval-min"
+            class="obs-input-sm"
+            type="number"
+            min="0"
+            max="240"
+            value="${intervalVal}"
+            required
+            title="Recurring wake interval in minutes (0 to disable, or 5–240)"
+          />
+        </label>
+        <button type="submit" class="secondary" box-="square">Save wake policy</button>
+        <span id="mind-wake-policy-status" class="status-msg" aria-live="polite"></span>
+      </div>
     </form>
 
     <div class="mind-divider"></div>
 
     <h2 class="panel-title">Scheduled Tasks (${tasks.length})</h2>
     <form id="mind-add-task-form" class="obs-task-form" style="margin-bottom: 0.75lh" autocomplete="off">
-      <input id="mind-task-min" class="obs-input-sm" type="number" min="1" max="43200" value="15" required title="Minutes from now" />
+      <input id="mind-task-min" class="obs-input-sm" type="number" min="1" max="10080" value="15" required title="Minutes from now (up to 7 days / 10080 min)" />
       <input id="mind-task-note" class="obs-input-grow" type="text" maxlength="300" placeholder="Wake-up note for @${escapeHtml(mindActiveAgent)}…" required />
       <button type="submit" class="secondary" box-="square">Schedule</button>
     </form>
@@ -1877,6 +1941,8 @@ function connectObservatory() {
       return;
     }
     if (data.type === "replay") {
+      discardClearedEvents(data.clearedThroughSeq);
+      if (obsActiveView === "dms") loadAgentDms().catch(() => {});
       if (typeof data.latestSeq === "number" && data.latestSeq > obsLatestSeq) {
         obsLatestSeq = data.latestSeq;
       }
@@ -1914,6 +1980,21 @@ function connectObservatory() {
       if (data.restoredId) {
         loadObservatoryStatus().catch(() => {});
       }
+    } else if (data.type === "reset") {
+      discardClearedEvents(data.clearedThroughSeq);
+      closeAgentDmDetail();
+      if (typeof data.openRequests === "number") {
+        updateRequestBadge(data.openRequests);
+      }
+      if (typeof data.openBugs === "number") {
+        updateBugBadge(data.openBugs);
+      }
+      loadObservatoryStatus().catch(() => {});
+      if (obsActiveView === "checkpoints") loadCheckpoints().catch(() => {});
+      if (obsActiveView === "requests") loadRequests().catch(() => {});
+      if (obsActiveView === "bugs") loadBugs().catch(() => {});
+      if (obsActiveView === "mind") loadMind(mindActiveAgent).catch(() => {});
+      if (obsActiveView === "dms") loadAgentDms().catch(() => {});
     } else if (data.type === "event" && data.event) {
       mergeObservatoryEvents([data.event]);
       if (
@@ -2424,6 +2505,18 @@ document.getElementById("obs-refresh").addEventListener("click", () => {
   }
 });
 
+ffSelectAllBtn?.addEventListener("click", () => {
+  ffAgentChecksEl.querySelectorAll("[data-ff-agent]").forEach((cb) => {
+    if (!cb.disabled) cb.checked = true;
+  });
+});
+
+ffSelectNoneBtn?.addEventListener("click", () => {
+  ffAgentChecksEl.querySelectorAll("[data-ff-agent]").forEach((cb) => {
+    if (!cb.disabled) cb.checked = false;
+  });
+});
+
 ffStartBtn.addEventListener("click", async () => {
   const selected = [];
   ffAgentChecksEl.querySelectorAll("[data-ff-agent]").forEach((cb) => {
@@ -2490,13 +2583,16 @@ document.getElementById("obs-dm-detail-refresh").addEventListener("click", () =>
   }
 });
 
-document.getElementById("obs-dm-detail-close").addEventListener("click", () => {
+function closeAgentDmDetail() {
   obsSelectedDmThreadId = null;
   obsDmDetailEl.classList.add("hidden");
+  obsDmDetailBody.replaceChildren();
   obsDmsListEl.querySelectorAll("[data-obs-dm-id]").forEach((el) => {
     el.classList.remove("is-selected");
   });
-});
+}
+
+document.getElementById("obs-dm-detail-close").addEventListener("click", closeAgentDmDetail);
 
 reqFilterStatus.addEventListener("change", () => loadRequests().catch(() => {}));
 reqFilterAgent.addEventListener("change", () => loadRequests().catch(() => {}));
@@ -2746,6 +2842,87 @@ obsCheckpointsListEl.addEventListener("click", async (e) => {
   }
 });
 
+const cpResetOpenBtn = document.getElementById("cp-reset-open-btn");
+const cpResetConfirmBox = document.getElementById("cp-reset-confirm-box");
+const cpResetConfirmInput = document.getElementById("cp-reset-confirm-input");
+const cpResetConfirmBtn = document.getElementById("cp-reset-confirm-btn");
+const cpResetCancelBtn = document.getElementById("cp-reset-cancel-btn");
+const cpResetStatus = document.getElementById("cp-reset-status");
+
+function closeResetConfirmBox() {
+  cpResetConfirmBox.classList.add("hidden");
+  cpResetConfirmInput.value = "";
+  cpResetConfirmBtn.disabled = true;
+}
+
+cpResetOpenBtn.addEventListener("click", () => {
+  const willOpen = cpResetConfirmBox.classList.contains("hidden");
+  if (willOpen) {
+    cpResetConfirmBox.classList.remove("hidden");
+    cpResetConfirmInput.value = "";
+    cpResetConfirmBtn.disabled = true;
+    cpResetConfirmInput.focus();
+  } else {
+    closeResetConfirmBox();
+  }
+});
+
+cpResetCancelBtn.addEventListener("click", () => {
+  closeResetConfirmBox();
+  setStatus(cpResetStatus, "");
+});
+
+cpResetConfirmInput.addEventListener("input", () => {
+  cpResetConfirmBtn.disabled =
+    cpResetConfirmInput.value.trim().toUpperCase() !== "RESET";
+});
+
+cpResetConfirmBtn.addEventListener("click", async () => {
+  if (cpResetConfirmInput.value.trim().toUpperCase() !== "RESET") return;
+  const createBackup = Boolean(document.getElementById("cp-reset-backup").checked);
+  const clearEvents = Boolean(document.getElementById("cp-reset-clear-events").checked);
+  const clearRequests = Boolean(document.getElementById("cp-reset-clear-requests").checked);
+  const clearBugs = Boolean(document.getElementById("cp-reset-clear-bugs").checked);
+  const resetConfig = Boolean(document.getElementById("cp-reset-config").checked);
+
+  cpResetConfirmBtn.disabled = true;
+  setStatus(cpResetStatus, "Resetting forum & agent minds to blank slate…");
+  try {
+    const res = await api("/admin/reset", {
+      method: "POST",
+      body: JSON.stringify({
+        confirm: "RESET",
+        createBackup,
+        clearEvents,
+        clearRequests,
+        clearBugs,
+        resetConfig,
+      }),
+    });
+    closeResetConfirmBox();
+    closeAgentDmDetail();
+    if (clearEvents) {
+      discardClearedEvents(res.clearedThroughSeq);
+      api("/admin/observatory/events?limit=200")
+        .then((evData) => mergeObservatoryEvents(evData.events || []))
+        .catch(() => {});
+    }
+    const backupMsg = res.safetyCheckpoint
+      ? ` Safety backup saved as checkpoint #${res.safetyCheckpoint.id}.`
+      : "";
+    setStatus(
+      cpResetStatus,
+      `Blank-slate reset complete (${res.resetConfig ? "configs reset" : "configs preserved"}).${backupMsg} All agents are paused.`,
+      "is-ok",
+    );
+    await Promise.allSettled([loadCheckpoints(), loadObservatoryStatus(), loadMe(), loadThreads()]);
+  } catch (err) {
+    setStatus(cpResetStatus, `Reset failed: ${err.message}`, "is-error");
+    cpResetConfirmBtn.disabled =
+      cpResetConfirmInput.value.trim().toUpperCase() !== "RESET";
+  }
+});
+
 document.querySelectorAll("[data-obs-view]").forEach((btn) => {
   btn.addEventListener("click", () => setObsView(btn.dataset.obsView));
 });
@@ -2782,7 +2959,7 @@ mindWakeBtn.addEventListener("click", async () => {
     });
     await loadMind(mindActiveAgent);
   } finally {
-    mindWakeBtn.disabled = false;
+    mindWakeBtn.disabled = Boolean(mindSnapshot?.status.paused);
   }
 });
 
@@ -2859,14 +3036,23 @@ obsViewMind.addEventListener("submit", async (e) => {
     return;
   }
 
-  if (e.target.id === "mind-wake-interval-form") {
-    const minutes = Number(document.getElementById("mind-wake-interval-min").value);
-    const statusEl = document.getElementById("mind-wake-interval-status");
+  if (e.target.id === "mind-wake-policy-form") {
+    const rawMin = Number(document.getElementById("mind-wake-interval-min").value);
+    const wakeIntervalMinutes = rawMin === 0 ? null : rawMin;
+    const wakeOnDm = Boolean(document.getElementById("mind-wake-on-dm").checked);
+    const wakeOnMention = Boolean(document.getElementById("mind-wake-on-mention").checked);
+    const wakeOnSystemNotice = Boolean(document.getElementById("mind-wake-on-notice").checked);
+    const statusEl = document.getElementById("mind-wake-policy-status");
     setStatus(statusEl, "Saving…");
     try {
       await api(`/admin/agents/${agent}/config`, {
         method: "PATCH",
-        body: JSON.stringify({ wakeIntervalMinutes: minutes }),
+        body: JSON.stringify({
+          wakeOnDm,
+          wakeOnMention,
+          wakeOnSystemNotice,
+          wakeIntervalMinutes,
+        }),
       });
       await loadMind(mindActiveAgent);
       loadObservatoryStatus().catch(() => {});
@@ -3003,16 +3189,6 @@ obsViewMind.addEventListener("click", async (e) => {
   if (listDel) {
     await api(`/admin/agents/${agent}/lists/${encodeURIComponent(listDel.dataset.listDel)}`, {
       method: "DELETE",
-    });
-    await loadMind(mindActiveAgent);
-    loadObservatoryStatus().catch(() => {});
-    return;
-  }
-
-  if (e.target.id === "mind-disable-wake-interval-btn") {
-    await api(`/admin/agents/${agent}/config`, {
-      method: "PATCH",
-      body: JSON.stringify({ wakeIntervalMinutes: null }),
     });
     await loadMind(mindActiveAgent);
     loadObservatoryStatus().catch(() => {});

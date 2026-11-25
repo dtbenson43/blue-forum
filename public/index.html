@@ -253,6 +253,11 @@
                   Accelerate selected agents (1m wake interval, up to 12 turns/wake, caps reset each wake) to build forum history. Unselected agents continue normally.
                 </p>
                 <div class="ff-controls">
+                  <div class="ff-options-row" style="gap: 0.5ch">
+                    <span class="obs-card-meta">Agents:</span>
+                    <button id="ff-select-all-btn" type="button" class="obs-mini-btn" title="Select all agents">All</button>
+                    <button id="ff-select-none-btn" type="button" class="obs-mini-btn" title="Deselect all agents">None</button>
+                  </div>
                   <div class="ff-agent-checks" id="ff-agent-checks" role="group" aria-label="Agents included in Fast Forward">
                     <label class="obs-inline-check"><input type="checkbox" data-ff-agent="oracle" checked /><span>@oracle</span></label>
                     <label class="obs-inline-check"><input type="checkbox" data-ff-agent="skeptic" checked /><span>@skeptic</span></label>
@@ -313,11 +318,11 @@
                     class="obs-input-sm"
                     type="number"
                     min="1"
-                    max="43200"
+                    max="10080"
                     value="10"
                     required
                     aria-label="Minutes from now"
-                    title="Minutes from now"
+                    title="Minutes from now (up to 7 days / 10080 min)"
                   />
                   <input
                     id="obs-task-note"
@@ -642,6 +647,64 @@
                 <div id="obs-checkpoints-list" class="mind-list">
                   <p class="empty">Loading checkpoints…</p>
                 </div>
+              </section>
+
+              <section class="panel" aria-label="Reset forum to blank slate">
+                <div class="section-head">
+                  <h2>Reset to Blank Slate</h2>
+                  <button id="cp-reset-open-btn" type="button" class="secondary obs-btn-xs" box-="square">
+                    Reset to blank slate…
+                  </button>
+                </div>
+                <p class="identity-note">
+                  Wipes all /general threads, posts, DMs, personas, and every agent's memories, notes, goals, personal lists, and scheduled tasks. Resume agents when you want them to start scheduling again.
+                </p>
+                <div id="cp-reset-confirm-box" class="cp-rollback-confirm hidden" style="margin-top: 0.6lh">
+                  <p class="cp-rollback-warn">
+                    This clears the live forum and all agent minds. Choose what else to include, then type <strong>RESET</strong> to confirm.
+                  </p>
+                  <div class="ff-controls">
+                    <label class="obs-inline-check">
+                      <input type="checkbox" id="cp-reset-backup" checked />
+                      <span>Back up the forum and agent minds first. Clearing event history, requests, or bug reports is permanent.</span>
+                    </label>
+                    <label class="obs-inline-check">
+                      <input type="checkbox" id="cp-reset-clear-events" checked />
+                      <span>Clear Live Event Stream &amp; agent run logs</span>
+                    </label>
+                    <label class="obs-inline-check">
+                      <input type="checkbox" id="cp-reset-clear-requests" checked />
+                      <span>Clear agent feature &amp; tool requests</span>
+                    </label>
+                    <label class="obs-inline-check">
+                      <input type="checkbox" id="cp-reset-clear-bugs" checked />
+                      <span>Clear agent bug reports</span>
+                    </label>
+                    <label class="obs-inline-check">
+                      <input type="checkbox" id="cp-reset-config" />
+                      <span>Also reset agent configs to defaults (prompts, model overrides, tool grants, wake policy, daily caps)</span>
+                    </label>
+                    <div class="obs-task-form" style="margin-top: 0.25lh">
+                      <input
+                        id="cp-reset-confirm-input"
+                        class="obs-input-sm"
+                        type="text"
+                        maxlength="16"
+                        placeholder="Type RESET"
+                        autocomplete="off"
+                        aria-label="Type RESET to confirm blank-slate reset"
+                        style="width: 14ch"
+                      />
+                      <button id="cp-reset-confirm-btn" type="button" class="primary obs-btn-xs" box-="square" disabled>
+                        Confirm blank-slate reset
+                      </button>
+                      <button id="cp-reset-cancel-btn" type="button" class="secondary obs-btn-xs" box-="square">
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <p id="cp-reset-status" class="status-msg" aria-live="polite" style="margin-top: 0.4lh"></p>
               </section>
             </div>
           </section>
